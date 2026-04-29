@@ -946,11 +946,11 @@ app.delete('/api/sales/:id', async (req, res) => {
 app.get('/api/debts', async (req, res) => {
   const debts = await all(`
     WITH receipt_totals AS (
-      SELECT r.id AS receipt_id, r.date, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost::numeric),0) AS total
+      SELECT r.id AS receipt_id, r.date, r.created_at, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
       LEFT JOIN suppliers s ON s.id = r.supplier_id
-      GROUP BY r.id, r.date, r.supplier_id, s.name
+      GROUP BY r.id, r.date, r.created_at, r.supplier_id, s.name
     ),
     receipt_payments AS (
       SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
@@ -984,7 +984,7 @@ app.get('/api/debts', async (req, res) => {
         s.total_amount::numeric AS total,
         COALESCE(s.paid_amount::numeric,0) AS paid,
         NULL::TEXT AS document_label,
-        s.created_at
+        s.created_at::timestamp AS created_at
       FROM sales s
       LEFT JOIN clients c ON c.id = s.client_id
       LEFT JOIN markings m ON m.id = s.marking_id
@@ -1010,7 +1010,7 @@ app.get('/api/debts', async (req, res) => {
         rt.total::numeric AS total,
         COALESCE(rp.paid::numeric,0) AS paid,
         'Приход №' || rt.receipt_id AS document_label,
-        rt.receipt_id::text AS created_at
+        rt.created_at::timestamp AS created_at
       FROM receipt_totals rt
       LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.receipt_id
       WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
@@ -1089,11 +1089,31 @@ app.get('/api/ledger', async (req, res) => {
   const rows = type === 'client'
     ? await all(`
         SELECT * FROM (
-          SELECT s.date,'sale' AS type,s.id,s.total_amount AS amount,s.paid_amount,s.notes AS comment,NULL::TEXT AS account_name,NULL::TEXT AS transaction_type,s.created_at,0 AS sort_order
+          SELECT
+            s.date::text AS date,
+            'sale'::text AS type,
+            s.id::integer AS id,
+            s.total_amount::numeric AS amount,
+            s.paid_amount::numeric AS paid_amount,
+            s.notes::text AS comment,
+            NULL::text AS account_name,
+            NULL::text AS transaction_type,
+            s.created_at::timestamp AS created_at,
+            0::integer AS sort_order
           FROM sales s
           WHERE s.client_id=$1
           UNION ALL
-          SELECT p.date,'payment' AS type,p.id,p.amount,NULL::NUMERIC AS paid_amount,p.comment,a.name AS account_name,t.type AS transaction_type,p.created_at,1 AS sort_order
+          SELECT
+            p.date::text AS date,
+            'payment'::text AS type,
+            p.id::integer AS id,
+            p.amount::numeric AS amount,
+            NULL::numeric AS paid_amount,
+            p.comment::text AS comment,
+            a.name::text AS account_name,
+            t.type::text AS transaction_type,
+            p.created_at::timestamp AS created_at,
+            1::integer AS sort_order
           FROM payments p
           JOIN sales s ON p.entity_type='sale' AND s.id=p.entity_id
           LEFT JOIN transactions t ON t.id=p.transaction_id
@@ -1104,11 +1124,31 @@ app.get('/api/ledger', async (req, res) => {
       `, [entityId])
     : await all(`
         SELECT * FROM (
-          SELECT p.date,'purchase' AS type,p.id,p.total_cost AS amount,p.paid_amount,p.notes AS comment,NULL::TEXT AS account_name,NULL::TEXT AS transaction_type,p.created_at,0 AS sort_order
+          SELECT
+            p.date::text AS date,
+            'purchase'::text AS type,
+            p.id::integer AS id,
+            p.total_cost::numeric AS amount,
+            p.paid_amount::numeric AS paid_amount,
+            p.notes::text AS comment,
+            NULL::text AS account_name,
+            NULL::text AS transaction_type,
+            p.created_at::timestamp AS created_at,
+            0::integer AS sort_order
           FROM purchases p
           WHERE p.supplier_id=$1
           UNION ALL
-          SELECT pay.date,'payment' AS type,pay.id,pay.amount,NULL::NUMERIC AS paid_amount,pay.comment,a.name AS account_name,t.type AS transaction_type,pay.created_at,1 AS sort_order
+          SELECT
+            pay.date::text AS date,
+            'payment'::text AS type,
+            pay.id::integer AS id,
+            pay.amount::numeric AS amount,
+            NULL::numeric AS paid_amount,
+            pay.comment::text AS comment,
+            a.name::text AS account_name,
+            t.type::text AS transaction_type,
+            pay.created_at::timestamp AS created_at,
+            1::integer AS sort_order
           FROM payments pay
           JOIN purchases p ON pay.entity_type='purchase' AND p.id=pay.entity_id
           LEFT JOIN transactions t ON t.id=pay.transaction_id
