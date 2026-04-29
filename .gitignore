@@ -1,0 +1,5 @@
+node_modules
+cargo.db
+cargo.db-shm
+cargo.db-wal
+.env
