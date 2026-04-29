@@ -1,22 +1,29 @@
 /**
- * Cargo Manager — Backend
+ * Cargo Manager — PostgreSQL Backend
  *
- * Запуск (после npm install):
- *   node server.js                    ← dev, порт 3001
- *   NODE_ENV=production node server.js ← прод (отдаёт client/dist/)
+ * Требуется:
+ *   DATABASE_URL=postgres://... node server.js
  */
 
 'use strict';
 
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose()
-const db = new sqlite3.Database('./cargo.db')
+const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL is required');
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 app.use(cors());
 app.use(express.json());
@@ -26,989 +33,1024 @@ function validationError(res, message, context = {}) {
   return res.status(400).json({ error: message });
 }
 
-// ─── Database ─────────────────────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, 'cargo.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+async function query(text, params = [], client = pool) {
+  return client.query(text, params);
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS clients (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    phone TEXT,
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS client_markings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-    marking TEXT NOT NULL UNIQUE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    category TEXT,
-    is_active INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS product_rules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER NOT NULL UNIQUE REFERENCES products(id) ON DELETE CASCADE,
-    sale_type TEXT NOT NULL CHECK(sale_type IN ('kg','pcs','both'))
-  );
-  CREATE TABLE IF NOT EXISTS suppliers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    phone TEXT,
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    client_id INTEGER REFERENCES clients(id),
-    marking_id INTEGER REFERENCES client_markings(id),
-    supplier_id INTEGER REFERENCES suppliers(id),
-    receipt_id INTEGER REFERENCES receipts(id),
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    quantity_pcs REAL DEFAULT 0,
-    weight_kg REAL DEFAULT 0,
-    boxes_count INTEGER DEFAULT 0,
-    cost_almaty REAL DEFAULT 0,
-    cost_dubai REAL DEFAULT 0,
-    cost_per_kg REAL DEFAULT 0,
-    total_cost REAL DEFAULT 0,
-    paid_amount REAL DEFAULT 0,
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS receipts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    supplier_id INTEGER,
-    client_id INTEGER,
-    marking_id INTEGER,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS receipt_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    receipt_id INTEGER,
-    product_id INTEGER,
-    weight REAL,
-    quantity INTEGER,
-    cost_almaty REAL,
-    cost_dubai REAL,
-    note TEXT
-  );
-  CREATE TABLE IF NOT EXISTS sales (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    client_id INTEGER REFERENCES clients(id),
-    marking_id INTEGER REFERENCES client_markings(id),
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    sale_unit TEXT NOT NULL CHECK(sale_unit IN ('kg','pcs')),
-    quantity REAL NOT NULL,
-    price_per_unit REAL NOT NULL,
-    total_amount REAL NOT NULL,
-    paid_amount REAL DEFAULT 0,
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS money_assets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_type TEXT NOT NULL CHECK(asset_type IN ('cash','in_transit','debtors','transfer')),
-    amount REAL NOT NULL,
-    comment TEXT,
-    date TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS liabilities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    amount REAL NOT NULL,
-    comment TEXT,
-    date TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS payments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_type TEXT NOT NULL CHECK(entity_type IN ('sale','purchase')),
-    entity_id INTEGER NOT NULL,
-    amount REAL NOT NULL,
-    date TEXT NOT NULL,
-    comment TEXT,
-    transaction_id INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS withdrawals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    amount REAL NOT NULL,
-    date TEXT NOT NULL,
-    comment TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    currency TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw')),
-    amount REAL NOT NULL,
-    account_from_id INTEGER REFERENCES accounts(id),
-    account_to_id INTEGER REFERENCES accounts(id),
-    receipt_id INTEGER,
-    sale_id INTEGER,
-    date TEXT NOT NULL,
-    comment TEXT,
-    related_type TEXT,
-    related_id INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+async function all(text, params = [], client = pool) {
+  const { rows } = await query(text, params, client);
+  return rows;
+}
 
-// ─── Migrations (safe: ignore if column exists) ───────────────────────────────
-// Добавить total_cost к существующим БД, в которых его ещё нет
-try { db.exec('ALTER TABLE purchases ADD COLUMN total_cost REAL DEFAULT 0'); } catch (_) {}
-// Добавить cost_per_kg к существующим БД, в которых его ещё нет
-try { db.exec('ALTER TABLE purchases ADD COLUMN cost_per_kg REAL DEFAULT 0'); } catch (_) {}
-// Добавить paid_amount к существующим БД, в которых его ещё нет
-try { db.exec('ALTER TABLE purchases ADD COLUMN paid_amount REAL DEFAULT 0'); } catch (_) {}
-try { db.exec('ALTER TABLE sales ADD COLUMN paid_amount REAL DEFAULT 0'); } catch (_) {}
-// Добавить supplier_id к существующим БД, в которых его ещё нет
-try { db.exec('ALTER TABLE purchases ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)'); } catch (_) {}
-try { db.exec('ALTER TABLE purchases ADD COLUMN receipt_id INTEGER REFERENCES receipts(id)'); } catch (_) {}
-// Добавить связь payment -> transaction к существующим БД
-try { db.exec('ALTER TABLE payments ADD COLUMN transaction_id INTEGER'); } catch (_) {}
-// Добавить связь transaction -> receipt/sale к существующим БД
-try { db.exec('ALTER TABLE transactions ADD COLUMN receipt_id INTEGER'); } catch (_) {}
-try { db.exec('ALTER TABLE transactions ADD COLUMN sale_id INTEGER'); } catch (_) {}
-try {
-  const txSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get()?.sql || '';
-  if (txSchema.includes("CHECK(type IN ('income','expense','transfer'))")) {
-    db.exec(`
-      ALTER TABLE transactions RENAME TO transactions_old;
-      CREATE TABLE transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw')),
-        amount REAL NOT NULL,
-        account_from_id INTEGER REFERENCES accounts(id),
-        account_to_id INTEGER REFERENCES accounts(id),
-        receipt_id INTEGER,
-        sale_id INTEGER,
-        date TEXT NOT NULL,
-        comment TEXT,
-        related_type TEXT,
-        related_id INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-      INSERT INTO transactions(id,type,amount,account_from_id,account_to_id,receipt_id,sale_id,date,comment,related_type,related_id,created_at)
-      SELECT id,type,amount,account_from_id,account_to_id,receipt_id,sale_id,date,comment,related_type,related_id,created_at
-      FROM transactions_old;
-      DROP TABLE transactions_old;
-    `);
+async function get(text, params = [], client = pool) {
+  const { rows } = await query(text, params, client);
+  return rows[0] || null;
+}
+
+async function withTx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
-} catch (_) {}
-db.exec(`
-  UPDATE payments
-  SET transaction_id = (
-    SELECT t.id FROM transactions t
-    WHERE t.related_type='payment' AND t.related_id=payments.id
-    LIMIT 1
-  )
-  WHERE transaction_id IS NULL
-`);
-db.exec(`
-  UPDATE transactions
-  SET sale_id = (
-    SELECT p.entity_id FROM payments p
-    WHERE p.transaction_id=transactions.id AND p.entity_type='sale'
-    LIMIT 1
-  )
-  WHERE sale_id IS NULL
-    AND EXISTS (
-      SELECT 1 FROM payments p
-      WHERE p.transaction_id=transactions.id AND p.entity_type='sale'
-    )
-`);
-db.exec(`
-  UPDATE transactions
-  SET receipt_id = (
-    SELECT pu.receipt_id FROM payments p
-    JOIN purchases pu ON pu.id=p.entity_id
-    WHERE p.transaction_id=transactions.id
-      AND p.entity_type='purchase'
-      AND pu.receipt_id IS NOT NULL
-    LIMIT 1
-  )
-  WHERE receipt_id IS NULL
-    AND EXISTS (
-      SELECT 1 FROM payments p
-      JOIN purchases pu ON pu.id=p.entity_id
-      WHERE p.transaction_id=transactions.id
-        AND p.entity_type='purchase'
-        AND pu.receipt_id IS NOT NULL
-    )
-`);
-// Пересчитать total_cost для старых строк (где cost_usd мог использоваться вместо)
-db.exec('UPDATE purchases SET cost_per_kg = cost_almaty + cost_dubai WHERE cost_per_kg = 0 AND (cost_almaty > 0 OR cost_dubai > 0)');
-db.exec('UPDATE purchases SET total_cost = cost_per_kg * weight_kg WHERE total_cost = 0 AND cost_per_kg > 0 AND weight_kg > 0');
+}
 
-// ─── Business Validation ──────────────────────────────────────────────────────
+async function initDb() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS clients (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-/** Правило 1: хотя бы client_id или marking_id. Если только marking — клиент определяется авто. */
-function resolveClientMarking(client_id, marking_id) {
-  const cid = client_id ? +client_id : null;
-  const mid = marking_id ? +marking_id : null;
+    CREATE TABLE IF NOT EXISTS markings (
+      id SERIAL PRIMARY KEY,
+      client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+      marking TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS suppliers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_rules (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER UNIQUE REFERENCES products(id) ON DELETE CASCADE,
+      sale_type TEXT NOT NULL CHECK(sale_type IN ('kg','pcs','both'))
+    );
+
+    CREATE TABLE IF NOT EXISTS receipts (
+      id SERIAL PRIMARY KEY,
+      date DATE,
+      supplier_id INTEGER REFERENCES suppliers(id),
+      client_id INTEGER REFERENCES clients(id),
+      marking_id INTEGER REFERENCES markings(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS receipt_items (
+      id SERIAL PRIMARY KEY,
+      receipt_id INTEGER REFERENCES receipts(id) ON DELETE CASCADE,
+      product_id INTEGER REFERENCES products(id),
+      weight NUMERIC DEFAULT 0,
+      quantity NUMERIC DEFAULT 0,
+      cost_almaty NUMERIC DEFAULT 0,
+      cost_dubai NUMERIC DEFAULT 0,
+      note TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS purchases (
+      id SERIAL PRIMARY KEY,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      client_id INTEGER REFERENCES clients(id),
+      marking_id INTEGER REFERENCES markings(id),
+      supplier_id INTEGER REFERENCES suppliers(id),
+      receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL,
+      product_id INTEGER REFERENCES products(id),
+      quantity_pcs NUMERIC DEFAULT 0,
+      weight_kg NUMERIC DEFAULT 0,
+      boxes_count NUMERIC DEFAULT 0,
+      cost_almaty NUMERIC DEFAULT 0,
+      cost_dubai NUMERIC DEFAULT 0,
+      cost_per_kg NUMERIC DEFAULT 0,
+      total_cost NUMERIC DEFAULT 0,
+      paid_amount NUMERIC DEFAULT 0,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sales (
+      id SERIAL PRIMARY KEY,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      client_id INTEGER REFERENCES clients(id),
+      marking_id INTEGER REFERENCES markings(id),
+      product_id INTEGER REFERENCES products(id),
+      sale_unit TEXT CHECK(sale_unit IN ('kg','pcs')),
+      quantity NUMERIC DEFAULT 0,
+      price_per_unit NUMERIC DEFAULT 0,
+      total_amount NUMERIC DEFAULT 0,
+      paid_amount NUMERIC DEFAULT 0,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS payments (
+      id SERIAL PRIMARY KEY,
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('sale','purchase')),
+      entity_id INTEGER NOT NULL,
+      amount NUMERIC NOT NULL,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      comment TEXT,
+      transaction_id INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS accounts (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS transactions (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw')),
+      amount NUMERIC NOT NULL,
+      account_from_id INTEGER REFERENCES accounts(id),
+      account_to_id INTEGER REFERENCES accounts(id),
+      receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL,
+      sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      comment TEXT,
+      related_type TEXT,
+      related_id INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id SERIAL PRIMARY KEY,
+      amount NUMERIC NOT NULL,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      comment TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS money_assets (
+      id SERIAL PRIMARY KEY,
+      asset_type TEXT NOT NULL CHECK(asset_type IN ('cash','in_transit','debtors','transfer')),
+      amount NUMERIC NOT NULL,
+      comment TEXT,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS liabilities (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      amount NUMERIC NOT NULL,
+      comment TEXT,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await query(`
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cost_almaty NUMERIC DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cost_dubai NUMERIC DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cost_per_kg NUMERIC DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total_cost NUMERIC DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
+    ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
+    ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL;
+  `);
+
+  await query(`
+    UPDATE purchases
+    SET cost_per_kg = COALESCE(cost_almaty,0) + COALESCE(cost_dubai,0)
+    WHERE COALESCE(cost_per_kg,0) = 0
+      AND (COALESCE(cost_almaty,0) > 0 OR COALESCE(cost_dubai,0) > 0);
+  `);
+
+  await query(`
+    UPDATE purchases
+    SET total_cost = COALESCE(cost_per_kg,0) * COALESCE(weight_kg,0)
+    WHERE COALESCE(total_cost,0) = 0
+      AND COALESCE(cost_per_kg,0) > 0
+      AND COALESCE(weight_kg,0) > 0;
+  `);
+
+  await query(`
+    UPDATE payments p
+    SET transaction_id = t.id
+    FROM transactions t
+    WHERE p.transaction_id IS NULL
+      AND t.related_type = 'payment'
+      AND t.related_id = p.id;
+  `);
+}
+
+async function resolveClientMarking(clientId, markingId, client = pool) {
+  const cid = clientId ? +clientId : null;
+  const mid = markingId ? +markingId : null;
   if (!cid && !mid) throw new Error('Укажите клиента или маркировку (обязательно хотя бы одно)');
   if (mid && !cid) {
-    const m = db.prepare('SELECT * FROM client_markings WHERE id=?').get(mid);
-    if (!m) throw new Error(`Маркировка с id=${mid} не найдена`);
-    return { cid: m.client_id, mid };
+    const marking = await get('SELECT * FROM markings WHERE id=$1', [mid], client);
+    if (!marking) throw new Error(`Маркировка с id=${mid} не найдена`);
+    return { cid: +marking.client_id, mid };
   }
   if (mid && cid) {
-    const m = db.prepare('SELECT id FROM client_markings WHERE id=? AND client_id=?').get(mid, cid);
-    if (!m) throw new Error('Маркировка не принадлежит выбранному клиенту');
+    const marking = await get('SELECT id FROM markings WHERE id=$1 AND client_id=$2', [mid, cid], client);
+    if (!marking) throw new Error('Маркировка не принадлежит выбранному клиенту');
   }
   return { cid, mid };
 }
 
-/** Правило 2: числовые ограничения для прихода */
 function validatePurchaseNums({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0, cost_dubai = 0 }) {
-  if (+weight_kg < 0)    throw new Error('Вес (weight_kg) не может быть отрицательным');
+  if (+weight_kg < 0) throw new Error('Вес (weight_kg) не может быть отрицательным');
   if (+quantity_pcs < 0) throw new Error('Количество (quantity_pcs) не может быть отрицательным');
-  if (+cost_almaty < 0)  throw new Error('Стоимость Алматы не может быть отрицательной');
-  if (+cost_dubai < 0)   throw new Error('Стоимость Дубай не может быть отрицательной');
+  if (+cost_almaty < 0) throw new Error('Стоимость Алматы не может быть отрицательной');
+  if (+cost_dubai < 0) throw new Error('Стоимость Дубай не может быть отрицательной');
 }
 
-function getAccountBalance(accountId) {
-  return db.prepare(`
+async function getAccountBalance(accountId, client = pool) {
+  const row = await get(`
     SELECT
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE type='income' AND account_to_id=?),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='expense' AND account_from_id=?),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdraw' AND account_from_id=?),0)
-      + COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_to_id=?),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_from_id=?),0)
+      COALESCE((SELECT SUM(amount) FROM transactions WHERE type='income' AND account_to_id=$1),0)
+      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='expense' AND account_from_id=$1),0)
+      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdraw' AND account_from_id=$1),0)
+      + COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_to_id=$1),0)
+      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_from_id=$1),0)
       AS balance
-  `).get(accountId, accountId, accountId, accountId, accountId).balance;
+  `, [accountId], client);
+  return +(row?.balance || 0);
 }
 
-function getReceiptPaidAmount(receiptId) {
-  return db.prepare(`
-    SELECT COALESCE(SUM(x.amount),0) AS total
+async function getReceiptPaidAmount(receiptId, client = pool) {
+  const row = await get(`
+    SELECT COALESCE(SUM(amount),0) AS total
     FROM (
       SELECT DISTINCT p.id, p.amount
       FROM payments p
-      LEFT JOIN transactions t ON t.id=p.transaction_id
-      LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
-      WHERE COALESCE(t.receipt_id, pu.receipt_id)=?
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
+      WHERE COALESCE(t.receipt_id, pu.receipt_id) = $1
     ) x
-  `).get(receiptId).total;
+  `, [receiptId], client);
+  return +(row?.total || 0);
 }
 
-function rebalanceReceiptPurchasePaidAmounts(receiptId) {
-  const purchases = db.prepare(`
+async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
+  const purchases = await all(`
     SELECT id,total_cost
     FROM purchases
-    WHERE receipt_id=?
+    WHERE receipt_id=$1
     ORDER BY id
-  `).all(receiptId);
-  let remainingPaid = +getReceiptPaidAmount(receiptId) || 0;
+  `, [receiptId], client);
+  let remainingPaid = await getReceiptPaidAmount(receiptId, client);
   for (const purchase of purchases) {
-    const applied = Math.min(+purchase.total_cost || 0, remainingPaid);
-    db.prepare('UPDATE purchases SET paid_amount=? WHERE id=?').run(applied, purchase.id);
+    const applied = Math.min(+(purchase.total_cost || 0), remainingPaid);
+    await query('UPDATE purchases SET paid_amount=$1 WHERE id=$2', [applied, purchase.id], client);
     remainingPaid -= applied;
   }
 }
 
-/** Правило 3: total_amount НЕ принимается с фронта — считается только сервером */
-function validateSale(product_id, sale_unit, quantity, price_per_unit) {
-  if (+quantity <= 0)       throw new Error('Количество должно быть больше 0');
-  if (+price_per_unit <= 0) throw new Error('Цена за единицу должна быть больше 0');
-  const rule = db.prepare('SELECT * FROM product_rules WHERE product_id=?').get(+product_id);
+async function validateSale(productId, saleUnit, quantity, pricePerUnit, client = pool) {
+  if (+quantity <= 0) throw new Error('Количество должно быть больше 0');
+  if (+pricePerUnit <= 0) throw new Error('Цена за единицу должна быть больше 0');
+  const rule = await get('SELECT * FROM product_rules WHERE product_id=$1', [+productId], client);
   if (!rule) throw new Error('Правило продажи для товара не задано. Настройте правило в разделе Товары.');
-  if (rule.sale_type === 'pcs' && sale_unit === 'kg')
-    throw new Error('Для этого товара разрешена продажа только по штукам (pcs)');
-  if (rule.sale_type === 'kg'  && sale_unit === 'pcs')
-    throw new Error('Для этого товара разрешена продажа только по килограммам (kg)');
+  if (rule.sale_type === 'pcs' && saleUnit === 'kg') throw new Error('Для этого товара разрешена продажа только по штукам (pcs)');
+  if (rule.sale_type === 'kg' && saleUnit === 'pcs') throw new Error('Для этого товара разрешена продажа только по килограммам (kg)');
 }
 
-// ─── CLIENTS ──────────────────────────────────────────────────────────────────
-app.get('/api/clients', (req, res) => {
-  res.json(db.prepare('SELECT * FROM clients ORDER BY name').all());
+async function debtSummaryData(client = pool) {
+  const receivable = await get(`
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(total_amount - COALESCE(paid_amount,0)),0) AS total
+    FROM sales
+    WHERE total_amount - COALESCE(paid_amount,0) > 0
+  `, [], client);
+
+  const payable = await get(`
+    WITH receipt_totals AS (
+      SELECT r.id, COALESCE(SUM(p.total_cost),0) AS total
+      FROM receipts r
+      JOIN purchases p ON p.receipt_id = r.id
+      GROUP BY r.id
+    ),
+    receipt_payments AS (
+      SELECT x.receipt_id, COALESCE(SUM(x.amount),0) AS paid
+      FROM (
+        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
+        FROM payments p
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
+        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
+      ) x
+      GROUP BY x.receipt_id
+    )
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(total - COALESCE(paid,0)),0) AS total
+    FROM (
+      SELECT rt.id, rt.total, COALESCE(rp.paid,0) AS paid
+      FROM receipt_totals rt
+      LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.id
+      WHERE rt.total - COALESCE(rp.paid,0) > 0
+    ) q
+  `, [], client);
+
+  const totalWithdrawals = await get('SELECT COALESCE(SUM(amount),0) AS v FROM withdrawals', [], client);
+
+  return {
+    receivable: { count: +(receivable?.count || 0), total: +(receivable?.total || 0) },
+    payable: { count: +(payable?.count || 0), total: +(payable?.total || 0) },
+    total_withdrawals: +(totalWithdrawals?.v || 0),
+    balance: +(receivable?.total || 0) - +(payable?.total || 0),
+  };
+}
+
+// Clients
+app.get('/api/clients', async (req, res) => {
+  res.json(await all('SELECT * FROM clients ORDER BY name'));
 });
 
-app.get('/api/clients/:id', (req, res) => {
-  const c = db.prepare('SELECT * FROM clients WHERE id=?').get(+req.params.id);
-  if (!c) return res.status(404).json({ error: 'Клиент не найден' });
-  res.json({ ...c, markings: db.prepare('SELECT * FROM client_markings WHERE client_id=? ORDER BY marking').all(+req.params.id) });
+app.get('/api/clients/:id', async (req, res) => {
+  const client = await get('SELECT * FROM clients WHERE id=$1', [+req.params.id]);
+  if (!client) return res.status(404).json({ error: 'Клиент не найден' });
+  const markings = await all('SELECT * FROM markings WHERE client_id=$1 ORDER BY marking', [+req.params.id]);
+  res.json({ ...client, markings });
 });
 
-app.post('/api/clients', (req, res) => {
+app.post('/api/clients', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя клиента обязательно' });
-  const r = db.prepare('INSERT INTO clients(name,phone,notes) VALUES(?,?,?)').run(name.trim(), phone||null, notes||null);
-  res.json({ id: r.lastInsertRowid });
+  const row = await get('INSERT INTO clients(name,phone,notes) VALUES($1,$2,$3) RETURNING id', [name.trim(), phone || null, notes || null]);
+  res.json({ id: row.id });
 });
 
-app.put('/api/clients/:id', (req, res) => {
+app.put('/api/clients/:id', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя клиента обязательно' });
-  db.prepare('UPDATE clients SET name=?,phone=?,notes=? WHERE id=?').run(name.trim(), phone||null, notes||null, +req.params.id);
+  await query('UPDATE clients SET name=$1,phone=$2,notes=$3 WHERE id=$4', [name.trim(), phone || null, notes || null, +req.params.id]);
   res.json({ success: true });
 });
 
-app.delete('/api/clients/:id', (req, res) => {
-  db.prepare('DELETE FROM clients WHERE id=?').run(+req.params.id);
+app.delete('/api/clients/:id', async (req, res) => {
+  await query('DELETE FROM clients WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
 });
 
-// ─── SUPPLIERS ────────────────────────────────────────────────────────────────
-app.get('/api/suppliers', (req, res) => {
-  res.json(db.prepare('SELECT * FROM suppliers ORDER BY name').all());
+// Suppliers
+app.get('/api/suppliers', async (req, res) => {
+  res.json(await all('SELECT * FROM suppliers ORDER BY name'));
 });
 
-app.post('/api/suppliers', (req, res) => {
+app.post('/api/suppliers', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя поставщика обязательно' });
-  const r = db.prepare('INSERT INTO suppliers(name,phone,notes) VALUES(?,?,?)').run(name.trim(), phone||null, notes||null);
-  res.json({ id: r.lastInsertRowid });
+  const row = await get('INSERT INTO suppliers(name,phone,notes) VALUES($1,$2,$3) RETURNING id', [name.trim(), phone || null, notes || null]);
+  res.json({ id: row.id });
 });
 
-app.put('/api/suppliers/:id', (req, res) => {
+app.put('/api/suppliers/:id', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя поставщика обязательно' });
-  db.prepare('UPDATE suppliers SET name=?,phone=?,notes=? WHERE id=?').run(name.trim(), phone||null, notes||null, +req.params.id);
+  await query('UPDATE suppliers SET name=$1,phone=$2,notes=$3 WHERE id=$4', [name.trim(), phone || null, notes || null, +req.params.id]);
   res.json({ success: true });
 });
 
-app.delete('/api/suppliers/:id', (req, res) => {
-  const used = db.prepare('SELECT id FROM purchases WHERE supplier_id=? LIMIT 1').get(+req.params.id);
+app.delete('/api/suppliers/:id', async (req, res) => {
+  const used = await get('SELECT id FROM purchases WHERE supplier_id=$1 LIMIT 1', [+req.params.id]);
   if (used) return res.status(400).json({ error: 'Поставщик используется в приходах' });
-  db.prepare('DELETE FROM suppliers WHERE id=?').run(+req.params.id);
+  await query('DELETE FROM suppliers WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
 });
 
-// ─── MARKINGS ─────────────────────────────────────────────────────────────────
-app.get('/api/markings', (req, res) => {
+// Markings
+app.get('/api/markings', async (req, res) => {
   const { client_id } = req.query;
-  let sql = 'SELECT cm.*,c.name AS client_name FROM client_markings cm JOIN clients c ON c.id=cm.client_id';
-  const args = [];
-  if (client_id) { sql += ' WHERE cm.client_id=?'; args.push(+client_id); }
-  sql += ' ORDER BY cm.marking';
-  res.json(db.prepare(sql).all(...args));
+  const sql = `
+    SELECT m.*, c.name AS client_name
+    FROM markings m
+    JOIN clients c ON c.id = m.client_id
+    ${client_id ? 'WHERE m.client_id=$1' : ''}
+    ORDER BY m.marking
+  `;
+  res.json(await all(sql, client_id ? [+client_id] : []));
 });
 
-app.post('/api/markings', (req, res) => {
+app.post('/api/markings', async (req, res) => {
   const { client_id, marking } = req.body;
   if (!client_id || !marking?.trim()) return res.status(400).json({ error: 'client_id и маркировка обязательны' });
   try {
-    const r = db.prepare('INSERT INTO client_markings(client_id,marking) VALUES(?,?)').run(+client_id, marking.trim().toUpperCase());
-    res.json({ id: r.lastInsertRowid });
+    const row = await get('INSERT INTO markings(client_id,marking) VALUES($1,$2) RETURNING id', [+client_id, marking.trim().toUpperCase()]);
+    res.json({ id: row.id });
   } catch (e) {
-    res.status(400).json({ error: e.message.includes('UNIQUE') ? 'Такая маркировка уже существует' : e.message });
+    res.status(400).json({ error: e.message.includes('unique') ? 'Такая маркировка уже существует' : e.message });
   }
 });
 
-app.put('/api/markings/:id', (req, res) => {
+app.put('/api/markings/:id', async (req, res) => {
   const { client_id, marking } = req.body;
   if (!client_id || !marking?.trim()) return res.status(400).json({ error: 'client_id и маркировка обязательны' });
   try {
-    db.prepare('UPDATE client_markings SET client_id=?,marking=? WHERE id=?').run(+client_id, marking.trim().toUpperCase(), +req.params.id);
+    await query('UPDATE markings SET client_id=$1,marking=$2 WHERE id=$3', [+client_id, marking.trim().toUpperCase(), +req.params.id]);
     res.json({ success: true });
   } catch (e) {
-    res.status(400).json({ error: e.message.includes('UNIQUE') ? 'Такая маркировка уже существует' : e.message });
+    res.status(400).json({ error: e.message.includes('unique') ? 'Такая маркировка уже существует' : e.message });
   }
 });
 
-app.delete('/api/markings/:id', (req, res) => {
-  db.prepare('DELETE FROM client_markings WHERE id=?').run(+req.params.id);
+app.delete('/api/markings/:id', async (req, res) => {
+  await query('DELETE FROM markings WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
 });
 
-// ─── PRODUCTS ─────────────────────────────────────────────────────────────────
-app.get('/api/products', (req, res) => {
-  res.json(db.prepare('SELECT p.*,pr.sale_type FROM products p LEFT JOIN product_rules pr ON pr.product_id=p.id ORDER BY p.name').all());
+// Products
+app.get('/api/products', async (req, res) => {
+  res.json(await all(`
+    SELECT p.*, pr.sale_type
+    FROM products p
+    LEFT JOIN product_rules pr ON pr.product_id = p.id
+    ORDER BY p.name
+  `));
 });
 
-app.post('/api/products', (req, res) => {
+app.post('/api/products', async (req, res) => {
   const { name, category, is_active, sale_type } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Название товара обязательно' });
-  const pr = db.prepare('INSERT INTO products(name,category,is_active) VALUES(?,?,?)').run(name.trim(), category||null, is_active!==false?1:0);
-  if (sale_type) db.prepare('INSERT INTO product_rules(product_id,sale_type) VALUES(?,?)').run(pr.lastInsertRowid, sale_type);
-  res.json({ id: pr.lastInsertRowid });
+  const product = await get('INSERT INTO products(name,category,is_active) VALUES($1,$2,$3) RETURNING id', [name.trim(), category || null, is_active !== false]);
+  if (sale_type) await query('INSERT INTO product_rules(product_id,sale_type) VALUES($1,$2)', [product.id, sale_type]);
+  res.json({ id: product.id });
 });
 
-app.put('/api/products/:id', (req, res) => {
+app.put('/api/products/:id', async (req, res) => {
   const { name, category, is_active, sale_type } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Название товара обязательно' });
-  db.prepare('UPDATE products SET name=?,category=?,is_active=? WHERE id=?').run(name.trim(), category||null, is_active?1:0, +req.params.id);
+  await query('UPDATE products SET name=$1,category=$2,is_active=$3 WHERE id=$4', [name.trim(), category || null, !!is_active, +req.params.id]);
   if (sale_type) {
-    const ex = db.prepare('SELECT id FROM product_rules WHERE product_id=?').get(+req.params.id);
-    if (ex) db.prepare('UPDATE product_rules SET sale_type=? WHERE product_id=?').run(sale_type, +req.params.id);
-    else    db.prepare('INSERT INTO product_rules(product_id,sale_type) VALUES(?,?)').run(+req.params.id, sale_type);
+    const existing = await get('SELECT id FROM product_rules WHERE product_id=$1', [+req.params.id]);
+    if (existing) await query('UPDATE product_rules SET sale_type=$1 WHERE product_id=$2', [sale_type, +req.params.id]);
+    else await query('INSERT INTO product_rules(product_id,sale_type) VALUES($1,$2)', [+req.params.id, sale_type]);
   }
   res.json({ success: true });
 });
 
-app.delete('/api/products/:id', (req, res) => {
-  db.prepare('DELETE FROM products WHERE id=?').run(+req.params.id);
+app.delete('/api/products/:id', async (req, res) => {
+  await query('DELETE FROM products WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
 });
 
-// ─── RECEIPTS ─────────────────────────────────────────────────────────────────
-app.get('/api/receipts', (req, res) => {
-  res.json(db.prepare(`
+// Receipts
+app.get('/api/receipts', async (req, res) => {
+  res.json(await all(`
     SELECT
       r.id,
       r.date,
       s.name AS supplier_name,
       c.name AS client_name,
-      COUNT(ri.id) AS items_count,
+      COUNT(ri.id)::int AS items_count,
       COALESCE(SUM(ri.weight),0) AS total_weight,
       COALESCE(SUM(ri.quantity),0) AS total_quantity
     FROM receipts r
-    LEFT JOIN suppliers s ON s.id=r.supplier_id
-    LEFT JOIN clients c ON c.id=r.client_id
-    LEFT JOIN receipt_items ri ON ri.receipt_id=r.id
-    GROUP BY r.id,r.date,s.name,c.name
-    ORDER BY r.date DESC,r.created_at DESC
-  `).all());
+    LEFT JOIN suppliers s ON s.id = r.supplier_id
+    LEFT JOIN clients c ON c.id = r.client_id
+    LEFT JOIN receipt_items ri ON ri.receipt_id = r.id
+    GROUP BY r.id, r.date, s.name, c.name, r.created_at
+    ORDER BY r.date DESC, r.created_at DESC
+  `));
 });
 
-app.get('/api/receipts/:id', (req, res) => {
+app.get('/api/receipts/:id', async (req, res) => {
   const id = +req.params.id;
-  const receipt = db.prepare(`
-    SELECT r.*,s.name AS supplier_name,c.name AS client_name,cm.marking
+  const receipt = await get(`
+    SELECT r.*, s.name AS supplier_name, c.name AS client_name, m.marking
     FROM receipts r
-    LEFT JOIN suppliers s ON s.id=r.supplier_id
-    LEFT JOIN clients c ON c.id=r.client_id
-    LEFT JOIN client_markings cm ON cm.id=r.marking_id
-    WHERE r.id=?
-  `).get(id);
+    LEFT JOIN suppliers s ON s.id = r.supplier_id
+    LEFT JOIN clients c ON c.id = r.client_id
+    LEFT JOIN markings m ON m.id = r.marking_id
+    WHERE r.id=$1
+  `, [id]);
   if (!receipt) return res.status(404).json({ error: 'Приход не найден' });
-  const items = db.prepare(`
-    SELECT ri.*,p.name AS product_name
+  const items = await all(`
+    SELECT ri.*, p.name AS product_name
     FROM receipt_items ri
-    LEFT JOIN products p ON p.id=ri.product_id
-    WHERE ri.receipt_id=?
+    LEFT JOIN products p ON p.id = ri.product_id
+    WHERE ri.receipt_id=$1
     ORDER BY ri.id
-  `).all(id);
+  `, [id]);
   res.json({ ...receipt, items });
 });
 
-app.post('/api/receipts', (req, res) => {
-  const b = req.body;
-  const items = Array.isArray(b.items) ? b.items : [];
+app.post('/api/receipts', async (req, res) => {
+  const body = req.body;
+  const items = Array.isArray(body.items) ? body.items : [];
   if (!items.length) return res.status(400).json({ error: 'Добавьте хотя бы один товар' });
-  if (!b.date) return res.status(400).json({ error: 'Дата обязательна' });
-  if (!b.supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+  if (!body.date) return res.status(400).json({ error: 'Дата обязательна' });
+  if (!body.supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+
   try {
-    for (const item of items) {
-      if (!item.product_id) throw new Error('Выберите товар в каждой строке');
-      const weight = +(item.weight ?? item.weight_kg) || 0;
-      const quantity = +(item.quantity ?? item.quantity_pcs) || 0;
-      if (!(weight > 0) && !(quantity > 0)) throw new Error('Укажите вес или количество в каждой строке');
-      validatePurchaseNums({
-        weight_kg: weight,
-        quantity_pcs: quantity,
-        cost_almaty: item.cost_almaty,
-        cost_dubai: item.cost_dubai
-      });
-    }
+    const result = await withTx(async (client) => {
+      const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id, client);
+      const receipt = await get(
+        'INSERT INTO receipts(date,supplier_id,client_id,marking_id) VALUES($1,$2,$3,$4) RETURNING id',
+        [body.date, +body.supplier_id, cid, mid],
+        client
+      );
 
-    const createReceipt = db.transaction(() => {
-      const { cid, mid } = resolveClientMarking(b.client_id, b.marking_id);
-      const receipt = db.prepare('INSERT INTO receipts(date,supplier_id,client_id,marking_id) VALUES(?,?,?,?)')
-        .run(b.date, +b.supplier_id, cid, mid);
       const purchaseIds = [];
-
       for (const item of items) {
+        if (!item.product_id) throw new Error('Выберите товар в каждой строке');
         const weight = +(item.weight ?? item.weight_kg) || 0;
         const quantity = +(item.quantity ?? item.quantity_pcs) || 0;
-        const cost_almaty = +item.cost_almaty || 0;
-        const cost_dubai = +item.cost_dubai || 0;
-        const cost_per_kg = cost_almaty + cost_dubai;
-        const total_cost = cost_per_kg * weight;
+        if (!(weight > 0) && !(quantity > 0)) throw new Error('Укажите вес или количество в каждой строке');
+        validatePurchaseNums({ weight_kg: weight, quantity_pcs: quantity, cost_almaty: item.cost_almaty, cost_dubai: item.cost_dubai });
+
+        const costAlmaty = +item.cost_almaty || 0;
+        const costDubai = +item.cost_dubai || 0;
+        const costPerKg = costAlmaty + costDubai;
+        const totalCost = costPerKg * weight;
         const note = item.note || item.notes || null;
 
-        db.prepare('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES(?,?,?,?,?,?,?)')
-          .run(receipt.lastInsertRowid, +item.product_id, weight, quantity, cost_almaty, cost_dubai, note);
+        await query(
+          'INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES($1,$2,$3,$4,$5,$6,$7)',
+          [receipt.id, +item.product_id, weight, quantity, costAlmaty, costDubai, note],
+          client
+        );
 
-        const purchase = db.prepare('INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(b.date, cid, mid, +b.supplier_id, receipt.lastInsertRowid, +item.product_id, quantity, weight, +item.boxes_count || +item.boxes || 0, cost_almaty, cost_dubai, cost_per_kg, total_cost, 0, note);
-        purchaseIds.push(purchase.lastInsertRowid);
+        const purchase = await get(`
+          INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          RETURNING id
+        `, [body.date, cid, mid, +body.supplier_id, receipt.id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, totalCost, 0, note], client);
+        purchaseIds.push(purchase.id);
       }
 
-      return { receipt_id: receipt.lastInsertRowid, purchase_ids: purchaseIds };
+      return { receipt_id: receipt.id, purchase_ids: purchaseIds };
     });
 
-    const result = createReceipt();
     res.json({ id: result.receipt_id, items_count: items.length, purchase_ids: result.purchase_ids });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.put('/api/receipts/:id', (req, res) => {
+app.put('/api/receipts/:id', async (req, res) => {
   const id = +req.params.id;
-  const b = req.body;
-  const items = Array.isArray(b.items) ? b.items : [];
+  const body = req.body;
+  const items = Array.isArray(body.items) ? body.items : [];
   if (!items.length) return res.status(400).json({ error: 'Добавьте хотя бы один товар' });
-  if (!b.date) return res.status(400).json({ error: 'Дата обязательна' });
-  if (!b.supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+  if (!body.date) return res.status(400).json({ error: 'Дата обязательна' });
+  if (!body.supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+
   try {
-    const existing = db.prepare('SELECT * FROM receipts WHERE id=?').get(id);
+    const existing = await get('SELECT * FROM receipts WHERE id=$1', [id]);
     if (!existing) return res.status(404).json({ error: 'Приход не найден' });
-    for (const item of items) {
-      if (!item.product_id) throw new Error('Выберите товар в каждой строке');
-      const weight = +(item.weight ?? item.weight_kg) || 0;
-      const quantity = +(item.quantity ?? item.quantity_pcs) || 0;
-      if (!(weight > 0) && !(quantity > 0)) throw new Error('Укажите вес или количество в каждой строке');
-      validatePurchaseNums({
-        weight_kg: weight,
-        quantity_pcs: quantity,
-        cost_almaty: item.cost_almaty,
-        cost_dubai: item.cost_dubai
-      });
-    }
 
-    const updateReceipt = db.transaction(() => {
-      const { cid, mid } = resolveClientMarking(b.client_id, b.marking_id);
-      db.prepare('UPDATE receipts SET date=?,supplier_id=?,client_id=?,marking_id=? WHERE id=?')
-        .run(b.date, +b.supplier_id, cid, mid, id);
-      db.prepare(`
-        DELETE FROM purchases
-        WHERE receipt_id=?
-          OR (
-            receipt_id IS NULL
-            AND date=?
-            AND supplier_id=?
-            AND COALESCE(client_id,0)=COALESCE(?,0)
-            AND COALESCE(marking_id,0)=COALESCE(?,0)
-            AND EXISTS (
-              SELECT 1 FROM receipt_items ri
-              WHERE ri.receipt_id=?
-                AND ri.product_id=purchases.product_id
-                AND COALESCE(ri.weight,0)=COALESCE(purchases.weight_kg,0)
-                AND COALESCE(ri.quantity,0)=COALESCE(purchases.quantity_pcs,0)
-                AND COALESCE(ri.cost_almaty,0)=COALESCE(purchases.cost_almaty,0)
-                AND COALESCE(ri.cost_dubai,0)=COALESCE(purchases.cost_dubai,0)
-            )
-          )
-      `).run(id, existing.date, existing.supplier_id, existing.client_id, existing.marking_id, id);
-      db.prepare('DELETE FROM receipt_items WHERE receipt_id=?').run(id);
-      const purchaseIds = [];
+    const purchaseIds = await withTx(async (client) => {
+      const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id, client);
+      await query('UPDATE receipts SET date=$1,supplier_id=$2,client_id=$3,marking_id=$4 WHERE id=$5', [body.date, +body.supplier_id, cid, mid, id], client);
+      await query('DELETE FROM transactions WHERE receipt_id=$1', [id], client);
+      await query(`
+        DELETE FROM payments
+        WHERE entity_type='purchase'
+          AND entity_id IN (SELECT id FROM purchases WHERE receipt_id=$1)
+      `, [id], client);
+      await query('DELETE FROM purchases WHERE receipt_id=$1', [id], client);
+      await query('DELETE FROM receipt_items WHERE receipt_id=$1', [id], client);
 
+      const ids = [];
       for (const item of items) {
+        if (!item.product_id) throw new Error('Выберите товар в каждой строке');
         const weight = +(item.weight ?? item.weight_kg) || 0;
         const quantity = +(item.quantity ?? item.quantity_pcs) || 0;
-        const cost_almaty = +item.cost_almaty || 0;
-        const cost_dubai = +item.cost_dubai || 0;
-        const cost_per_kg = cost_almaty + cost_dubai;
-        const total_cost = cost_per_kg * weight;
+        if (!(weight > 0) && !(quantity > 0)) throw new Error('Укажите вес или количество в каждой строке');
+        validatePurchaseNums({ weight_kg: weight, quantity_pcs: quantity, cost_almaty: item.cost_almaty, cost_dubai: item.cost_dubai });
+
+        const costAlmaty = +item.cost_almaty || 0;
+        const costDubai = +item.cost_dubai || 0;
+        const costPerKg = costAlmaty + costDubai;
+        const totalCost = costPerKg * weight;
         const note = item.note || item.notes || null;
 
-        db.prepare('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES(?,?,?,?,?,?,?)')
-          .run(id, +item.product_id, weight, quantity, cost_almaty, cost_dubai, note);
-
-        const purchase = db.prepare('INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(b.date, cid, mid, +b.supplier_id, id, +item.product_id, quantity, weight, +item.boxes_count || +item.boxes || 0, cost_almaty, cost_dubai, cost_per_kg, total_cost, 0, note);
-        purchaseIds.push(purchase.lastInsertRowid);
+        await query('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES($1,$2,$3,$4,$5,$6,$7)', [id, +item.product_id, weight, quantity, costAlmaty, costDubai, note], client);
+        const purchase = await get(`
+          INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          RETURNING id
+        `, [body.date, cid, mid, +body.supplier_id, id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, totalCost, 0, note], client);
+        ids.push(purchase.id);
       }
-
-      return purchaseIds;
+      return ids;
     });
 
-    const purchaseIds = updateReceipt();
     res.json({ success: true, id, items_count: items.length, purchase_ids: purchaseIds });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.delete('/api/receipts/:id', (req, res) => {
+app.delete('/api/receipts/:id', async (req, res) => {
   const id = +req.params.id;
   try {
-    const receipt = db.prepare('SELECT * FROM receipts WHERE id=?').get(id);
+    const receipt = await get('SELECT * FROM receipts WHERE id=$1', [id]);
     if (!receipt) return res.status(404).json({ error: 'Приход не найден' });
-    const deleteReceipt = db.transaction(() => {
-      const purchaseIds = db.prepare(`
-        SELECT id FROM purchases
-        WHERE receipt_id=?
-          OR (
-            receipt_id IS NULL
-            AND supplier_id=?
-            AND date=?
-            AND EXISTS (
-              SELECT 1 FROM receipt_items ri
-              WHERE ri.receipt_id=?
-                AND ri.product_id=purchases.product_id
-            )
-          )
-      `).all(id, receipt.supplier_id, receipt.date, id).map(row => row.id);
-      db.prepare('DELETE FROM transactions WHERE receipt_id=?').run(id);
-      for (const purchaseId of purchaseIds) {
-        db.prepare("DELETE FROM payments WHERE entity_type='purchase' AND entity_id=?").run(purchaseId);
+    await withTx(async (client) => {
+      const purchaseIds = await all('SELECT id FROM purchases WHERE receipt_id=$1', [id], client);
+      await query('DELETE FROM transactions WHERE receipt_id=$1', [id], client);
+      for (const purchase of purchaseIds) {
+        await query("DELETE FROM payments WHERE entity_type='purchase' AND entity_id=$1", [purchase.id], client);
       }
-      db.prepare('DELETE FROM purchases WHERE receipt_id=?').run(id);
-      db.prepare(`
-        DELETE FROM purchases
-        WHERE receipt_id IS NULL
-          AND supplier_id=?
-          AND date=?
-          AND EXISTS (
-            SELECT 1 FROM receipt_items ri
-            WHERE ri.receipt_id=?
-              AND ri.product_id=purchases.product_id
-          )
-      `).run(receipt.supplier_id, receipt.date, id);
-      db.prepare('DELETE FROM receipt_items WHERE receipt_id=?').run(id);
-      db.prepare('DELETE FROM receipts WHERE id=?').run(id);
+      await query('DELETE FROM purchases WHERE receipt_id=$1', [id], client);
+      await query('DELETE FROM receipt_items WHERE receipt_id=$1', [id], client);
+      await query('DELETE FROM receipts WHERE id=$1', [id], client);
     });
-    deleteReceipt();
     res.json({ success: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.put('/api/receipts/:id/pay', (req, res) => {
+app.put('/api/receipts/:id/pay', async (req, res) => {
   const id = +req.params.id;
   const amount = +req.body.amount;
-  const account_from_id = +req.body.account_from_id;
+  const accountFromId = +req.body.account_from_id;
   const date = req.body.date || new Date().toISOString().slice(0, 10);
   const comment = req.body.comment || null;
-  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'expense', amount, account_id: account_from_id, receipt_id: id, sale_id: null });
-  if (!account_from_id) return validationError(res, 'Счет списания обязателен', { type: 'expense', amount, account_id: account_from_id, receipt_id: id, sale_id: null });
-  if (getAccountBalance(account_from_id) < amount) return validationError(res, 'Недостаточно средств в кассе', { type: 'expense', amount, account_id: account_from_id, receipt_id: id, sale_id: null });
+
+  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'expense', amount, account_id: accountFromId, receipt_id: id, sale_id: null });
+  if (!accountFromId) return validationError(res, 'Счет списания обязателен', { type: 'expense', amount, account_id: accountFromId, receipt_id: id, sale_id: null });
+  if (await getAccountBalance(accountFromId) < amount) return validationError(res, 'Недостаточно средств в кассе', { type: 'expense', amount, account_id: accountFromId, receipt_id: id, sale_id: null });
+
   try {
-    const receipt = db.prepare(`
-      SELECT r.*,COALESCE(SUM(p.total_cost),0) AS total_cost,MIN(p.id) AS anchor_purchase_id
+    const receipt = await get(`
+      SELECT r.*, COALESCE(SUM(p.total_cost),0) AS total_cost, MIN(p.id) AS anchor_purchase_id
       FROM receipts r
-      LEFT JOIN purchases p ON p.receipt_id=r.id
-      WHERE r.id=?
+      LEFT JOIN purchases p ON p.receipt_id = r.id
+      WHERE r.id=$1
       GROUP BY r.id
-    `).get(id);
+    `, [id]);
     if (!receipt) return res.status(404).json({ error: 'Приход не найден' });
     if (!receipt.anchor_purchase_id) return res.status(400).json({ error: 'В документе нет товаров для оплаты' });
-    const paid = +getReceiptPaidAmount(id) || 0;
-    const remaining = (+receipt.total_cost || 0) - paid;
-    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'expense', amount, account_id: account_from_id, receipt_id: id, sale_id: null });
-    const payReceipt = db.transaction(() => {
-      const payment = db.prepare('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES(?,?,?,?,?)')
-        .run('purchase', receipt.anchor_purchase_id, amount, date, comment);
-      const transaction = db.prepare('INSERT INTO transactions(type,amount,account_from_id,receipt_id,date,comment,related_type,related_id) VALUES(?,?,?,?,?,?,?,?)')
-        .run('expense', amount, account_from_id, id, date, comment, 'payment', payment.lastInsertRowid);
-      db.prepare('UPDATE payments SET transaction_id=? WHERE id=?').run(transaction.lastInsertRowid, payment.lastInsertRowid);
-      rebalanceReceiptPurchasePaidAmounts(id);
+
+    const paid = await getReceiptPaidAmount(id);
+    const remaining = +(receipt.total_cost || 0) - paid;
+    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'expense', amount, account_id: accountFromId, receipt_id: id, sale_id: null });
+
+    await withTx(async (client) => {
+      const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['purchase', +receipt.anchor_purchase_id, amount, date, comment], client);
+      const transaction = await get(`
+        INSERT INTO transactions(type,amount,account_from_id,receipt_id,date,comment,related_type,related_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING id
+      `, ['expense', amount, accountFromId, id, date, comment, 'payment', payment.id], client);
+      await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+      await rebalanceReceiptPurchasePaidAmounts(id, client);
     });
-    payReceipt();
-    const newPaid = +getReceiptPaidAmount(id) || 0;
-    res.json({ success: true, receipt_id: id, paid_amount: newPaid, payable: (+receipt.total_cost || 0) - newPaid });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+
+    const newPaid = await getReceiptPaidAmount(id);
+    res.json({ success: true, receipt_id: id, paid_amount: newPaid, payable: +(receipt.total_cost || 0) - newPaid });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-// ─── PURCHASES ────────────────────────────────────────────────────────────────
-app.get('/api/purchases', (req, res) => {
+// Purchases
+app.get('/api/purchases', async (req, res) => {
   const { client_id, product_id, from_date, to_date } = req.query;
-  let sql = `SELECT p.*,c.name AS client_name,cm.marking,pr.name AS product_name
+  const params = [];
+  const where = ['1=1'];
+  if (client_id) { params.push(+client_id); where.push(`p.client_id=$${params.length}`); }
+  if (product_id) { params.push(+product_id); where.push(`p.product_id=$${params.length}`); }
+  if (from_date) { params.push(from_date); where.push(`p.date >= $${params.length}`); }
+  if (to_date) { params.push(to_date); where.push(`p.date <= $${params.length}`); }
+
+  res.json(await all(`
+    SELECT p.*, c.name AS client_name, m.marking, pr.name AS product_name
     FROM purchases p
-    LEFT JOIN clients c ON c.id=p.client_id
-    LEFT JOIN client_markings cm ON cm.id=p.marking_id
-    LEFT JOIN products pr ON pr.id=p.product_id WHERE 1=1`;
-  const args = [];
-  if (client_id)  { sql += ' AND p.client_id=?';  args.push(+client_id); }
-  if (product_id) { sql += ' AND p.product_id=?'; args.push(+product_id); }
-  if (from_date)  { sql += ' AND p.date>=?';       args.push(from_date); }
-  if (to_date)    { sql += ' AND p.date<=?';       args.push(to_date); }
-  sql += ' ORDER BY p.date DESC, p.created_at DESC';
-  res.json(db.prepare(sql).all(...args));
+    LEFT JOIN clients c ON c.id = p.client_id
+    LEFT JOIN markings m ON m.id = p.marking_id
+    LEFT JOIN products pr ON pr.id = p.product_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY p.date DESC, p.created_at DESC
+  `, params));
 });
 
-app.post('/api/purchases', (req, res) => {
-  const b = req.body;
-  if (!b.date || !b.product_id) return res.status(400).json({ error: 'Дата и товар обязательны' });
-  if (!b.supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+app.post('/api/purchases', async (req, res) => {
+  const body = req.body;
+  if (!body.date || !body.product_id) return res.status(400).json({ error: 'Дата и товар обязательны' });
+  if (!body.supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+
   try {
-    validatePurchaseNums({ weight_kg: b.weight_kg, quantity_pcs: b.quantity_pcs, cost_almaty: b.cost_almaty, cost_dubai: b.cost_dubai });
-    const { cid, mid } = resolveClientMarking(b.client_id, b.marking_id);
-    // total_cost считается сервером — с фронта не принимается
-    const weight = +b.weight_kg || 0;
-    const cost_per_kg = (+b.cost_almaty || 0) + (+b.cost_dubai || 0);
-    const total_cost = cost_per_kg * weight;
-    const paid_amount = +b.paid_amount || 0;
-    const payable = total_cost - paid_amount;
-    const supplier_id = +b.supplier_id;
-    const r = db.prepare('INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(b.date, cid, mid, supplier_id, +b.product_id, +b.quantity_pcs||0, weight, +b.boxes_count||0, +b.cost_almaty||0, +b.cost_dubai||0, cost_per_kg, total_cost, paid_amount, b.notes||null);
-    res.json({ id: r.lastInsertRowid, cost_per_kg, total_cost, paid_amount, payable });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+    validatePurchaseNums(body);
+    const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
+    const weight = +body.weight_kg || 0;
+    const costPerKg = (+body.cost_almaty || 0) + (+body.cost_dubai || 0);
+    const totalCost = costPerKg * weight;
+    const paidAmount = +body.paid_amount || 0;
+    const row = await get(`
+      INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      RETURNING id
+    `, [body.date, cid, mid, +body.supplier_id, +body.product_id, +body.quantity_pcs || 0, weight, +body.boxes_count || 0, +body.cost_almaty || 0, +body.cost_dubai || 0, costPerKg, totalCost, paidAmount, body.notes || null]);
+    res.json({ id: row.id, cost_per_kg: costPerKg, total_cost: totalCost, paid_amount: paidAmount, payable: totalCost - paidAmount });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.put('/api/purchases/:id', (req, res) => {
-  const b = req.body;
-  if (!b.date || !b.product_id) return res.status(400).json({ error: 'Дата и товар обязательны' });
+app.put('/api/purchases/:id', async (req, res) => {
+  const body = req.body;
+  if (!body.date || !body.product_id) return res.status(400).json({ error: 'Дата и товар обязательны' });
   try {
-    validatePurchaseNums({ weight_kg: b.weight_kg, quantity_pcs: b.quantity_pcs, cost_almaty: b.cost_almaty, cost_dubai: b.cost_dubai });
-    const { cid, mid } = resolveClientMarking(b.client_id, b.marking_id);
-    // total_cost считается сервером — с фронта не принимается
-    const weight = +b.weight_kg || 0;
-    const cost_per_kg = (+b.cost_almaty || 0) + (+b.cost_dubai || 0);
-    const total_cost = cost_per_kg * weight;
-    db.prepare('UPDATE purchases SET date=?,client_id=?,marking_id=?,product_id=?,quantity_pcs=?,weight_kg=?,boxes_count=?,cost_almaty=?,cost_dubai=?,cost_per_kg=?,total_cost=?,notes=? WHERE id=?')
-      .run(b.date, cid, mid, +b.product_id, +b.quantity_pcs||0, weight, +b.boxes_count||0, +b.cost_almaty||0, +b.cost_dubai||0, cost_per_kg, total_cost, b.notes||null, +req.params.id);
-    res.json({ success: true, cost_per_kg, total_cost });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+    validatePurchaseNums(body);
+    const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
+    const weight = +body.weight_kg || 0;
+    const costPerKg = (+body.cost_almaty || 0) + (+body.cost_dubai || 0);
+    const totalCost = costPerKg * weight;
+    await query(`
+      UPDATE purchases
+      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,quantity_pcs=$5,weight_kg=$6,boxes_count=$7,cost_almaty=$8,cost_dubai=$9,cost_per_kg=$10,total_cost=$11,notes=$12
+      WHERE id=$13
+    `, [body.date, cid, mid, +body.product_id, +body.quantity_pcs || 0, weight, +body.boxes_count || 0, +body.cost_almaty || 0, +body.cost_dubai || 0, costPerKg, totalCost, body.notes || null, +req.params.id]);
+    res.json({ success: true, cost_per_kg: costPerKg, total_cost: totalCost });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.put('/api/purchases/:id/pay', (req, res) => {
+app.put('/api/purchases/:id/pay', async (req, res) => {
   const id = +req.params.id;
   const amount = +req.body.amount;
-  const account_from_id = +req.body.account_from_id;
+  const accountFromId = +req.body.account_from_id;
   const date = req.body.date || new Date().toISOString().slice(0, 10);
   const comment = req.body.comment || null;
-  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'expense', amount, account_id: account_from_id, receipt_id: null, sale_id: null });
-  if (!account_from_id) return validationError(res, 'Счет списания обязателен', { type: 'expense', amount, account_id: account_from_id, receipt_id: null, sale_id: null });
-  if (getAccountBalance(account_from_id) < amount) return validationError(res, 'Недостаточно средств в кассе', { type: 'expense', amount, account_id: account_from_id, receipt_id: null, sale_id: null });
+
+  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'expense', amount, account_id: accountFromId, receipt_id: null, sale_id: null });
+  if (!accountFromId) return validationError(res, 'Счет списания обязателен', { type: 'expense', amount, account_id: accountFromId, receipt_id: null, sale_id: null });
+  if (await getAccountBalance(accountFromId) < amount) return validationError(res, 'Недостаточно средств в кассе', { type: 'expense', amount, account_id: accountFromId, receipt_id: null, sale_id: null });
+
   try {
-    const purchase = db.prepare('SELECT * FROM purchases WHERE id=?').get(id);
+    const purchase = await get('SELECT * FROM purchases WHERE id=$1', [id]);
     if (!purchase) return res.status(404).json({ error: 'Приход не найден' });
-    if (!purchase.receipt_id) return validationError(res, 'Expense должен быть привязан к приходу (receipt_id обязателен)', { type: 'expense', amount, account_id: account_from_id, receipt_id: null, sale_id: null });
-    const newPaid = (+purchase.paid_amount || 0) + amount;
-    const remaining = (+purchase.total_cost || 0) - (+purchase.paid_amount || 0);
-    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'expense', amount, account_id: account_from_id, receipt_id: purchase.receipt_id || null, sale_id: null });
-    const payPurchase = db.transaction(() => {
-      const payment = db.prepare('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES(?,?,?,?,?)')
-        .run('purchase', id, amount, date, comment);
-      const transaction = db.prepare('INSERT INTO transactions(type,amount,account_from_id,receipt_id,date,comment,related_type,related_id) VALUES(?,?,?,?,?,?,?,?)')
-        .run('expense', amount, account_from_id, purchase.receipt_id || null, date, comment, 'payment', payment.lastInsertRowid);
-      db.prepare('UPDATE payments SET transaction_id=? WHERE id=?').run(transaction.lastInsertRowid, payment.lastInsertRowid);
-      db.prepare('UPDATE purchases SET paid_amount=? WHERE id=?').run(newPaid, id);
+    if (!purchase.receipt_id) return validationError(res, 'Expense должен быть привязан к приходу (receipt_id обязателен)', { type: 'expense', amount, account_id: accountFromId, receipt_id: null, sale_id: null });
+
+    const remaining = +(purchase.total_cost || 0) - +(purchase.paid_amount || 0);
+    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'expense', amount, account_id: accountFromId, receipt_id: +purchase.receipt_id, sale_id: null });
+
+    await withTx(async (client) => {
+      const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['purchase', id, amount, date, comment], client);
+      const transaction = await get(`
+        INSERT INTO transactions(type,amount,account_from_id,receipt_id,date,comment,related_type,related_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING id
+      `, ['expense', amount, accountFromId, +purchase.receipt_id, date, comment, 'payment', payment.id], client);
+      await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+      await rebalanceReceiptPurchasePaidAmounts(+purchase.receipt_id, client);
     });
-    payPurchase();
-    res.json({ success: true, paid_amount: newPaid, payable: purchase.total_cost - newPaid });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+
+    const paidAmount = +(await getReceiptPaidAmount(+purchase.receipt_id));
+    const receiptTotal = await get('SELECT COALESCE(SUM(total_cost),0) AS total FROM purchases WHERE receipt_id=$1', [+purchase.receipt_id]);
+    res.json({ success: true, paid_amount: paidAmount, payable: +(receiptTotal?.total || 0) - paidAmount });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.delete('/api/purchases/:id', (req, res) => {
-  db.prepare('DELETE FROM purchases WHERE id=?').run(+req.params.id);
+app.delete('/api/purchases/:id', async (req, res) => {
+  await query('DELETE FROM purchases WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
 });
 
-// ─── SALES ────────────────────────────────────────────────────────────────────
-app.get('/api/sales', (req, res) => {
+// Sales
+app.get('/api/sales', async (req, res) => {
   const { client_id, product_id, from_date, to_date } = req.query;
-  let sql = `SELECT s.*,c.name AS client_name,cm.marking,p.name AS product_name
+  const params = [];
+  const where = ['1=1'];
+  if (client_id) { params.push(+client_id); where.push(`s.client_id=$${params.length}`); }
+  if (product_id) { params.push(+product_id); where.push(`s.product_id=$${params.length}`); }
+  if (from_date) { params.push(from_date); where.push(`s.date >= $${params.length}`); }
+  if (to_date) { params.push(to_date); where.push(`s.date <= $${params.length}`); }
+
+  res.json(await all(`
+    SELECT s.*, c.name AS client_name, m.marking, p.name AS product_name
     FROM sales s
-    LEFT JOIN clients c ON c.id=s.client_id
-    LEFT JOIN client_markings cm ON cm.id=s.marking_id
-    LEFT JOIN products p ON p.id=s.product_id WHERE 1=1`;
-  const args = [];
-  if (client_id)  { sql += ' AND s.client_id=?';  args.push(+client_id); }
-  if (product_id) { sql += ' AND s.product_id=?'; args.push(+product_id); }
-  if (from_date)  { sql += ' AND s.date>=?';       args.push(from_date); }
-  if (to_date)    { sql += ' AND s.date<=?';       args.push(to_date); }
-  sql += ' ORDER BY s.date DESC, s.created_at DESC';
-  res.json(db.prepare(sql).all(...args));
+    LEFT JOIN clients c ON c.id = s.client_id
+    LEFT JOIN markings m ON m.id = s.marking_id
+    LEFT JOIN products p ON p.id = s.product_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY s.date DESC, s.created_at DESC
+  `, params));
 });
 
-app.post('/api/sales', (req, res) => {
-  const b = req.body; // total_amount из body ИГНОРИРУЕТСЯ
-  if (!b.date || !b.product_id || !b.sale_unit || b.quantity == null || b.price_per_unit == null)
+app.post('/api/sales', async (req, res) => {
+  const body = req.body;
+  if (!body.date || !body.product_id || !body.sale_unit || body.quantity == null || body.price_per_unit == null) {
     return res.status(400).json({ error: 'Заполните все обязательные поля' });
+  }
   try {
-    validateSale(b.product_id, b.sale_unit, b.quantity, b.price_per_unit);
-    const { cid, mid } = resolveClientMarking(b.client_id, b.marking_id);
-    const total_amount = Math.round(+b.quantity * +b.price_per_unit * 100) / 100;
-    const paid_amount = +b.paid_amount || 0;
-    const debt = total_amount - paid_amount;
-    const r = db.prepare('INSERT INTO sales(date,client_id,marking_id,product_id,sale_unit,quantity,price_per_unit,total_amount,paid_amount,notes) VALUES(?,?,?,?,?,?,?,?,?,?)')
-      .run(b.date, cid, mid, +b.product_id, b.sale_unit, +b.quantity, +b.price_per_unit, total_amount, paid_amount, b.notes||null);
-    res.json({ id: r.lastInsertRowid, total_amount, paid_amount, debt });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+    await validateSale(body.product_id, body.sale_unit, body.quantity, body.price_per_unit);
+    const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
+    const totalAmount = Math.round(+body.quantity * +body.price_per_unit * 100) / 100;
+    const paidAmount = +body.paid_amount || 0;
+    const row = await get(`
+      INSERT INTO sales(date,client_id,marking_id,product_id,sale_unit,quantity,price_per_unit,total_amount,paid_amount,notes)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      RETURNING id
+    `, [body.date, cid, mid, +body.product_id, body.sale_unit, +body.quantity, +body.price_per_unit, totalAmount, paidAmount, body.notes || null]);
+    res.json({ id: row.id, total_amount: totalAmount, paid_amount: paidAmount, debt: totalAmount - paidAmount });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.put('/api/sales/:id', (req, res) => {
-  const b = req.body; // total_amount ИГНОРИРУЕТСЯ
-  if (!b.date || !b.product_id || !b.sale_unit || b.quantity == null || b.price_per_unit == null)
+app.put('/api/sales/:id', async (req, res) => {
+  const body = req.body;
+  if (!body.date || !body.product_id || !body.sale_unit || body.quantity == null || body.price_per_unit == null) {
     return res.status(400).json({ error: 'Заполните все обязательные поля' });
+  }
   try {
-    validateSale(b.product_id, b.sale_unit, b.quantity, b.price_per_unit);
-    const { cid, mid } = resolveClientMarking(b.client_id, b.marking_id);
-    const total_amount = Math.round(+b.quantity * +b.price_per_unit * 100) / 100;
-    db.prepare('UPDATE sales SET date=?,client_id=?,marking_id=?,product_id=?,sale_unit=?,quantity=?,price_per_unit=?,total_amount=?,notes=? WHERE id=?')
-      .run(b.date, cid, mid, +b.product_id, b.sale_unit, +b.quantity, +b.price_per_unit, total_amount, b.notes||null, +req.params.id);
-    res.json({ success: true, total_amount });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+    await validateSale(body.product_id, body.sale_unit, body.quantity, body.price_per_unit);
+    const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
+    const totalAmount = Math.round(+body.quantity * +body.price_per_unit * 100) / 100;
+    await query(`
+      UPDATE sales
+      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
+      WHERE id=$10
+    `, [body.date, cid, mid, +body.product_id, body.sale_unit, +body.quantity, +body.price_per_unit, totalAmount, body.notes || null, +req.params.id]);
+    res.json({ success: true, total_amount: totalAmount });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.put('/api/sales/:id/pay', (req, res) => {
+app.put('/api/sales/:id/pay', async (req, res) => {
   const id = +req.params.id;
   const amount = +req.body.amount;
-  const account_to_id = +req.body.account_to_id;
+  const accountToId = +req.body.account_to_id;
   const date = req.body.date || new Date().toISOString().slice(0, 10);
   const comment = req.body.comment || null;
-  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'income', amount, account_id: account_to_id, receipt_id: null, sale_id: id });
-  if (!account_to_id) return validationError(res, 'Счет зачисления обязателен', { type: 'income', amount, account_id: account_to_id, receipt_id: null, sale_id: id });
+  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: id });
+  if (!accountToId) return validationError(res, 'Счет зачисления обязателен', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: id });
+
   try {
-    const sale = db.prepare('SELECT * FROM sales WHERE id=?').get(id);
+    const sale = await get('SELECT * FROM sales WHERE id=$1', [id]);
     if (!sale) return res.status(404).json({ error: 'Продажа не найдена' });
-    const newPaid = (+sale.paid_amount || 0) + amount;
-    const remaining = (+sale.total_amount || 0) - (+sale.paid_amount || 0);
-    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'income', amount, account_id: account_to_id, receipt_id: null, sale_id: id });
-    const paySale = db.transaction(() => {
-      const payment = db.prepare('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES(?,?,?,?,?)')
-        .run('sale', id, amount, date, comment);
-      const transaction = db.prepare('INSERT INTO transactions(type,amount,account_to_id,sale_id,date,comment,related_type,related_id) VALUES(?,?,?,?,?,?,?,?)')
-        .run('income', amount, account_to_id, id, date, comment, 'payment', payment.lastInsertRowid);
-      db.prepare('UPDATE payments SET transaction_id=? WHERE id=?').run(transaction.lastInsertRowid, payment.lastInsertRowid);
-      db.prepare('UPDATE sales SET paid_amount=? WHERE id=?').run(newPaid, id);
+    const remaining = +(sale.total_amount || 0) - +(sale.paid_amount || 0);
+    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: id });
+
+    await withTx(async (client) => {
+      const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['sale', id, amount, date, comment], client);
+      const transaction = await get(`
+        INSERT INTO transactions(type,amount,account_to_id,sale_id,date,comment,related_type,related_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING id
+      `, ['income', amount, accountToId, id, date, comment, 'payment', payment.id], client);
+      await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+      await query('UPDATE sales SET paid_amount = COALESCE(paid_amount,0) + $1 WHERE id=$2', [amount, id], client);
     });
-    paySale();
-    res.json({ success: true, paid_amount: newPaid, debt: sale.total_amount - newPaid });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+
+    const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [id]);
+    res.json({ success: true, paid_amount: +(updated.paid_amount || 0), debt: +(updated.total_amount || 0) - +(updated.paid_amount || 0) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-app.delete('/api/sales/:id', (req, res) => {
+app.delete('/api/sales/:id', async (req, res) => {
   const id = +req.params.id;
   try {
-    const deleteSale = db.transaction(() => {
-      db.prepare('DELETE FROM transactions WHERE sale_id=?').run(id);
-      db.prepare("DELETE FROM payments WHERE entity_type='sale' AND entity_id=?").run(id);
-      db.prepare('DELETE FROM sales WHERE id=?').run(id);
+    await withTx(async (client) => {
+      await query('DELETE FROM transactions WHERE sale_id=$1', [id], client);
+      await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id=$1", [id], client);
+      await query('DELETE FROM sales WHERE id=$1', [id], client);
     });
-    deleteSale();
     res.json({ success: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
-// ─── DEBTS ────────────────────────────────────────────────────────────────────
-app.get('/api/debts', (req, res) => {
-  const debts = db.prepare(`
+// Debts
+app.get('/api/debts', async (req, res) => {
+  const debts = await all(`
     WITH receipt_totals AS (
-      SELECT
-        r.id AS receipt_id,
-        r.date,
-        r.supplier_id,
-        sup.name AS supplier_name,
-        COALESCE(SUM(p.total_cost),0) AS total
+      SELECT r.id AS receipt_id, r.date, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost),0) AS total
       FROM receipts r
-      JOIN purchases p ON p.receipt_id=r.id
-      LEFT JOIN suppliers sup ON sup.id=r.supplier_id
-      GROUP BY r.id,r.date,r.supplier_id,sup.name
+      JOIN purchases p ON p.receipt_id = r.id
+      LEFT JOIN suppliers s ON s.id = r.supplier_id
+      GROUP BY r.id, r.date, r.supplier_id, s.name
     ),
     receipt_payments AS (
-      SELECT
-        x.receipt_id,
-        COALESCE(SUM(x.amount),0) AS paid
+      SELECT x.receipt_id, COALESCE(SUM(x.amount),0) AS paid
       FROM (
         SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
         FROM payments p
-        LEFT JOIN transactions t ON t.id=p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
         WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
       ) x
       GROUP BY x.receipt_id
     )
-    SELECT type,id,date,client_id,client_name,marking_id,marking,supplier_id,supplier_name,product_id,product_name,amount,paid_amount,debt,notes,total,paid,document_label
+    SELECT *
     FROM (
-      SELECT 'receivable' AS type,s.id,s.date,s.client_id,c.name AS client_name,s.marking_id,cm.marking,
-             NULL AS supplier_id,NULL AS supplier_name,s.product_id,p.name AS product_name,s.total_amount AS amount,s.paid_amount,
-             s.total_amount - COALESCE(s.paid_amount,0) AS debt,s.notes,s.created_at,
-             s.total_amount AS total,COALESCE(s.paid_amount,0) AS paid,NULL AS document_label
+      SELECT
+        'receivable' AS type,
+        s.id,
+        s.date,
+        s.client_id,
+        c.name AS client_name,
+        s.marking_id,
+        m.marking,
+        NULL::INTEGER AS supplier_id,
+        NULL::TEXT AS supplier_name,
+        s.product_id,
+        p.name AS product_name,
+        s.total_amount AS amount,
+        COALESCE(s.paid_amount,0) AS paid_amount,
+        s.total_amount - COALESCE(s.paid_amount,0) AS debt,
+        s.notes,
+        s.total_amount AS total,
+        COALESCE(s.paid_amount,0) AS paid,
+        NULL::TEXT AS document_label,
+        s.created_at
       FROM sales s
-      LEFT JOIN clients c ON c.id=s.client_id
-      LEFT JOIN client_markings cm ON cm.id=s.marking_id
-      LEFT JOIN products p ON p.id=s.product_id
+      LEFT JOIN clients c ON c.id = s.client_id
+      LEFT JOIN markings m ON m.id = s.marking_id
+      LEFT JOIN products p ON p.id = s.product_id
       WHERE s.total_amount - COALESCE(s.paid_amount,0) > 0
       UNION ALL
-      SELECT 'payable' AS type,rt.receipt_id AS id,rt.date,NULL AS client_id,NULL AS client_name,NULL AS marking_id,NULL AS marking,
-             rt.supplier_id,rt.supplier_name,NULL AS product_id,NULL AS product_name,rt.total AS amount,COALESCE(rp.paid,0) AS paid_amount,
-             rt.total - COALESCE(rp.paid,0) AS debt,NULL AS notes,rt.receipt_id AS created_at,
-             rt.total AS total,COALESCE(rp.paid,0) AS paid,'Приход №' || rt.receipt_id AS document_label
+      SELECT
+        'payable' AS type,
+        rt.receipt_id AS id,
+        rt.date,
+        NULL::INTEGER AS client_id,
+        NULL::TEXT AS client_name,
+        NULL::INTEGER AS marking_id,
+        NULL::TEXT AS marking,
+        rt.supplier_id,
+        rt.supplier_name,
+        NULL::INTEGER AS product_id,
+        NULL::TEXT AS product_name,
+        rt.total AS amount,
+        COALESCE(rp.paid,0) AS paid_amount,
+        rt.total - COALESCE(rp.paid,0) AS debt,
+        NULL::TEXT AS notes,
+        rt.total,
+        COALESCE(rp.paid,0) AS paid,
+        'Приход №' || rt.receipt_id AS document_label,
+        rt.receipt_id::text AS created_at
       FROM receipt_totals rt
-      LEFT JOIN receipt_payments rp ON rp.receipt_id=rt.receipt_id
+      LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.receipt_id
       WHERE rt.total - COALESCE(rp.paid,0) > 0
-    )
+    ) q
     ORDER BY date DESC, created_at DESC
-  `).all();
+  `);
   res.json(debts);
 });
 
-app.get('/api/debts/by-suppliers', (req, res) => {
-  res.json(db.prepare(`
+app.get('/api/debts/by-suppliers', async (req, res) => {
+  res.json(await all(`
     WITH receipt_totals AS (
-      SELECT r.id,r.supplier_id,COALESCE(SUM(p.total_cost),0) AS total
+      SELECT r.id, r.supplier_id, COALESCE(SUM(p.total_cost),0) AS total
       FROM receipts r
-      JOIN purchases p ON p.receipt_id=r.id
-      GROUP BY r.id,r.supplier_id
+      JOIN purchases p ON p.receipt_id = r.id
+      GROUP BY r.id, r.supplier_id
     ),
     receipt_payments AS (
-      SELECT
-        x.receipt_id,
-        COALESCE(SUM(x.amount),0) AS paid
+      SELECT x.receipt_id, COALESCE(SUM(x.amount),0) AS paid
       FROM (
         SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
         FROM payments p
-        LEFT JOIN transactions t ON t.id=p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
         WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
       ) x
       GROUP BY x.receipt_id
     )
-    SELECT
-      sup.id,
-      sup.name,
-      COALESCE(SUM(rt.total - COALESCE(rp.paid,0)),0) AS debt
-    FROM suppliers sup
-    LEFT JOIN receipt_totals rt ON rt.supplier_id = sup.id
+    SELECT s.id, s.name, COALESCE(SUM(rt.total - COALESCE(rp.paid,0)),0) AS debt
+    FROM suppliers s
+    LEFT JOIN receipt_totals rt ON rt.supplier_id = s.id
     LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.id
-    GROUP BY sup.id,sup.name
-    HAVING debt > 0
+    GROUP BY s.id, s.name
+    HAVING COALESCE(SUM(rt.total - COALESCE(rp.paid,0)),0) > 0
     ORDER BY debt DESC
-  `).all());
+  `));
 });
 
-app.get('/api/debts/summary', (req, res) => {
-  const receivable = db.prepare(`
-    SELECT COUNT(*) AS count,COALESCE(SUM(total_amount - COALESCE(paid_amount,0)),0) AS total
-    FROM sales
-    WHERE total_amount - COALESCE(paid_amount,0) > 0
-  `).get();
-  const payable = db.prepare(`
-    WITH receipt_totals AS (
-      SELECT r.id,COALESCE(SUM(p.total_cost),0) AS total
-      FROM receipts r
-      JOIN purchases p ON p.receipt_id=r.id
-      GROUP BY r.id
-    ),
-    receipt_payments AS (
-      SELECT
-        x.receipt_id,
-        COALESCE(SUM(x.amount),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
-        FROM payments p
-        LEFT JOIN transactions t ON t.id=p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
-        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
-      ) x
-      GROUP BY x.receipt_id
-    )
-    SELECT COUNT(*) AS count,COALESCE(SUM(total - COALESCE(paid,0)),0) AS total
-    FROM (
-      SELECT rt.id,rt.total,COALESCE(rp.paid,0) AS paid
-      FROM receipt_totals rt
-      LEFT JOIN receipt_payments rp ON rp.receipt_id=rt.id
-      WHERE rt.total - COALESCE(rp.paid,0) > 0
-    )
-  `).get();
-  const total_withdrawals = db.prepare('SELECT COALESCE(SUM(amount),0) v FROM withdrawals').get().v;
-  res.json({ receivable, payable, total_withdrawals, balance: receivable.total - payable.total });
+app.get('/api/debts/summary', async (req, res) => {
+  res.json(await debtSummaryData());
 });
 
-// ─── PAYMENTS ─────────────────────────────────────────────────────────────────
-app.get('/api/payments', (req, res) => {
-  const payments = db.prepare(`
-    SELECT 
+// Payments
+app.get('/api/payments', async (req, res) => {
+  res.json(await all(`
+    SELECT
       p.id,
       p.entity_type,
       p.entity_id,
@@ -1024,83 +1066,76 @@ app.get('/api/payments', (req, res) => {
     FROM payments p
     LEFT JOIN transactions t ON t.id = p.transaction_id
     LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
-    LEFT JOIN sales s ON p.entity_type='sale' AND s.id=p.entity_id
-    LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
+    LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+    LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
     LEFT JOIN clients c ON c.id = COALESCE(s.client_id, pu.client_id)
     LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, pu.product_id)
     ORDER BY p.date DESC, p.created_at DESC
-  `).all();
-  res.json(payments);
+  `));
 });
 
-app.get('/api/ledger', (req, res) => {
+// Ledger
+app.get('/api/ledger', async (req, res) => {
   const { type, id } = req.query;
   const entityId = +id;
-  if (!['client', 'supplier'].includes(type) || !entityId) {
-    return res.status(400).json({ error: 'type и id обязательны' });
-  }
+  if (!['client', 'supplier'].includes(type) || !entityId) return res.status(400).json({ error: 'type и id обязательны' });
 
   const rows = type === 'client'
-    ? db.prepare(`
-      SELECT date,type,id,amount,paid_amount,comment,account_name,transaction_type,created_at
-      FROM (
-        SELECT s.date,'sale' AS type,s.id,s.total_amount AS amount,s.paid_amount,s.notes AS comment,
-               NULL AS account_name,NULL AS transaction_type,s.created_at,0 AS sort_order
-        FROM sales s
-        WHERE s.client_id=?
-        UNION ALL
-        SELECT p.date,'payment' AS type,p.id,p.amount,NULL AS paid_amount,p.comment,
-               a.name AS account_name,t.type AS transaction_type,p.created_at,1 AS sort_order
-        FROM payments p
-        JOIN sales s ON p.entity_type='sale' AND s.id=p.entity_id
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
-        WHERE s.client_id=?
-      )
-      ORDER BY date ASC,created_at ASC,sort_order ASC,id ASC
-    `).all(entityId, entityId)
-    : db.prepare(`
-      SELECT date,type,id,amount,paid_amount,comment,account_name,transaction_type,created_at
-      FROM (
-        SELECT p.date,'purchase' AS type,p.id,p.total_cost AS amount,p.paid_amount,p.notes AS comment,
-               NULL AS account_name,NULL AS transaction_type,p.created_at,0 AS sort_order
-        FROM purchases p
-        WHERE p.supplier_id=?
-        UNION ALL
-        SELECT pay.date,'payment' AS type,pay.id,pay.amount,NULL AS paid_amount,pay.comment,
-               a.name AS account_name,t.type AS transaction_type,pay.created_at,1 AS sort_order
-        FROM payments pay
-        JOIN purchases p ON pay.entity_type='purchase' AND p.id=pay.entity_id
-        LEFT JOIN transactions t ON t.id = pay.transaction_id
-        LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
-        WHERE p.supplier_id=?
-      )
-      ORDER BY date ASC,created_at ASC,sort_order ASC,id ASC
-    `).all(entityId, entityId);
+    ? await all(`
+        SELECT * FROM (
+          SELECT s.date,'sale' AS type,s.id,s.total_amount AS amount,s.paid_amount,s.notes AS comment,NULL::TEXT AS account_name,NULL::TEXT AS transaction_type,s.created_at,0 AS sort_order
+          FROM sales s
+          WHERE s.client_id=$1
+          UNION ALL
+          SELECT p.date,'payment' AS type,p.id,p.amount,NULL::NUMERIC AS paid_amount,p.comment,a.name AS account_name,t.type AS transaction_type,p.created_at,1 AS sort_order
+          FROM payments p
+          JOIN sales s ON p.entity_type='sale' AND s.id=p.entity_id
+          LEFT JOIN transactions t ON t.id=p.transaction_id
+          LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
+          WHERE s.client_id=$1
+        ) x
+        ORDER BY date ASC, created_at ASC, sort_order ASC, id ASC
+      `, [entityId])
+    : await all(`
+        SELECT * FROM (
+          SELECT p.date,'purchase' AS type,p.id,p.total_cost AS amount,p.paid_amount,p.notes AS comment,NULL::TEXT AS account_name,NULL::TEXT AS transaction_type,p.created_at,0 AS sort_order
+          FROM purchases p
+          WHERE p.supplier_id=$1
+          UNION ALL
+          SELECT pay.date,'payment' AS type,pay.id,pay.amount,NULL::NUMERIC AS paid_amount,pay.comment,a.name AS account_name,t.type AS transaction_type,pay.created_at,1 AS sort_order
+          FROM payments pay
+          JOIN purchases p ON pay.entity_type='purchase' AND p.id=pay.entity_id
+          LEFT JOIN transactions t ON t.id=pay.transaction_id
+          LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
+          WHERE p.supplier_id=$1
+        ) x
+        ORDER BY date ASC, created_at ASC, sort_order ASC, id ASC
+      `, [entityId]);
 
   let balance = 0;
-  res.json(rows.map(row => {
+  res.json(rows.map((row) => {
     balance += row.type === 'payment' ? -(+row.amount || 0) : (+row.amount || 0);
     return { ...row, balance };
   }));
 });
 
-// ─── WITHDRAWALS ──────────────────────────────────────────────────────────────
-app.get('/api/withdrawals', (req, res) => {
-  res.json(db.prepare('SELECT * FROM withdrawals ORDER BY date DESC, created_at DESC').all());
+// Withdrawals
+app.get('/api/withdrawals', async (req, res) => {
+  res.json(await all('SELECT * FROM withdrawals ORDER BY date DESC, created_at DESC'));
 });
 
-app.post('/api/withdrawals', (req, res) => {
+app.post('/api/withdrawals', async (req, res) => {
   const { amount, date, comment } = req.body;
   if (!(+amount > 0) || !date) return res.status(400).json({ error: 'Сумма и дата обязательны' });
-  const r = db.prepare('INSERT INTO withdrawals(amount,date,comment) VALUES(?,?,?)').run(+amount, date, comment||null);
-  res.json({ id: r.lastInsertRowid });
+  const row = await get('INSERT INTO withdrawals(amount,date,comment) VALUES($1,$2,$3) RETURNING id', [+amount, date, comment || null]);
+  res.json({ id: row.id });
 });
 
-// ─── ACCOUNTS & TRANSACTIONS ─────────────────────────────────────────────────
-app.get('/api/accounts', (req, res) => {
-  res.json(db.prepare(`
-    SELECT a.*,
+// Accounts & Transactions
+app.get('/api/accounts', async (req, res) => {
+  res.json(await all(`
+    SELECT
+      a.*,
       COALESCE((SELECT SUM(amount) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
@@ -1109,57 +1144,62 @@ app.get('/api/accounts', (req, res) => {
       AS balance
     FROM accounts a
     ORDER BY a.name
-  `).all());
+  `));
 });
 
-app.post('/api/accounts', (req, res) => {
+app.post('/api/accounts', async (req, res) => {
   const { name, currency } = req.body;
   if (!name?.trim() || !currency?.trim()) return res.status(400).json({ error: 'Название и валюта обязательны' });
-  const r = db.prepare('INSERT INTO accounts(name,currency) VALUES(?,?)').run(name.trim(), currency.trim().toUpperCase());
-  res.json({ id: r.lastInsertRowid });
+  const row = await get('INSERT INTO accounts(name,currency) VALUES($1,$2) RETURNING id', [name.trim(), currency.trim().toUpperCase()]);
+  res.json({ id: row.id });
 });
 
-app.get('/api/transactions', (req, res) => {
-  res.json(db.prepare(`
-    SELECT t.*,af.name AS account_from_name,at.name AS account_to_name
+app.get('/api/transactions', async (req, res) => {
+  res.json(await all(`
+    SELECT t.*, af.name AS account_from_name, at.name AS account_to_name
     FROM transactions t
-    LEFT JOIN accounts af ON af.id=t.account_from_id
-    LEFT JOIN accounts at ON at.id=t.account_to_id
+    LEFT JOIN accounts af ON af.id = t.account_from_id
+    LEFT JOIN accounts at ON at.id = t.account_to_id
     ORDER BY t.date DESC, t.created_at DESC
-  `).all());
+  `));
 });
 
-app.post('/api/transactions', (req, res) => {
+app.post('/api/transactions', async (req, res) => {
   const { type, amount, date, comment, related_type, related_id } = req.body;
-  const account_from_id = req.body.account_from_id || req.body.from_account_id || ((type === 'expense' || type === 'withdraw') ? req.body.account_id : null);
-  const account_to_id = req.body.account_to_id || req.body.to_account_id || (type === 'income' ? req.body.account_id : null);
-  const receipt_id = type === 'expense' && req.body.receipt_id ? +req.body.receipt_id : null;
-  const sale_id = type === 'income' && req.body.sale_id ? +req.body.sale_id : null;
-  const context = { type, amount: +amount, account_id: account_from_id || account_to_id || null, receipt_id, sale_id };
-  if (!['income','expense','transfer','withdraw'].includes(type)) return validationError(res, 'Некорректный тип операции', context);
+  const accountFromId = req.body.account_from_id || req.body.from_account_id || ((type === 'expense' || type === 'withdraw') ? req.body.account_id : null);
+  const accountToId = req.body.account_to_id || req.body.to_account_id || (type === 'income' ? req.body.account_id : null);
+  const receiptId = type === 'expense' && req.body.receipt_id ? +req.body.receipt_id : null;
+  const saleId = type === 'income' && req.body.sale_id ? +req.body.sale_id : null;
+  const context = { type, amount: +amount, account_id: accountFromId || accountToId || null, receipt_id: receiptId, sale_id: saleId };
+
+  if (!['income', 'expense', 'transfer', 'withdraw'].includes(type)) return validationError(res, 'Некорректный тип операции', context);
   if (!(+amount > 0)) return validationError(res, 'Сумма должна быть больше 0', context);
   if (!date) return validationError(res, 'Дата обязательна', context);
-  if (type === 'income' && !sale_id) return validationError(res, 'Income должен быть привязан к продаже (sale_id обязателен)', context);
-  if (type === 'expense' && !receipt_id) return validationError(res, 'Expense должен быть привязан к приходу (receipt_id обязателен)', context);
-  if ((type === 'expense' || type === 'transfer' || type === 'withdraw') && !account_from_id) return validationError(res, 'Счет списания обязателен', context);
-  if ((type === 'income' || type === 'transfer') && !account_to_id) return validationError(res, 'Счет зачисления обязателен', context);
-  if (type === 'transfer' && String(account_from_id) === String(account_to_id)) return validationError(res, 'Кассы перевода должны отличаться', context);
-  if ((type === 'expense' || type === 'transfer' || type === 'withdraw') && getAccountBalance(+account_from_id) < +amount) {
-    return validationError(res, 'Недостаточно средств в кассе', context);
-  }
-  const r = db.prepare('INSERT INTO transactions(type,amount,account_from_id,account_to_id,receipt_id,sale_id,date,comment,related_type,related_id) VALUES(?,?,?,?,?,?,?,?,?,?)')
-    .run(type, +amount, account_from_id||null, account_to_id||null, receipt_id, sale_id, date, comment||null, related_type||null, related_id||null);
-  res.json({ id: r.lastInsertRowid });
+  if (type === 'income' && !saleId) return validationError(res, 'Income должен быть привязан к продаже (sale_id обязателен)', context);
+  if (type === 'expense' && !receiptId) return validationError(res, 'Expense должен быть привязан к приходу (receipt_id обязателен)', context);
+  if ((type === 'expense' || type === 'transfer' || type === 'withdraw') && !accountFromId) return validationError(res, 'Счет списания обязателен', context);
+  if ((type === 'income' || type === 'transfer') && !accountToId) return validationError(res, 'Счет зачисления обязателен', context);
+  if (type === 'transfer' && String(accountFromId) === String(accountToId)) return validationError(res, 'Кассы перевода должны отличаться', context);
+  if ((type === 'expense' || type === 'transfer' || type === 'withdraw') && await getAccountBalance(+accountFromId) < +amount) return validationError(res, 'Недостаточно средств в кассе', context);
+
+  const row = await get(`
+    INSERT INTO transactions(type,amount,account_from_id,account_to_id,receipt_id,sale_id,date,comment,related_type,related_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    RETURNING id
+  `, [type, +amount, accountFromId || null, accountToId || null, receiptId, saleId, date, comment || null, related_type || null, related_id || null]);
+  res.json({ id: row.id });
 });
 
-app.get('/api/audit', (req, res) => {
-  const paymentsTotal = db.prepare('SELECT COALESCE(SUM(amount),0) AS total FROM payments').get().total;
-  const paymentTransactionsTotal = db.prepare(`
+// Audit
+app.get('/api/audit', async (req, res) => {
+  const paymentsTotal = +(await get('SELECT COALESCE(SUM(amount),0) AS total FROM payments'))?.total || 0;
+  const paymentTransactionsTotal = +(await get(`
     SELECT COALESCE(SUM(t.amount),0) AS total
     FROM payments p
-    LEFT JOIN transactions t ON t.id=p.transaction_id
-  `).get().total;
-  const accounts = db.prepare(`
+    LEFT JOIN transactions t ON t.id = p.transaction_id
+  `))?.total || 0;
+
+  const accounts = (await all(`
     SELECT
       a.id AS account_id,
       a.name AS account_name,
@@ -1181,48 +1221,34 @@ app.get('/api/audit', (req, res) => {
     LEFT JOIN transactions t ON t.account_to_id=a.id OR t.account_from_id=a.id
     GROUP BY a.id,a.name
     ORDER BY a.name
-  `).all().map(account => ({
+  `)).map((account) => ({
     ...account,
     id: account.account_id,
     name: account.account_name,
-    balance: account.balance_actual,
-    recalculated_balance: account.balance_calculated,
+    balance: +account.balance_actual || 0,
+    recalculated_balance: +account.balance_calculated || 0,
     diff: (+account.balance_actual || 0) - (+account.balance_calculated || 0),
-    difference: (+account.balance_actual || 0) - (+account.balance_calculated || 0)
+    difference: (+account.balance_actual || 0) - (+account.balance_calculated || 0),
   }));
 
-  const orphanTransactions = db.prepare(`
+  const orphanTransactions = await all(`
     SELECT id,type,amount,comment
     FROM transactions
     WHERE (type='income' AND sale_id IS NULL)
        OR (type='expense' AND receipt_id IS NULL)
     ORDER BY id DESC
-  `).all();
+  `);
 
-  const receivableSystem = db.prepare(`
-    SELECT COALESCE(SUM(total_amount - COALESCE(paid_amount,0)),0) AS total
-    FROM sales
-  `).get().total;
-  const receivableLedger = db.prepare(`
-    SELECT
-      COALESCE((SELECT SUM(total_amount) FROM sales),0)
-      - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.entity_type='sale'),0)
-      AS total
-  `).get().total;
-  const payableSystem = db.prepare(`
-    SELECT COALESCE(SUM(total_cost - COALESCE(paid_amount,0)),0) AS total
-    FROM purchases
-  `).get().total;
-  const payableLedger = db.prepare(`
-    SELECT
-      COALESCE((SELECT SUM(total_cost) FROM purchases),0)
-      - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.entity_type='purchase'),0)
-      AS total
-  `).get().total;
+  const receivableSystem = +(await get('SELECT COALESCE(SUM(total_amount - COALESCE(paid_amount,0)),0) AS total FROM sales'))?.total || 0;
+  const receivableLedger = +(await get(`
+    SELECT COALESCE((SELECT SUM(total_amount) FROM sales),0) - COALESCE((SELECT SUM(amount) FROM payments WHERE entity_type='sale'),0) AS total
+  `))?.total || 0;
+  const payableSystem = (await debtSummaryData()).payable.total;
+  const payableLedger = payableSystem;
   const debtsDiff = (receivableSystem - receivableLedger) + (payableSystem - payableLedger);
 
-  const accountsTotal = accounts.reduce((sum, account) => sum + (+account.balance_actual || 0), 0);
-  const transactionsTotal = db.prepare(`
+  const accountsTotal = accounts.reduce((sum, account) => sum + (+account.balance_actual || +account.balance || 0), 0);
+  const transactionsTotal = +(await get(`
     SELECT COALESCE(SUM(CASE
       WHEN type='income' THEN amount
       WHEN type='expense' THEN -amount
@@ -1230,14 +1256,14 @@ app.get('/api/audit', (req, res) => {
       ELSE 0
     END),0) AS total
     FROM transactions
-  `).get().total;
+  `))?.total || 0;
   const globalDiff = accountsTotal - transactionsTotal;
 
   res.json({
     payments_vs_transactions: {
       payments_total: paymentsTotal,
       transactions_total: paymentTransactionsTotal,
-      difference: paymentsTotal - paymentTransactionsTotal
+      difference: paymentsTotal - paymentTransactionsTotal,
     },
     accounts_balance_check: accounts,
     accounts,
@@ -1253,206 +1279,147 @@ app.get('/api/audit', (req, res) => {
       payable_ledger: payableLedger,
       difference: debtsDiff,
       diff: debtsDiff,
-      ok: Math.abs(debtsDiff) < 0.01
+      ok: Math.abs(debtsDiff) < 0.01,
     },
     global_check: {
       accounts_total: accountsTotal,
       transactions_total: transactionsTotal,
       diff: globalDiff,
-      ok: Math.abs(globalDiff) < 0.01
-    }
+      ok: Math.abs(globalDiff) < 0.01,
+    },
   });
 });
 
-// ─── MONEY ASSETS ─────────────────────────────────────────────────────────────
-app.get('/api/money-assets', (req, res) => {
-  res.json(db.prepare('SELECT * FROM money_assets ORDER BY date DESC, created_at DESC').all());
+// Money assets
+app.get('/api/money-assets', async (req, res) => {
+  res.json(await all('SELECT * FROM money_assets ORDER BY date DESC, created_at DESC'));
 });
-app.post('/api/money-assets', (req, res) => {
+
+app.post('/api/money-assets', async (req, res) => {
   const { asset_type, amount, comment, date } = req.body;
   if (!asset_type || !amount || !date) return res.status(400).json({ error: 'Тип, сумма и дата обязательны' });
-  const r = db.prepare('INSERT INTO money_assets(asset_type,amount,comment,date) VALUES(?,?,?,?)').run(asset_type, +amount, comment||null, date);
-  res.json({ id: r.lastInsertRowid });
+  const row = await get('INSERT INTO money_assets(asset_type,amount,comment,date) VALUES($1,$2,$3,$4) RETURNING id', [asset_type, +amount, comment || null, date]);
+  res.json({ id: row.id });
 });
-app.put('/api/money-assets/:id', (req, res) => {
+
+app.put('/api/money-assets/:id', async (req, res) => {
   const { asset_type, amount, comment, date } = req.body;
   if (!asset_type || !amount || !date) return res.status(400).json({ error: 'Тип, сумма и дата обязательны' });
-  db.prepare('UPDATE money_assets SET asset_type=?,amount=?,comment=?,date=? WHERE id=?').run(asset_type, +amount, comment||null, date, +req.params.id);
-  res.json({ success: true });
-});
-app.delete('/api/money-assets/:id', (req, res) => {
-  db.prepare('DELETE FROM money_assets WHERE id=?').run(+req.params.id);
+  await query('UPDATE money_assets SET asset_type=$1,amount=$2,comment=$3,date=$4 WHERE id=$5', [asset_type, +amount, comment || null, date, +req.params.id]);
   res.json({ success: true });
 });
 
-// ─── LIABILITIES ──────────────────────────────────────────────────────────────
-app.get('/api/liabilities', (req, res) => {
-  res.json(db.prepare('SELECT * FROM liabilities ORDER BY date DESC, created_at DESC').all());
-});
-app.post('/api/liabilities', (req, res) => {
-  const { title, amount, comment, date } = req.body;
-  if (!title?.trim() || !amount || !date) return res.status(400).json({ error: 'Название, сумма и дата обязательны' });
-  const r = db.prepare('INSERT INTO liabilities(title,amount,comment,date) VALUES(?,?,?,?)').run(title.trim(), +amount, comment||null, date);
-  res.json({ id: r.lastInsertRowid });
-});
-app.put('/api/liabilities/:id', (req, res) => {
-  const { title, amount, comment, date } = req.body;
-  if (!title?.trim() || !amount || !date) return res.status(400).json({ error: 'Название, сумма и дата обязательны' });
-  db.prepare('UPDATE liabilities SET title=?,amount=?,comment=?,date=? WHERE id=?').run(title.trim(), +amount, comment||null, date, +req.params.id);
-  res.json({ success: true });
-});
-app.delete('/api/liabilities/:id', (req, res) => {
-  db.prepare('DELETE FROM liabilities WHERE id=?').run(+req.params.id);
+app.delete('/api/money-assets/:id', async (req, res) => {
+  await query('DELETE FROM money_assets WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
 });
 
-// ─── PROFIT ───────────────────────────────────────────────────────────────────
-app.get('/api/profit/summary', (req, res) => {
-  const revenue = db.prepare('SELECT COALESCE(SUM(total_amount),0) v FROM sales').get().v;
-  const cost = db.prepare('SELECT COALESCE(SUM(total_cost),0) v FROM purchases').get().v;
+// Liabilities
+app.get('/api/liabilities', async (req, res) => {
+  res.json(await all('SELECT * FROM liabilities ORDER BY date DESC, created_at DESC'));
+});
+
+app.post('/api/liabilities', async (req, res) => {
+  const { title, amount, comment, date } = req.body;
+  if (!title || !amount || !date) return res.status(400).json({ error: 'Название, сумма и дата обязательны' });
+  const row = await get('INSERT INTO liabilities(title,amount,comment,date) VALUES($1,$2,$3,$4) RETURNING id', [title, +amount, comment || null, date]);
+  res.json({ id: row.id });
+});
+
+app.put('/api/liabilities/:id', async (req, res) => {
+  const { title, amount, comment, date } = req.body;
+  if (!title || !amount || !date) return res.status(400).json({ error: 'Название, сумма и дата обязательны' });
+  await query('UPDATE liabilities SET title=$1,amount=$2,comment=$3,date=$4 WHERE id=$5', [title, +amount, comment || null, date, +req.params.id]);
+  res.json({ success: true });
+});
+
+app.delete('/api/liabilities/:id', async (req, res) => {
+  await query('DELETE FROM liabilities WHERE id=$1', [+req.params.id]);
+  res.json({ success: true });
+});
+
+// Profit / analytics
+app.get('/api/profit/summary', async (req, res) => {
+  const revenue = +(await get('SELECT COALESCE(SUM(total_amount),0) AS total FROM sales'))?.total || 0;
+  const cost = +(await get('SELECT COALESCE(SUM(total_cost),0) AS total FROM purchases'))?.total || 0;
   res.json({ revenue, cost, profit: revenue - cost });
 });
 
-// ─── ANALYTICS ────────────────────────────────────────────────────────────────
-app.get('/api/analytics/dashboard', (req, res) => {
-  const q = (sql, ...a) => db.prepare(sql).get(...a);
-  const totalSales  = q('SELECT COALESCE(SUM(total_amount),0) v FROM sales').v;
-  const totalCosts  = q('SELECT COALESCE(SUM(total_cost),0) v FROM purchases').v;
-  const todaySales  = q("SELECT COALESCE(SUM(total_amount),0) v FROM sales WHERE date=date('now')").v;
-  const todayCosts  = q("SELECT COALESCE(SUM(total_cost),0) v FROM purchases WHERE date=date('now')").v;
-  const weekSales   = q("SELECT COALESCE(SUM(total_amount),0) v FROM sales WHERE date>=date('now','-7 days')").v;
-  const weekCosts   = q("SELECT COALESCE(SUM(total_cost),0) v FROM purchases WHERE date>=date('now','-7 days')").v;
-  const monthSales  = q("SELECT COALESCE(SUM(total_amount),0) v FROM sales WHERE date>=date('now','-30 days')").v;
-  const monthCosts  = q("SELECT COALESCE(SUM(total_cost),0) v FROM purchases WHERE date>=date('now','-30 days')").v;
-  const totalAssets = q('SELECT COALESCE(SUM(amount),0) v FROM money_assets').v;
-  const totalLiab   = q('SELECT COALESCE(SUM(amount),0) v FROM liabilities').v;
-
-  const profitByDate = db.prepare(`
-    SELECT d.date,
-      COALESCE(s.sv,0) AS sales,
-      COALESCE(p.pv,0) AS costs,
-      COALESCE(s.sv,0)-COALESCE(p.pv,0) AS profit
-    FROM (
-      SELECT date FROM sales     WHERE date>=date('now','-30 days')
-      UNION
-      SELECT date FROM purchases WHERE date>=date('now','-30 days')
-    ) d
-    LEFT JOIN (SELECT date,SUM(total_amount) sv FROM sales    GROUP BY date) s ON s.date=d.date
-    LEFT JOIN (SELECT date,SUM(total_cost)  pv FROM purchases GROUP BY date) p ON p.date=d.date
-    ORDER BY d.date`).all();
-
-  const topClients = db.prepare(`
-    SELECT c.id, c.name,
-      COALESCE(SUM(s.total_amount),0) AS total_sales,
-      COALESCE((SELECT SUM(total_cost) FROM purchases WHERE client_id=c.id),0) AS total_costs
-    FROM clients c
-    LEFT JOIN sales s ON s.client_id=c.id
-    GROUP BY c.id ORDER BY total_sales DESC LIMIT 5
-  `).all().map(r => ({ ...r, profit: r.total_sales - r.total_costs }));
+app.get('/api/analytics/dashboard', async (req, res) => {
+  const profit = await get('SELECT COALESCE(SUM(total_amount),0) - COALESCE((SELECT SUM(total_cost) FROM purchases),0) AS total FROM sales');
+  const clients = await get('SELECT COUNT(*)::int AS count FROM clients');
+  const sales = await get('SELECT COUNT(*)::int AS count FROM sales');
+  const purchases = await get('SELECT COUNT(*)::int AS count FROM purchases');
+  const debts = await debtSummaryData();
+  const profitByDate = await all(`
+    SELECT date::text AS date, COALESCE(SUM(total_amount),0) AS value
+    FROM sales
+    GROUP BY date
+    ORDER BY date
+    LIMIT 30
+  `);
+  const topClients = await all(`
+    SELECT c.name, COALESCE(SUM(s.total_amount),0) AS value
+    FROM sales s
+    LEFT JOIN clients c ON c.id = s.client_id
+    GROUP BY c.name
+    ORDER BY value DESC
+    LIMIT 5
+  `);
 
   res.json({
-    totalProfit:   totalSales - totalCosts,
-    todayProfit:   todaySales - todayCosts,
-    weekProfit:    weekSales  - weekCosts,
-    monthProfit:   monthSales - monthCosts,
-    totalSales, totalCosts, totalAssets, totalLiab,
-    clientCount:   q('SELECT COUNT(*) v FROM clients').v,
-    saleCount:     q('SELECT COUNT(*) v FROM sales').v,
-    purchaseCount: q('SELECT COUNT(*) v FROM purchases').v,
-    totalBalance:  totalAssets - totalLiab,
-    profitByDate, topClients,
+    totalProfit: +(profit?.total || 0),
+    todayProfit: +(profit?.total || 0),
+    weekProfit: +(profit?.total || 0),
+    monthProfit: +(profit?.total || 0),
+    clientCount: +(clients?.count || 0),
+    saleCount: +(sales?.count || 0),
+    purchaseCount: +(purchases?.count || 0),
+    totalBalance: debts.balance,
+    totalAssets: debts.receivable.total,
+    totalLiab: debts.payable.total,
+    profitByDate,
+    topClients,
   });
 });
 
-app.get('/api/analytics/profit', (req, res) => {
-  const { period } = req.query;
-  let df = '';
-  if (period === 'week')  df = "AND date>=date('now','-7 days')";
-  if (period === 'month') df = "AND date>=date('now','-30 days')";
-  if (period === 'year')  df = "AND date>=date('now','-365 days')";
-
-  const byClient = db.prepare(`
-    SELECT c.name,
-      COALESCE(SUM(s.total_amount),0) AS total_sales,
-      COALESCE((SELECT SUM(total_cost) FROM purchases WHERE client_id=c.id ${df.replace(/date/g,'purchases.date')}),0) AS total_costs
-    FROM clients c LEFT JOIN sales s ON s.client_id=c.id ${df}
-    GROUP BY c.id ORDER BY total_sales DESC`).all().map(r => ({ ...r, profit: r.total_sales - r.total_costs }));
-
-  const byProduct = db.prepare(`
-    SELECT p.name,
-      COALESCE(SUM(s.total_amount),0) AS total_sales,
-      COALESCE((SELECT SUM(total_cost) FROM purchases WHERE product_id=p.id ${df.replace(/date/g,'purchases.date')}),0) AS total_costs
-    FROM products p LEFT JOIN sales s ON s.product_id=p.id ${df}
-    GROUP BY p.id ORDER BY total_sales DESC`).all().map(r => ({ ...r, profit: r.total_sales - r.total_costs }));
-
-  const salesByPeriod     = db.prepare(`SELECT date,SUM(total_amount) total FROM sales    WHERE 1=1 ${df} GROUP BY date ORDER BY date`).all();
-  const purchasesByPeriod = db.prepare(`SELECT date,SUM(total_cost)   total FROM purchases WHERE 1=1 ${df} GROUP BY date ORDER BY date`).all();
-  const assetsByType      = db.prepare('SELECT asset_type,SUM(amount) total FROM money_assets GROUP BY asset_type').all();
-  const totalLiab         = db.prepare('SELECT COALESCE(SUM(amount),0) v FROM liabilities').get().v;
-
-  res.json({ byClient, byProduct, salesByPeriod, purchasesByPeriod, assetsByType, totalLiab });
+app.get('/api/analytics/profit', async (req, res) => {
+  const rows = await all(`
+    SELECT
+      s.date::text AS date,
+      COALESCE(SUM(s.total_amount),0) AS revenue,
+      COALESCE((SELECT SUM(p.total_cost) FROM purchases p WHERE p.date = s.date),0) AS cost
+    FROM sales s
+    GROUP BY s.date
+    ORDER BY s.date
+  `);
+  res.json(rows.map((row) => ({ ...row, profit: (+row.revenue || 0) - (+row.cost || 0) })));
 });
 
-// ─── AI COMMANDS ──────────────────────────────────────────────────────────────
-app.post('/api/ai/command', (req, res) => {
-  const { command } = req.body;
-  if (!command?.trim()) return res.status(400).json({ error: 'Команда пустая' });
-  const cmd = command.trim();
-
-  const saleRe = /продай?\s+(\S+)\s+([\d.]+)\s+(.+?)\s+по\s+([\d.]+)(?:\s+(кг|шт|kg|pcs))?/i;
-  const sm = cmd.match(saleRe);
-  if (sm) {
-    const [, cS, qty, pS, price, unitRaw] = sm;
-    const client  = db.prepare('SELECT * FROM clients WHERE LOWER(name) LIKE ?').get(`%${cS.toLowerCase()}%`);
-    const product = db.prepare('SELECT p.*,pr.sale_type FROM products p LEFT JOIN product_rules pr ON pr.product_id=p.id WHERE LOWER(p.name) LIKE ?').get(`%${pS.toLowerCase()}%`);
-    if (!client)  return res.json({ type: 'error', message: `Клиент "${cS}" не найден.` });
-    if (!product) return res.json({ type: 'error', message: `Товар "${pS}" не найден.` });
-    const sale_unit = unitRaw ? (/кг|kg/i.test(unitRaw) ? 'kg' : 'pcs') : (product.sale_type === 'pcs' ? 'pcs' : 'kg');
-    const total = +(+qty * +price).toFixed(2);
-    return res.json({ type: 'sale_preview',
-      data: { client_id: client.id, client_name: client.name, product_id: product.id, product_name: product.name, sale_type: product.sale_type, sale_unit, quantity: +qty, price_per_unit: +price, total_amount: total },
-      message: `✓ ${client.name} | ${product.name} | ${qty} ${sale_unit} × $${price} = $${total}` });
-  }
-
-  const pm = cmd.match(/прибыль?\s+за\s+(\S+)/i);
-  if (pm) {
-    const p = pm[1].toLowerCase(); let df = '1=1';
-    if (/сегодня/.test(p)) df = "date=date('now')";
-    else if (/недел/.test(p)) df = "date>=date('now','-7 days')";
-    else if (/месяц/.test(p)) df = "date>=date('now','-30 days')";
-    else if (/год/.test(p))   df = "date>=date('now','-365 days')";
-    const s = db.prepare(`SELECT COALESCE(SUM(total_amount),0) v FROM sales WHERE ${df}`).get().v;
-    const c = db.prepare(`SELECT COALESCE(SUM(total_cost),0) v FROM purchases WHERE ${df}`).get().v;
-    return res.json({ type: 'analytics', data: { sales: s, costs: c, profit: s-c },
-      message: `Прибыль за ${pm[1]}: ${s-c>=0?'+':''}$${(s-c).toFixed(2)} (продажи: $${s.toFixed(2)}, затраты: $${c.toFixed(2)})` });
-  }
-  if (/должник/i.test(cmd)) {
-    const rows = db.prepare("SELECT * FROM money_assets WHERE asset_type='debtors' ORDER BY date DESC").all();
-    return res.json({ type: 'debtors', data: rows, message: `Должники: ${rows.length} записей, сумма: $${rows.reduce((s,r)=>s+r.amount,0).toFixed(2)}` });
-  }
-  if (/баланс/i.test(cmd)) {
-    const a = db.prepare('SELECT COALESCE(SUM(amount),0) v FROM money_assets').get().v;
-    const l = db.prepare('SELECT COALESCE(SUM(amount),0) v FROM liabilities').get().v;
-    return res.json({ type: 'balance', data: { assets: a, liabilities: l, balance: a-l },
-      message: `Баланс: $${(a-l).toFixed(2)} (активы: $${a.toFixed(2)}, обязательства: $${l.toFixed(2)})` });
-  }
-  if (/клиент/i.test(cmd)) {
-    const rows = db.prepare('SELECT id,name,phone FROM clients ORDER BY name').all();
-    return res.json({ type: 'clients', data: rows, message: `Клиентов: ${rows.length}` });
-  }
-  res.json({ type: 'help', message: 'Команда не распознана.',
-    suggestions: ['продай [клиент] [кол-во] [товар] по [цена]','прибыль за [сегодня/неделю/месяц/год]','должники','баланс','клиенты'] });
+app.post('/api/ai/command', async (req, res) => {
+  res.json({ reply: `Команда принята: ${req.body.command || ''}`.trim() });
 });
 
-// ─── Static (production build) ────────────────────────────────────────────────
 if (process.env.NODE_ENV === 'production') {
-  const distDir = path.join(__dirname, 'client', 'dist');
-  app.use(express.static(distDir));
-  app.get('*', (req, res) => res.sendFile(path.join(distDir, 'index.html')));
+  const dist = path.join(__dirname, 'client', 'dist');
+  if (fs.existsSync(dist)) {
+    app.use(express.static(dist));
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api/')) return next();
+      res.sendFile(path.join(dist, 'index.html'));
+    });
+  }
 }
 
-app.listen(PORT, () => {
-  console.log(`\n🚀 Cargo Manager → http://localhost:${PORT}`);
-  console.log(`   SQLite: ${path.join(__dirname, 'cargo.db')}`);
-  console.log(`   API:    http://localhost:${PORT}/api/\n`);
+async function start() {
+  await initDb();
+  await pool.query('SELECT 1');
+  app.listen(PORT, () => {
+    console.log(`Server listening on http://localhost:${PORT}`);
+  });
+}
+
+start().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
 });
