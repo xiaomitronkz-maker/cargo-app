@@ -1,58 +1,59 @@
-import { useState, useEffect } from 'react'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts'
+import { useEffect, useMemo, useState } from 'react'
 import api from '../api'
 import { normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-const fmtShort = (n) => {
-  const value = toNumber(n)
-  if (Math.abs(value) >= 1000) return '$' + (value / 1000).toFixed(1) + 'k'
-  return '$' + value.toFixed(0)
-}
 
-function StatCard({ label, value, sub, positive }) {
-  const isNum = typeof value === 'number'
-  const cls = isNum && value > 0 ? 'positive' : isNum && value < 0 ? 'negative' : ''
+function StatCard({ label, value, tone }) {
   return (
     <div className="stat-card">
       <div className="stat-label">{label}</div>
-      <div className={`stat-value ${positive !== undefined ? (positive ? 'positive' : 'negative') : cls}`}>
-        {isNum ? fmt(value) : value}
-      </div>
-      {sub && <div className="stat-sub">{sub}</div>}
+      <div className={`stat-value ${tone || ''}`}>{fmt(value)}</div>
     </div>
   )
 }
 
-const CustomTooltip = ({ active, payload, label }) => {
-  const safePayload = normalizeArray(payload)
-  if (!active || safePayload.length === 0) return null
+function SectionCard({ title, children }) {
   return (
-    <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px' }}>
-      <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>{label}</p>
-      {safePayload.map(p => (
-        <p key={p.name} style={{ fontSize: 13, color: p.color, marginBottom: 2 }}>
-          {p.name}: {fmtShort(p.value)}
-        </p>
-      ))}
+    <div className="table-wrapper" style={{ marginTop: 20 }}>
+      <div style={{ padding: '14px 16px 0', fontWeight: 700 }}>{title}</div>
+      {children}
     </div>
   )
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState(null)
+  const [accounts, setAccounts] = useState([])
+  const [debts, setDebts] = useState([])
+  const [sales, setSales] = useState([])
+  const [receipts, setReceipts] = useState([])
+  const [profitSummary, setProfitSummary] = useState({})
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const load = async () => {
       setLoading(true)
       try {
-        const result = await api.getDashboard()
-        console.log('Analytics data:', result)
-        setData(result && typeof result === 'object' ? result : {})
+        const [accountsData, debtsData, salesData, receiptsData, profitData] = await Promise.all([
+          api.getAccounts(),
+          api.getDebts(),
+          api.getSales(),
+          api.getReceipts(),
+          api.getProfitSummary(),
+        ])
+        console.log('Analytics data:', { accountsData, debtsData, salesData, receiptsData, profitData })
+        setAccounts(normalizeArray(accountsData))
+        setDebts(normalizeArray(debtsData))
+        setSales(normalizeArray(salesData))
+        setReceipts(normalizeArray(receiptsData))
+        setProfitSummary(profitData && typeof profitData === 'object' ? profitData : {})
       } catch (e) {
         console.log('Analytics data:', null)
-        setData({})
+        setAccounts([])
+        setDebts([])
+        setSales([])
+        setReceipts([])
+        setProfitSummary({})
       } finally {
         setLoading(false)
       }
@@ -60,124 +61,151 @@ export default function Dashboard() {
     load()
   }, [])
 
-  if (loading) return <div className="loading">Загрузка...</div>
-  if (!data) return <div className="page"><div className="alert alert-error">Ошибка загрузки</div></div>
+  const safeAccounts = normalizeArray(accounts)
+  const safeDebts = normalizeArray(debts)
+  const safeSales = normalizeArray(sales)
+  const safeReceipts = normalizeArray(receipts)
 
-  const safeData = data && typeof data === 'object' ? data : {}
-  const totalProfit = toNumber(safeData.totalProfit)
-  const todayProfit = toNumber(safeData.todayProfit)
-  const weekProfit = toNumber(safeData.weekProfit)
-  const monthProfit = toNumber(safeData.monthProfit)
-  const clientCount = toNumber(safeData.clientCount)
-  const saleCount = toNumber(safeData.saleCount)
-  const purchaseCount = toNumber(safeData.purchaseCount)
-  const totalBalance = toNumber(safeData.totalBalance)
-  const totalAssets = toNumber(safeData.totalAssets)
-  const profitByDate = normalizeArray(safeData.profitByDate).map(row => ({
-    ...row,
-    sales: toNumber(row?.sales),
-    profit: toNumber(row?.profit),
-    costs: toNumber(row?.costs),
-  }))
-  const topClients = normalizeArray(safeData.topClients).map(row => ({
-    ...row,
-    total_sales: toNumber(row?.total_sales),
-    total_costs: toNumber(row?.total_costs),
-    profit: toNumber(row?.profit),
-  }))
+  const cash = useMemo(() => safeAccounts.reduce((sum, account) => sum + toNumber(account.balance), 0), [safeAccounts])
+  const receivable = useMemo(() => safeDebts.filter((d) => d.type === 'receivable').reduce((sum, debt) => sum + toNumber(debt.debt), 0), [safeDebts])
+  const payable = useMemo(() => safeDebts.filter((d) => d.type === 'payable').reduce((sum, debt) => sum + toNumber(debt.debt), 0), [safeDebts])
+  const profit = toNumber(profitSummary?.profit)
+  const control = cash + receivable - (payable + profit)
+
+  const latestSales = useMemo(() => [...safeSales].slice(0, 5), [safeSales])
+  const latestReceipts = useMemo(() => [...safeReceipts].slice(0, 5), [safeReceipts])
+  const topReceivable = useMemo(
+    () => [...safeDebts].filter((d) => d.type === 'receivable').sort((a, b) => toNumber(b.debt) - toNumber(a.debt)).slice(0, 5),
+    [safeDebts]
+  )
+  const topPayable = useMemo(
+    () => [...safeDebts].filter((d) => d.type === 'payable').sort((a, b) => toNumber(b.debt) - toNumber(a.debt)).slice(0, 5),
+    [safeDebts]
+  )
+
+  if (loading) return <div className="loading">Загрузка...</div>
 
   return (
     <div className="page">
       <div className="page-header">
         <div>
           <div className="page-title">Dashboard</div>
-          <div className="page-subtitle">Общий обзор бизнеса</div>
+          <div className="page-subtitle">Деньги, долги и риски</div>
         </div>
       </div>
 
-      {/* Profit stats */}
       <div className="stat-grid">
-        <StatCard label="Общая прибыль" value={totalProfit} sub={`Продажи: ${fmt(toNumber(safeData.totalSales))}`} />
-        <StatCard label="Сегодня" value={todayProfit} />
-        <StatCard label="Неделя" value={weekProfit} />
-        <StatCard label="Месяц" value={monthProfit} />
-        <StatCard label="Баланс" value={totalBalance} sub={`Активы: ${fmt(totalAssets)}`} />
-        <StatCard label="Клиентов" value={clientCount} positive />
-        <StatCard label="Продаж" value={saleCount} positive />
-        <StatCard label="Приходов" value={purchaseCount} positive />
+        <StatCard label="Деньги" value={cash} tone={cash >= 0 ? 'positive' : 'negative'} />
+        <StatCard label="Нам должны" value={receivable} tone="positive" />
+        <StatCard label="Мы должны" value={payable} tone="negative" />
+        <StatCard label="Прибыль" value={profit} tone={profit >= 0 ? 'positive' : 'negative'} />
+        <StatCard label="Контроль" value={control} tone={Math.abs(control) < 0.01 ? 'positive' : 'negative'} />
       </div>
 
-      {/* Profit chart */}
-      <div className="chart-card">
-        <div className="chart-title">Прибыль за 30 дней</div>
-        {profitByDate.length === 0 ? (
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '32px 0', fontSize: 13 }}>
-            Нет данных. Добавьте приходы и продажи.
-          </div>
-        ) : (
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={profitByDate} margin={{ top: 4, right: 16, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis dataKey="date" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} tickLine={false} axisLine={false}
-                tickFormatter={v => String(v || '').slice(5)} />
-              <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11 }} tickLine={false} axisLine={false}
-                tickFormatter={fmtShort} width={56} />
-              <Tooltip content={<CustomTooltip />} />
-              <Line name="Продажи" type="monotone" dataKey="sales" stroke="#5e6ad2" strokeWidth={2} dot={false} />
-              <Line name="Прибыль" type="monotone" dataKey="profit" stroke="#16a34a" strokeWidth={2} dot={false} />
-              <Line name="Затраты" type="monotone" dataKey="costs" stroke="#dc2626" strokeWidth={1.5} dot={false} strokeDasharray="4 4" />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
+      <div className={`alert ${Math.abs(control) < 0.01 ? 'alert-success' : 'alert-error'}`} style={{ marginTop: 20 }}>
+        {Math.abs(control) < 0.01 ? 'Баланс сошелся' : `Контроль: ${fmt(control)}`}
       </div>
 
-      {/* Top clients */}
-      <div className="chart-card">
-        <div className="chart-title">Топ клиентов по продажам</div>
-        {topClients.length === 0 ? (
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px 0', fontSize: 13 }}>
-            Нет данных по клиентам
-          </div>
-        ) : (
-          <div>
-            <ResponsiveContainer width="100%" height={160}>
-              <BarChart data={topClients} layout="vertical" margin={{ left: 0, right: 16 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
-                <XAxis type="number" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} tickLine={false} axisLine={false} tickFormatter={fmtShort} />
-                <YAxis dataKey="name" type="category" tick={{ fill: 'var(--text-secondary)', fontSize: 12 }} tickLine={false} axisLine={false} width={80} />
-                <Tooltip content={<CustomTooltip />} />
-                <Bar name="Продажи" dataKey="total_sales" fill="#5e6ad2" radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+      <div className="record-grid" style={{ marginTop: 20 }}>
+        <SectionCard title="Последние продажи">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Клиент</th>
+                <th>Товар</th>
+                <th>Сумма</th>
+              </tr>
+            </thead>
+            <tbody>
+              {latestSales.length === 0 && (
+                <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>Нет продаж</td></tr>
+              )}
+              {latestSales.map((sale) => (
+                <tr key={sale.id}>
+                  <td className="td-muted">{sale.date || '—'}</td>
+                  <td>{sale.client_name || '—'}</td>
+                  <td>{sale.product_name || '—'}</td>
+                  <td className="td-mono">{fmt(sale.total_amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </SectionCard>
 
-            <div className="table-wrapper" style={{ marginTop: 16 }}>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Клиент</th>
-                    <th>Продажи</th>
-                    <th>Затраты</th>
-                    <th>Прибыль</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {topClients.map(c => (
-                    <tr key={c.id}>
-                      <td>{c.name}</td>
-                      <td className="td-mono">{fmt(c.total_sales)}</td>
-                      <td className="td-mono td-muted">{fmt(c.total_costs)}</td>
-                      <td>
-                        <span className={`badge ${c.profit >= 0 ? 'badge-success' : 'badge-danger'}`}>
-                          {fmt(c.profit)}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
+        <SectionCard title="Последние приходы">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Поставщик</th>
+                <th>Клиент</th>
+                <th>Товаров</th>
+              </tr>
+            </thead>
+            <tbody>
+              {latestReceipts.length === 0 && (
+                <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>Нет приходов</td></tr>
+              )}
+              {latestReceipts.map((receipt) => (
+                <tr key={receipt.id}>
+                  <td className="td-muted">{receipt.date || '—'}</td>
+                  <td>{receipt.supplier_name || '—'}</td>
+                  <td>{receipt.client_name || '—'}</td>
+                  <td className="td-mono">{toNumber(receipt.items_count)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </SectionCard>
+
+        <SectionCard title="Топ должников">
+          <table>
+            <thead>
+              <tr>
+                <th>Клиент</th>
+                <th>Документ</th>
+                <th>Долг</th>
+              </tr>
+            </thead>
+            <tbody>
+              {topReceivable.length === 0 && (
+                <tr><td colSpan={3} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>Нет дебиторки</td></tr>
+              )}
+              {topReceivable.map((debt) => (
+                <tr key={`${debt.type}-${debt.id}`}>
+                  <td>{debt.client_name || '—'}</td>
+                  <td>{debt.document_label || debt.product_name || '—'}</td>
+                  <td><span className="badge badge-success">{fmt(debt.debt)}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </SectionCard>
+
+        <SectionCard title="Топ обязательств">
+          <table>
+            <thead>
+              <tr>
+                <th>Поставщик</th>
+                <th>Документ</th>
+                <th>Долг</th>
+              </tr>
+            </thead>
+            <tbody>
+              {topPayable.length === 0 && (
+                <tr><td colSpan={3} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>Нет обязательств</td></tr>
+              )}
+              {topPayable.map((debt) => (
+                <tr key={`${debt.type}-${debt.id}`}>
+                  <td>{debt.supplier_name || '—'}</td>
+                  <td>{debt.document_label || `Приход №${debt.id}`}</td>
+                  <td><span className="badge badge-warning">{fmt(debt.debt)}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </SectionCard>
       </div>
     </div>
   )
