@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 export default function Liabilities() {
   const [payables, setPayables] = useState([])
@@ -11,7 +12,12 @@ export default function Liabilities() {
     setLoading(true)
     try {
       const debts = await api.getDebts()
-      setPayables(debts.filter(debt => debt.type === 'payable'))
+      console.log('Analytics data:', debts)
+      const safeDebts = normalizeArray(debts)
+      setPayables(safeDebts.filter(debt => debt.type === 'payable'))
+    } catch (e) {
+      console.log('Analytics data:', null)
+      setPayables([])
     } finally {
       setLoading(false)
     }
@@ -19,14 +25,15 @@ export default function Liabilities() {
 
   useEffect(() => { load() }, [])
 
-  const total = payables.reduce((sum, debt) => sum + (+debt.debt || 0), 0)
+  const safePayables = normalizeArray(payables)
+  const total = safePayables.reduce((sum, debt) => sum + toNumber(debt.debt), 0)
 
   return (
     <div className="page">
       <div className="page-header">
         <div>
           <div className="page-title">Обязательства</div>
-          <div className="page-subtitle">{payables.length} документов поставщиков</div>
+          <div className="page-subtitle">{safePayables.length} документов поставщиков</div>
         </div>
         <button className="btn btn-secondary" onClick={load}>Обновить</button>
       </div>
@@ -35,7 +42,7 @@ export default function Liabilities() {
         <div className="stat-card">
           <div className="stat-label">💳 Всего обязательств</div>
           <div className="stat-value negative">{fmt(total)}</div>
-          <div className="stat-sub">{payables.length} открытых документов</div>
+          <div className="stat-sub">{safePayables.length} открытых документов</div>
         </div>
       </div>
 
@@ -51,12 +58,12 @@ export default function Liabilities() {
               </tr>
             </thead>
             <tbody>
-              {payables.length === 0 && (
+              {safePayables.length === 0 && (
                 <tr><td colSpan={4}>
                   <div className="empty-state"><p>Обязательств нет</p></div>
                 </td></tr>
               )}
-              {payables.map(debt => (
+              {safePayables.map(debt => (
                 <tr key={debt.id}>
                   <td className="td-muted">{debt.date || '—'}</td>
                   <td style={{ fontWeight: 600 }}>{debt.supplier_name || 'Без поставщика'}</td>

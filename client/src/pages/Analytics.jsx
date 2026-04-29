@@ -1,19 +1,21 @@
 import { useState, useEffect } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-const fmtShort = (n) => { if (Math.abs(n) >= 1000) return '$' + (n / 1000).toFixed(1) + 'k'; return '$' + n.toFixed(0) }
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmtShort = (n) => { const value = toNumber(n); if (Math.abs(value) >= 1000) return '$' + (value / 1000).toFixed(1) + 'k'; return '$' + value.toFixed(0) }
 
 const PIE_COLORS = { cash: '#5e6ad2', in_transit: '#d97706', debtors: '#dc2626', transfer: '#16a34a' }
 const PIE_LABELS = { cash: 'Наличные', in_transit: 'В дороге', debtors: 'Должники', transfer: 'Перевод' }
 
 const CustomTooltip = ({ active, payload, label }) => {
-  if (!active || !payload?.length) return null
+  const safePayload = normalizeArray(payload)
+  if (!active || safePayload.length === 0) return null
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px' }}>
       <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>{label}</p>
-      {payload.map(p => (
+      {safePayload.map(p => (
         <p key={p.name} style={{ fontSize: 13, color: p.color || 'var(--text)', marginBottom: 2 }}>
           {p.name}: {fmtShort(p.value)}
         </p>
@@ -37,8 +39,20 @@ export default function Analytics() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    setLoading(true)
-    api.getProfit(period).then(setData).finally(() => setLoading(false))
+    const load = async () => {
+      setLoading(true)
+      try {
+        const result = await api.getProfit(period)
+        console.log('Analytics data:', result)
+        setData(result && typeof result === 'object' ? result : {})
+      } catch (e) {
+        console.log('Analytics data:', null)
+        setData({})
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
   }, [period])
 
   return (
@@ -81,7 +95,12 @@ export default function Analytics() {
 }
 
 function ClientsTab({ data }) {
-  const { byClient } = data
+  const byClient = normalizeArray(data?.byClient).map(row => ({
+    ...row,
+    total_sales: toNumber(row?.total_sales),
+    total_costs: toNumber(row?.total_costs),
+    profit: toNumber(row?.profit),
+  }))
   return (
     <div>
       {byClient.length > 0 && (
@@ -122,7 +141,12 @@ function ClientsTab({ data }) {
 }
 
 function ProductsTab({ data }) {
-  const { byProduct } = data
+  const byProduct = normalizeArray(data?.byProduct).map(row => ({
+    ...row,
+    total_sales: toNumber(row?.total_sales),
+    total_costs: toNumber(row?.total_costs),
+    profit: toNumber(row?.profit),
+  }))
   return (
     <div>
       {byProduct.length > 0 && (
@@ -163,12 +187,13 @@ function ProductsTab({ data }) {
 }
 
 function TimelineTab({ data }) {
-  const { salesByPeriod, purchasesByPeriod } = data
-  const dates = [...new Set([...salesByPeriod.map(r => r.date), ...purchasesByPeriod.map(r => r.date)])].sort()
+  const salesByPeriod = normalizeArray(data?.salesByPeriod).map(row => ({ ...row, total: toNumber(row?.total) }))
+  const purchasesByPeriod = normalizeArray(data?.purchasesByPeriod).map(row => ({ ...row, total: toNumber(row?.total) }))
+  const dates = [...new Set([...salesByPeriod.map(r => r.date), ...purchasesByPeriod.map(r => r.date)].filter(Boolean))].sort()
   const combined = dates.map(d => ({
-    date: d.slice(5),
-    sales: salesByPeriod.find(r => r.date === d)?.total || 0,
-    costs: purchasesByPeriod.find(r => r.date === d)?.total || 0,
+    date: String(d || '').slice(5),
+    sales: toNumber(salesByPeriod.find(r => r.date === d)?.total),
+    costs: toNumber(purchasesByPeriod.find(r => r.date === d)?.total),
   }))
   return (
     <div>
@@ -194,9 +219,10 @@ function TimelineTab({ data }) {
 }
 
 function BalanceTab({ data }) {
-  const { assetsByType, totalLiab } = data
-  const totalAssets = assetsByType.reduce((s, r) => s + r.total, 0)
-  const pieData = assetsByType.map(r => ({ name: PIE_LABELS[r.asset_type] || r.asset_type, value: r.total, type: r.asset_type }))
+  const assetsByType = normalizeArray(data?.assetsByType).map(row => ({ ...row, total: toNumber(row?.total) }))
+  const totalLiab = toNumber(data?.totalLiab)
+  const totalAssets = assetsByType.reduce((s, r) => s + toNumber(r.total), 0)
+  const pieData = assetsByType.map(r => ({ name: PIE_LABELS[r.asset_type] || r.asset_type, value: toNumber(r.total), type: r.asset_type }))
 
   return (
     <div>

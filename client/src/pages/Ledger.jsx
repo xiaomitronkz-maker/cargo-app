@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 const typeMeta = {
   sale: { label: 'Продажа', badge: 'badge-success' },
@@ -18,10 +19,17 @@ export default function Ledger() {
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    Promise.all([api.getClients(), api.getSuppliers()]).then(([clientsData, suppliersData]) => {
-      setClients(clientsData)
-      setSuppliers(suppliersData)
-    })
+    Promise.all([api.getClients(), api.getSuppliers()])
+      .then(([clientsData, suppliersData]) => {
+        console.log('Analytics data:', { clientsData, suppliersData })
+        setClients(normalizeArray(clientsData))
+        setSuppliers(normalizeArray(suppliersData))
+      })
+      .catch(() => {
+        console.log('Analytics data:', null)
+        setClients([])
+        setSuppliers([])
+      })
   }, [])
 
   useEffect(() => {
@@ -37,17 +45,26 @@ export default function Ledger() {
     setLoading(true)
     api.getLedger({ type: entityType, id: selectedId })
       .then(data => {
+        console.log('Analytics data:', data)
+        const safeData = normalizeArray(data)
         let running = 0
-        setRows(data.map(row => {
-          running += row.type === 'payment' ? -(+row.amount || 0) : (+row.amount || 0)
-          return { ...row, running_balance: running }
+        setRows(safeData.map(row => {
+          const amount = toNumber(row?.amount)
+          const paidAmount = row?.paid_amount == null ? null : toNumber(row.paid_amount)
+          running += row.type === 'payment' ? -amount : amount
+          return { ...row, amount, paid_amount: paidAmount, running_balance: running }
         }))
+      })
+      .catch(() => {
+        console.log('Analytics data:', null)
+        setRows([])
       })
       .finally(() => setLoading(false))
   }, [entityType, selectedId])
 
-  const entities = entityType === 'client' ? clients : suppliers
-  const total = rows.length ? rows[rows.length - 1].running_balance : 0
+  const entities = entityType === 'client' ? normalizeArray(clients) : normalizeArray(suppliers)
+  const safeRows = normalizeArray(rows)
+  const total = safeRows.length ? toNumber(safeRows[safeRows.length - 1].running_balance) : 0
 
   return (
     <div className="page">
@@ -87,12 +104,12 @@ export default function Ledger() {
               </tr>
             </thead>
             <tbody>
-              {rows.length === 0 && (
+              {safeRows.length === 0 && (
                 <tr><td colSpan={6}>
                   <div className="empty-state"><p>Операций нет</p></div>
                 </td></tr>
               )}
-              {rows.map(row => (
+              {safeRows.map(row => (
                 <tr key={`${row.type}-${row.id}`}>
                   <td className="td-muted">{row.date}</td>
                   <td>
@@ -106,7 +123,7 @@ export default function Ledger() {
                   <td style={{ fontWeight: 600 }}>{fmt(row.amount)}</td>
                   <td className="td-muted">{row.paid_amount == null ? '—' : fmt(row.paid_amount)}</td>
                   <td>
-                    <span className={`badge ${(+row.running_balance || 0) > 0 ? 'badge-warning' : 'badge-success'}`} style={{ fontSize: 13 }}>
+                    <span className={`badge ${toNumber(row.running_balance) > 0 ? 'badge-warning' : 'badge-success'}`} style={{ fontSize: 13 }}>
                       {fmt(row.running_balance)}
                     </span>
                   </td>
@@ -115,7 +132,7 @@ export default function Ledger() {
               <tr>
                 <td colSpan={5} style={{ fontWeight: 700 }}>Итого</td>
                 <td>
-                  <span className={`badge ${(+total || 0) > 0 ? 'badge-warning' : 'badge-success'}`} style={{ fontSize: 13 }}>
+                  <span className={`badge ${toNumber(total) > 0 ? 'badge-warning' : 'badge-success'}`} style={{ fontSize: 13 }}>
                     {fmt(total)}
                   </span>
                 </td>

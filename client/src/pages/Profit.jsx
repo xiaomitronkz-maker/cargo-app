@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 function ProfitCard({ label, value, tone }) {
   return (
@@ -17,7 +18,20 @@ export default function Profit() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    api.getProfitSummary().then(setData).finally(() => setLoading(false))
+    const load = async () => {
+      setLoading(true)
+      try {
+        const result = await api.getProfitSummary()
+        console.log('Analytics data:', result)
+        setData(result && typeof result === 'object' ? result : {})
+      } catch (e) {
+        console.log('Analytics data:', null)
+        setData({})
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
   }, [])
 
   if (loading) return <div className="loading">Загрузка...</div>
@@ -32,9 +46,9 @@ export default function Profit() {
       </div>
 
       <div className="stat-grid">
-        <ProfitCard label="Выручка" value={data?.revenue || 0} tone="positive" />
-        <ProfitCard label="Себестоимость" value={data?.cost || 0} tone="negative" />
-        <ProfitCard label="Прибыль" value={data?.profit || 0} tone={(data?.profit || 0) >= 0 ? 'positive' : 'negative'} />
+        <ProfitCard label="Выручка" value={toNumber(data?.revenue)} tone="positive" />
+        <ProfitCard label="Себестоимость" value={toNumber(data?.cost)} tone="negative" />
+        <ProfitCard label="Прибыль" value={toNumber(data?.profit)} tone={toNumber(data?.profit) >= 0 ? 'positive' : 'negative'} />
       </div>
     </div>
   )

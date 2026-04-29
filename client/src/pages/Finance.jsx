@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Modal from '../components/Modal'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 function FinanceCard({ label, value, tone }) {
   return (
@@ -31,11 +32,20 @@ export default function Finance() {
     setLoading(true)
     Promise.all([api.getDebtsSummary(), api.getDebtsBySuppliers(), api.getAccounts(), api.getProfitSummary(), api.getDebts()])
       .then(([summaryData, suppliersData, accountsData, profitData, debtsData]) => {
-        setSummary(summaryData)
-        setSuppliers(suppliersData)
-        setAccounts(accountsData)
-        setProfitSummary(profitData)
-        setDebts(debtsData)
+        console.log('Analytics data:', { summaryData, suppliersData, accountsData, profitData, debtsData })
+        setSummary(summaryData && typeof summaryData === 'object' ? summaryData : {})
+        setSuppliers(normalizeArray(suppliersData))
+        setAccounts(normalizeArray(accountsData))
+        setProfitSummary(profitData && typeof profitData === 'object' ? profitData : {})
+        setDebts(normalizeArray(debtsData))
+      })
+      .catch(() => {
+        console.log('Analytics data:', null)
+        setSummary({})
+        setSuppliers([])
+        setAccounts([])
+        setProfitSummary({})
+        setDebts([])
       })
       .finally(() => setLoading(false))
   }
@@ -55,13 +65,16 @@ export default function Finance() {
 
   if (loading) return <div className="loading">Загрузка...</div>
 
-  const receivable = summary?.receivable?.total || 0
-  const payable = debts
+  const safeDebts = normalizeArray(debts)
+  const safeSuppliers = normalizeArray(suppliers)
+  const safeAccounts = normalizeArray(accounts)
+  const receivable = toNumber(summary?.receivable?.total)
+  const payable = safeDebts
     .filter(debt => debt.type === 'payable')
-    .reduce((sum, debt) => sum + (+debt.debt || 0), 0)
+    .reduce((sum, debt) => sum + toNumber(debt.debt), 0)
   const balance = receivable - payable
-  const profit = profitSummary?.profit || 0
-  const cash = accounts.reduce((sum, account) => sum + (+account.balance || 0), 0)
+  const profit = toNumber(profitSummary?.profit)
+  const cash = safeAccounts.reduce((sum, account) => sum + toNumber(account.balance), 0)
   const assets = cash + receivable
   const liabilities = payable
   const control = assets - (liabilities + profit)
@@ -107,17 +120,17 @@ export default function Finance() {
             </tr>
           </thead>
           <tbody>
-            {accounts.length === 0 && (
+            {safeAccounts.length === 0 && (
               <tr><td colSpan={3}>
                 <div className="empty-state"><p>Кассы не созданы</p></div>
               </td></tr>
             )}
-            {accounts.map(a => (
+            {safeAccounts.map(a => (
               <tr key={a.id}>
                 <td style={{ fontWeight: 600 }}>{a.name}</td>
                 <td className="td-muted">{a.currency}</td>
                 <td>
-                  <span className={`badge ${(+a.balance || 0) >= 0 ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 13 }}>
+                  <span className={`badge ${toNumber(a.balance) >= 0 ? 'badge-success' : 'badge-danger'}`} style={{ fontSize: 13 }}>
                     {fmt(a.balance)}
                   </span>
                 </td>
@@ -136,12 +149,12 @@ export default function Finance() {
             </tr>
           </thead>
           <tbody>
-            {suppliers.length === 0 && (
+            {safeSuppliers.length === 0 && (
               <tr><td colSpan={2}>
                 <div className="empty-state"><p>Долгов поставщикам нет</p></div>
               </td></tr>
             )}
-            {suppliers.map(s => (
+            {safeSuppliers.map(s => (
               <tr key={s.id}>
                 <td style={{ fontWeight: 600 }}>{s.name}</td>
                 <td>

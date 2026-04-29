@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const fmtShort = (n) => {
-  if (Math.abs(n) >= 1000) return '$' + (n / 1000).toFixed(1) + 'k'
-  return '$' + n.toFixed(0)
+  const value = toNumber(n)
+  if (Math.abs(value) >= 1000) return '$' + (value / 1000).toFixed(1) + 'k'
+  return '$' + value.toFixed(0)
 }
 
 function StatCard({ label, value, sub, positive }) {
@@ -23,11 +25,12 @@ function StatCard({ label, value, sub, positive }) {
 }
 
 const CustomTooltip = ({ active, payload, label }) => {
-  if (!active || !payload?.length) return null
+  const safePayload = normalizeArray(payload)
+  if (!active || safePayload.length === 0) return null
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px' }}>
       <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>{label}</p>
-      {payload.map(p => (
+      {safePayload.map(p => (
         <p key={p.name} style={{ fontSize: 13, color: p.color, marginBottom: 2 }}>
           {p.name}: {fmtShort(p.value)}
         </p>
@@ -41,15 +44,47 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    api.getDashboard()
-      .then(setData)
-      .finally(() => setLoading(false))
+    const load = async () => {
+      setLoading(true)
+      try {
+        const result = await api.getDashboard()
+        console.log('Analytics data:', result)
+        setData(result && typeof result === 'object' ? result : {})
+      } catch (e) {
+        console.log('Analytics data:', null)
+        setData({})
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
   }, [])
 
   if (loading) return <div className="loading">Загрузка...</div>
   if (!data) return <div className="page"><div className="alert alert-error">Ошибка загрузки</div></div>
 
-  const { totalProfit, todayProfit, weekProfit, monthProfit, clientCount, saleCount, purchaseCount, totalBalance, totalAssets, totalLiab, profitByDate, topClients } = data
+  const safeData = data && typeof data === 'object' ? data : {}
+  const totalProfit = toNumber(safeData.totalProfit)
+  const todayProfit = toNumber(safeData.todayProfit)
+  const weekProfit = toNumber(safeData.weekProfit)
+  const monthProfit = toNumber(safeData.monthProfit)
+  const clientCount = toNumber(safeData.clientCount)
+  const saleCount = toNumber(safeData.saleCount)
+  const purchaseCount = toNumber(safeData.purchaseCount)
+  const totalBalance = toNumber(safeData.totalBalance)
+  const totalAssets = toNumber(safeData.totalAssets)
+  const profitByDate = normalizeArray(safeData.profitByDate).map(row => ({
+    ...row,
+    sales: toNumber(row?.sales),
+    profit: toNumber(row?.profit),
+    costs: toNumber(row?.costs),
+  }))
+  const topClients = normalizeArray(safeData.topClients).map(row => ({
+    ...row,
+    total_sales: toNumber(row?.total_sales),
+    total_costs: toNumber(row?.total_costs),
+    profit: toNumber(row?.profit),
+  }))
 
   return (
     <div className="page">
@@ -62,7 +97,7 @@ export default function Dashboard() {
 
       {/* Profit stats */}
       <div className="stat-grid">
-        <StatCard label="Общая прибыль" value={totalProfit} sub={`Продажи: ${fmt(data.totalSales)}`} />
+        <StatCard label="Общая прибыль" value={totalProfit} sub={`Продажи: ${fmt(toNumber(safeData.totalSales))}`} />
         <StatCard label="Сегодня" value={todayProfit} />
         <StatCard label="Неделя" value={weekProfit} />
         <StatCard label="Месяц" value={monthProfit} />
@@ -84,7 +119,7 @@ export default function Dashboard() {
             <LineChart data={profitByDate} margin={{ top: 4, right: 16, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
               <XAxis dataKey="date" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} tickLine={false} axisLine={false}
-                tickFormatter={v => v.slice(5)} />
+                tickFormatter={v => String(v || '').slice(5)} />
               <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11 }} tickLine={false} axisLine={false}
                 tickFormatter={fmtShort} width={56} />
               <Tooltip content={<CustomTooltip />} />

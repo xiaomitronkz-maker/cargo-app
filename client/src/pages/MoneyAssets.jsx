@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 export default function MoneyAssets() {
   const [accounts, setAccounts] = useState([])
@@ -15,8 +16,13 @@ export default function MoneyAssets() {
         api.getAccounts(),
         api.getDebts(),
       ])
-      setAccounts(accountsData)
-      setDebts(debtsData)
+      console.log('Analytics data:', { accountsData, debtsData })
+      setAccounts(normalizeArray(accountsData))
+      setDebts(normalizeArray(debtsData))
+    } catch (e) {
+      console.log('Analytics data:', null)
+      setAccounts([])
+      setDebts([])
     } finally {
       setLoading(false)
     }
@@ -24,10 +30,12 @@ export default function MoneyAssets() {
 
   useEffect(() => { load() }, [])
 
-  const cash = accounts.reduce((sum, acc) => sum + (+acc.balance || 0), 0)
-  const receivable = debts
+  const safeAccounts = normalizeArray(accounts)
+  const safeDebts = normalizeArray(debts)
+  const cash = safeAccounts.reduce((sum, acc) => sum + toNumber(acc.balance), 0)
+  const receivable = safeDebts
     .filter(debt => debt.type === 'receivable')
-    .reduce((sum, debt) => sum + (+debt.debt || 0), 0)
+    .reduce((sum, debt) => sum + toNumber(debt.debt), 0)
   const inTransit = 0
   const transfers = 0
   const total = cash + receivable
@@ -68,12 +76,12 @@ export default function MoneyAssets() {
                 </tr>
               </thead>
               <tbody>
-                {accounts.length === 0 && (
+                {safeAccounts.length === 0 && (
                   <tr><td colSpan={2}>
                     <div className="empty-state"><p>Кассы не созданы</p></div>
                   </td></tr>
                 )}
-                {accounts.map(account => (
+                {safeAccounts.map(account => (
                   <tr key={account.id}>
                     <td style={{ fontWeight: 600 }}>{account.name}</td>
                     <td className="td-mono">{fmt(account.balance)}</td>

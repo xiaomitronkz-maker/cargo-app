@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-const ok = (n) => Math.abs(+n || 0) < 0.01
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const ok = (n) => Math.abs(toNumber(n)) < 0.01
 
 function Status({ difference }) {
   return ok(difference)
@@ -22,7 +23,16 @@ export default function Audit() {
 
   const load = () => {
     setLoading(true)
-    api.getAudit().then(setData).finally(() => setLoading(false))
+    api.getAudit()
+      .then((result) => {
+        console.log('Analytics data:', result)
+        setData(result && typeof result === 'object' ? result : {})
+      })
+      .catch(() => {
+        console.log('Analytics data:', null)
+        setData({})
+      })
+      .finally(() => setLoading(false))
   }
 
   useEffect(() => { load() }, [])
@@ -30,13 +40,13 @@ export default function Audit() {
   if (loading) return <div className="loading">Загрузка...</div>
 
   const payments = data?.payments_vs_transactions || {}
-  const accounts = data?.accounts || data?.accounts_balance_check || []
-  const orphanTransactions = data?.orphan_transactions || []
+  const accounts = normalizeArray(data?.accounts || data?.accounts_balance_check)
+  const orphanTransactions = normalizeArray(data?.orphan_transactions)
   const debts = data?.debts_check || {}
   const global = data?.global_check || {}
-  const accountsDifference = accounts.reduce((sum, account) => sum + Math.abs(+account.difference || 0), 0)
+  const accountsDifference = accounts.reduce((sum, account) => sum + Math.abs(toNumber(account.difference)), 0)
   const debtsDifference = debts.diff ?? debts.difference
-  const globalDifference = global.diff || 0
+  const globalDifference = toNumber(global.diff)
   const globalOk = global.ok ?? ok(globalDifference)
 
   return (
@@ -125,9 +135,9 @@ export default function Audit() {
             {accounts.map(account => (
               <tr key={account.account_id || account.id}>
                 <td style={{ fontWeight: 600 }}>{account.account_name || account.name}</td>
-                <td>{fmt(account.balance_actual ?? account.balance)}</td>
-                <td>{fmt(account.balance_calculated ?? account.recalculated_balance)}</td>
-                <td style={{ fontWeight: 700, color: ok(account.diff ?? account.difference) ? 'var(--success)' : 'var(--danger)' }}>
+                <td>{fmt(toNumber(account.balance_actual ?? account.balance))}</td>
+                <td>{fmt(toNumber(account.balance_calculated ?? account.recalculated_balance))}</td>
+                <td style={{ fontWeight: 700, color: ok(toNumber(account.diff ?? account.difference)) ? 'var(--success)' : 'var(--danger)' }}>
                   {fmt(account.diff ?? account.difference)}
                 </td>
                 <td><Status difference={account.diff ?? account.difference} /></td>
