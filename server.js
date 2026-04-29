@@ -152,6 +152,7 @@ async function initDb() {
       date DATE NOT NULL DEFAULT CURRENT_DATE,
       client_id INTEGER REFERENCES clients(id),
       marking_id INTEGER REFERENCES markings(id),
+      sales_document_id INTEGER,
       product_id INTEGER REFERENCES products(id),
       sale_unit TEXT CHECK(sale_unit IN ('kg','pcs')),
       quantity NUMERIC DEFAULT 0,
@@ -160,6 +161,24 @@ async function initDb() {
       paid_amount NUMERIC DEFAULT 0,
       notes TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sales_documents (
+      id SERIAL PRIMARY KEY,
+      date DATE NOT NULL DEFAULT CURRENT_DATE,
+      client_id INTEGER REFERENCES clients(id),
+      marking_id INTEGER REFERENCES markings(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sales_items (
+      id SERIAL PRIMARY KEY,
+      sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE CASCADE,
+      product_id INTEGER REFERENCES products(id),
+      sale_unit TEXT CHECK(sale_unit IN ('kg','pcs')),
+      quantity NUMERIC DEFAULT 0,
+      price_per_unit NUMERIC DEFAULT 0,
+      note TEXT
     );
 
     CREATE TABLE IF NOT EXISTS payments (
@@ -231,6 +250,7 @@ async function initDb() {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total_cost NUMERIC DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE SET NULL;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
@@ -327,6 +347,86 @@ async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
   }
 }
 
+async function getSalesDocumentPaidAmount(salesDocumentId, client = pool) {
+  const row = await get(`
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM (
+      SELECT DISTINCT p.id, p.amount::numeric AS amount
+      FROM payments p
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+      WHERE COALESCE(
+        (SELECT s2.sales_document_id FROM sales s2 WHERE s2.id = t.sale_id),
+        s.sales_document_id
+      ) = $1
+    ) x
+  `, [salesDocumentId], client);
+  return +(row?.total || 0);
+}
+
+async function rebalanceSalesDocumentPaidAmounts(salesDocumentId, client = pool) {
+  const salesRows = await all(`
+    SELECT id,total_amount
+    FROM sales
+    WHERE sales_document_id=$1
+    ORDER BY id
+  `, [salesDocumentId], client);
+  let remainingPaid = await getSalesDocumentPaidAmount(salesDocumentId, client);
+  for (const sale of salesRows) {
+    const applied = Math.min(+(sale.total_amount || 0), remainingPaid);
+    await query('UPDATE sales SET paid_amount=$1 WHERE id=$2', [applied, sale.id], client);
+    remainingPaid -= applied;
+  }
+}
+
+async function createLegacySalesForDocument({ date, clientId, markingId, items, salesDocumentId }, client = pool) {
+  const saleIds = [];
+  for (const item of items) {
+    if (!item.product_id) throw new Error('Выберите товар в каждой строке');
+    if (!item.sale_unit) throw new Error('Укажите единицу продажи в каждой строке');
+    if (item.quantity == null || !(+item.quantity > 0)) throw new Error('Количество в каждой строке должно быть больше 0');
+    if (item.price_per_unit == null || !(+item.price_per_unit > 0)) throw new Error('Цена в каждой строке должна быть больше 0');
+
+    await validateSale(item.product_id, item.sale_unit, item.quantity, item.price_per_unit, client);
+    const totalAmount = Math.round(+item.quantity * +item.price_per_unit * 100) / 100;
+    const sale = await get(`
+      INSERT INTO sales(date,client_id,marking_id,sales_document_id,product_id,sale_unit,quantity,price_per_unit,total_amount,paid_amount,notes)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING id
+    `, [date, clientId, markingId, salesDocumentId, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, totalAmount, 0, item.note || item.notes || null], client);
+    saleIds.push(sale.id);
+  }
+  return saleIds;
+}
+
+async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId, date, comment }, client = pool) {
+  const anchorSale = await get('SELECT * FROM sales WHERE id=$1', [anchorSaleId], client);
+  if (!anchorSale) throw new Error('Продажа не найдена');
+  if (!anchorSale.sales_document_id) throw new Error('Продажа не привязана к документу');
+
+  const totalRow = await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales WHERE sales_document_id=$1', [+anchorSale.sales_document_id], client);
+  const totalAmount = +(totalRow?.total || 0);
+  const paid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
+  const remaining = totalAmount - paid;
+  if (amount > remaining) throw new Error('Сумма оплаты превышает остаток долга');
+
+  const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['sale', anchorSaleId, amount, date, comment], client);
+  const transaction = await get(`
+    INSERT INTO transactions(type,amount,account_to_id,sale_id,date,comment,related_type,related_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    RETURNING id
+  `, ['income', amount, accountToId, anchorSaleId, date, comment, 'payment', payment.id], client);
+  await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+  await rebalanceSalesDocumentPaidAmounts(+anchorSale.sales_document_id, client);
+
+  const newPaid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
+  return {
+    sales_document_id: +anchorSale.sales_document_id,
+    paid_amount: newPaid,
+    debt: totalAmount - newPaid,
+  };
+}
+
 async function validateSale(productId, saleUnit, quantity, pricePerUnit, client = pool) {
   if (+quantity <= 0) throw new Error('Количество должно быть больше 0');
   if (+pricePerUnit <= 0) throw new Error('Цена за единицу должна быть больше 0');
@@ -338,9 +438,33 @@ async function validateSale(productId, saleUnit, quantity, pricePerUnit, client 
 
 async function debtSummaryData(client = pool) {
   const receivable = await get(`
-    SELECT COUNT(*)::int AS count, COALESCE(SUM(total_amount::numeric - COALESCE(paid_amount::numeric,0)),0) AS total
-    FROM sales
-    WHERE total_amount::numeric - COALESCE(paid_amount::numeric,0) > 0
+    WITH receivable_totals AS (
+      SELECT
+        COALESCE(sd.id, -s.id) AS receivable_group_id,
+        COALESCE(SUM(s.total_amount::numeric),0) AS total
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      GROUP BY COALESCE(sd.id, -s.id)
+    ),
+    receivable_payments AS (
+      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
+      FROM (
+        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
+        FROM payments p
+        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN sales s2 ON s2.id = t.sale_id
+        WHERE COALESCE(s.id, s2.id) IS NOT NULL
+      ) x
+      GROUP BY x.receivable_group_id
+    )
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(total::numeric - COALESCE(paid::numeric,0)),0) AS total
+    FROM (
+      SELECT rt.receivable_group_id, rt.total, COALESCE(rp.paid,0) AS paid
+      FROM receivable_totals rt
+      LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rt.receivable_group_id
+      WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
+    ) q
   `, [], client);
 
   const payable = await get(`
@@ -833,6 +957,71 @@ app.delete('/api/purchases/:id', async (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/sales-documents', async (req, res) => {
+  const body = req.body;
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return res.status(400).json({ error: 'Добавьте хотя бы один товар' });
+  if (!body.date) return res.status(400).json({ error: 'Дата обязательна' });
+
+  try {
+    const result = await withTx(async (client) => {
+      const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id, client);
+      const salesDocument = await get(
+        'INSERT INTO sales_documents(date,client_id,marking_id) VALUES($1,$2,$3) RETURNING id',
+        [body.date, cid, mid],
+        client
+      );
+
+      for (const item of items) {
+        if (!item.product_id) throw new Error('Выберите товар в каждой строке');
+        if (!item.sale_unit) throw new Error('Укажите единицу продажи в каждой строке');
+        if (!(+item.quantity > 0)) throw new Error('Количество в каждой строке должно быть больше 0');
+        if (!(+item.price_per_unit > 0)) throw new Error('Цена в каждой строке должна быть больше 0');
+        await query(
+          'INSERT INTO sales_items(sales_document_id,product_id,sale_unit,quantity,price_per_unit,note) VALUES($1,$2,$3,$4,$5,$6)',
+          [salesDocument.id, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, item.note || item.notes || null],
+          client
+        );
+      }
+
+      const saleIds = await createLegacySalesForDocument({
+        date: body.date,
+        clientId: cid,
+        markingId: mid,
+        items,
+        salesDocumentId: salesDocument.id,
+      }, client);
+
+      return { id: salesDocument.id, sale_ids: saleIds };
+    });
+
+    res.json({ id: result.id, items_count: items.length, sale_ids: result.sale_ids });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.put('/api/sales-documents/:id/pay', async (req, res) => {
+  const salesDocumentId = +req.params.id;
+  const amount = +req.body.amount;
+  const accountToId = +req.body.account_to_id;
+  const date = req.body.date || new Date().toISOString().slice(0, 10);
+  const comment = req.body.comment || null;
+
+  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: salesDocumentId });
+  if (!accountToId) return validationError(res, 'Счет зачисления обязателен', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: salesDocumentId });
+
+  try {
+    const anchorSale = await get('SELECT id FROM sales WHERE sales_document_id=$1 ORDER BY id LIMIT 1', [salesDocumentId]);
+    if (!anchorSale) return res.status(404).json({ error: 'Документ продажи не найден' });
+
+    const result = await withTx((client) => paySalesDocumentByAnchorSale(anchorSale.id, { amount, accountToId, date, comment }, client));
+    res.json({ success: true, sales_document_id: result.sales_document_id, paid_amount: result.paid_amount, debt: result.debt });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // Sales
 app.get('/api/sales', async (req, res) => {
   const { client_id, product_id, from_date, to_date } = req.query;
@@ -907,6 +1096,11 @@ app.put('/api/sales/:id/pay', async (req, res) => {
   try {
     const sale = await get('SELECT * FROM sales WHERE id=$1', [id]);
     if (!sale) return res.status(404).json({ error: 'Продажа не найдена' });
+    if (sale.sales_document_id) {
+      const result = await withTx((client) => paySalesDocumentByAnchorSale(id, { amount, accountToId, date, comment }, client));
+      return res.json({ success: true, sales_document_id: result.sales_document_id, paid_amount: result.paid_amount, debt: result.debt });
+    }
+
     const remaining = +(sale.total_amount || 0) - +(sale.paid_amount || 0);
     if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: id });
 
@@ -945,7 +1139,38 @@ app.delete('/api/sales/:id', async (req, res) => {
 // Debts
 app.get('/api/debts', async (req, res) => {
   const debts = await all(`
-    WITH receipt_totals AS (
+    WITH receivable_totals AS (
+      SELECT
+        COALESCE(sd.id, -s.id) AS receivable_group_id,
+        sd.id AS sales_document_id,
+        COALESCE(sd.date, s.date) AS date,
+        COALESCE(sd.created_at, s.created_at) AS created_at,
+        COALESCE(sd.client_id, s.client_id) AS client_id,
+        COALESCE(sd.marking_id, s.marking_id) AS marking_id,
+        c.name AS client_name,
+        m.marking,
+        COALESCE(SUM(s.total_amount::numeric),0) AS total,
+        COUNT(s.id)::int AS items_count,
+        MIN(s.id) AS anchor_sale_id
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      LEFT JOIN clients c ON c.id = COALESCE(sd.client_id, s.client_id)
+      LEFT JOIN markings m ON m.id = COALESCE(sd.marking_id, s.marking_id)
+      GROUP BY COALESCE(sd.id, -s.id), sd.id, COALESCE(sd.date, s.date), COALESCE(sd.created_at, s.created_at), COALESCE(sd.client_id, s.client_id), COALESCE(sd.marking_id, s.marking_id), c.name, m.marking
+    ),
+    receivable_payments AS (
+      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
+      FROM (
+        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
+        FROM payments p
+        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN sales s2 ON s2.id = t.sale_id
+        WHERE COALESCE(s.id, s2.id) IS NOT NULL
+      ) x
+      GROUP BY x.receivable_group_id
+    ),
+    receipt_totals AS (
       SELECT r.id AS receipt_id, r.date, r.created_at, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
@@ -967,29 +1192,35 @@ app.get('/api/debts', async (req, res) => {
     FROM (
       SELECT
         'receivable' AS type,
-        s.id,
-        s.date,
-        s.client_id,
-        c.name AS client_name,
-        s.marking_id,
-        m.marking,
+        rt.anchor_sale_id AS id,
+        rt.date,
+        rt.client_id,
+        rt.client_name,
+        rt.marking_id,
+        rt.marking,
         NULL::INTEGER AS supplier_id,
         NULL::TEXT AS supplier_name,
         s.product_id,
-        p.name AS product_name,
-        s.total_amount::numeric AS amount,
-        COALESCE(s.paid_amount::numeric,0) AS paid_amount,
-        s.total_amount::numeric - COALESCE(s.paid_amount::numeric,0) AS debt,
-        s.notes,
-        s.total_amount::numeric AS total,
-        COALESCE(s.paid_amount::numeric,0) AS paid,
-        NULL::TEXT AS document_label,
-        s.created_at::timestamp AS created_at
-      FROM sales s
-      LEFT JOIN clients c ON c.id = s.client_id
-      LEFT JOIN markings m ON m.id = s.marking_id
+        CASE
+          WHEN rt.items_count = 1 THEN p.name
+          ELSE rt.items_count::text || ' тов.'
+        END AS product_name,
+        rt.total::numeric AS amount,
+        COALESCE(rp.paid::numeric,0) AS paid_amount,
+        rt.total::numeric - COALESCE(rp.paid::numeric,0) AS debt,
+        NULL::TEXT AS notes,
+        rt.total::numeric AS total,
+        COALESCE(rp.paid::numeric,0) AS paid,
+        CASE
+          WHEN rt.sales_document_id IS NOT NULL THEN 'Продажа №' || rt.sales_document_id
+          ELSE NULL::TEXT
+        END AS document_label,
+        rt.created_at::timestamp AS created_at
+      FROM receivable_totals rt
+      LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rt.receivable_group_id
+      LEFT JOIN sales s ON s.id = rt.anchor_sale_id
       LEFT JOIN products p ON p.id = s.product_id
-      WHERE s.total_amount::numeric - COALESCE(s.paid_amount::numeric,0) > 0
+      WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
       UNION ALL
       SELECT
         'payable' AS type,
@@ -1285,9 +1516,43 @@ app.get('/api/audit', async (req, res) => {
     ORDER BY id DESC
   `);
 
-  const receivableSystem = +(await get('SELECT COALESCE(SUM(total_amount::numeric - COALESCE(paid_amount::numeric,0)),0) AS total FROM sales'))?.total || 0;
+  const receivableSystem = +(await get(`
+    WITH receivable_groups AS (
+      SELECT
+        COALESCE(sd.id, -s.id) AS receivable_group_id,
+        COALESCE(SUM(s.total_amount::numeric),0) AS total,
+        COALESCE(SUM(COALESCE(s.paid_amount::numeric,0)),0) AS paid
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      GROUP BY COALESCE(sd.id, -s.id)
+    )
+    SELECT COALESCE(SUM(total - paid),0) AS total
+    FROM receivable_groups
+  `))?.total || 0;
   const receivableLedger = +(await get(`
-    SELECT COALESCE((SELECT SUM(total_amount::numeric) FROM sales),0) - COALESCE((SELECT SUM(amount::numeric) FROM payments WHERE entity_type='sale'),0) AS total
+    WITH receivable_groups AS (
+      SELECT
+        COALESCE(sd.id, -s.id) AS receivable_group_id,
+        COALESCE(SUM(s.total_amount::numeric),0) AS total
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      GROUP BY COALESCE(sd.id, -s.id)
+    ),
+    receivable_payments AS (
+      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
+      FROM (
+        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
+        FROM payments p
+        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN sales s2 ON s2.id = t.sale_id
+        WHERE COALESCE(s.id, s2.id) IS NOT NULL
+      ) x
+      GROUP BY x.receivable_group_id
+    )
+    SELECT COALESCE(SUM(rg.total - COALESCE(rp.paid,0)),0) AS total
+    FROM receivable_groups rg
+    LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rg.receivable_group_id
   `))?.total || 0;
   const payableSystem = (await debtSummaryData()).payable.total;
   const payableLedger = payableSystem;
@@ -1386,13 +1651,13 @@ app.delete('/api/liabilities/:id', async (req, res) => {
 
 // Profit / analytics
 app.get('/api/profit/summary', async (req, res) => {
-  const revenue = +(await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales'))?.total || 0;
+  const revenue = +(await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales WHERE sales_document_id IS NULL'))?.total || 0;
   const cost = +(await get('SELECT COALESCE(SUM(total_cost::numeric),0) AS total FROM purchases'))?.total || 0;
   res.json({ revenue, cost, profit: revenue - cost });
 });
 
 app.get('/api/analytics/dashboard', async (req, res) => {
-  const profit = await get('SELECT COALESCE(SUM(total_amount::numeric),0) - COALESCE((SELECT SUM(total_cost::numeric) FROM purchases),0) AS total FROM sales');
+  const profit = await get('SELECT COALESCE(SUM(total_amount::numeric),0) - COALESCE((SELECT SUM(total_cost::numeric) FROM purchases),0) AS total FROM sales WHERE sales_document_id IS NULL');
   const clients = await get('SELECT COUNT(*)::int AS count FROM clients');
   const sales = await get('SELECT COUNT(*)::int AS count FROM sales');
   const purchases = await get('SELECT COUNT(*)::int AS count FROM purchases');
@@ -1400,6 +1665,7 @@ app.get('/api/analytics/dashboard', async (req, res) => {
   const profitByDate = await all(`
     SELECT date::text AS date, COALESCE(SUM(total_amount::numeric),0) AS value
     FROM sales
+    WHERE sales_document_id IS NULL
     GROUP BY date
     ORDER BY date
     LIMIT 30
@@ -1408,6 +1674,7 @@ app.get('/api/analytics/dashboard', async (req, res) => {
     SELECT c.name, COALESCE(SUM(s.total_amount::numeric),0) AS value
     FROM sales s
     LEFT JOIN clients c ON c.id = s.client_id
+    WHERE s.sales_document_id IS NULL
     GROUP BY c.name
     ORDER BY value DESC
     LIMIT 5
@@ -1436,6 +1703,7 @@ app.get('/api/analytics/profit', async (req, res) => {
       COALESCE(SUM(s.total_amount::numeric),0) AS revenue,
       COALESCE((SELECT SUM(p.total_cost::numeric) FROM purchases p WHERE p.date = s.date),0) AS cost
     FROM sales s
+    WHERE s.sales_document_id IS NULL
     GROUP BY s.date
     ORDER BY s.date
   `);

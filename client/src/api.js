@@ -66,6 +66,7 @@ const api = {
     return api.get(`/sales${q ? '?' + q : ''}`)
   },
   createSale: (data) => api.post('/sales', data),
+  createSalesDocument: (data) => api.post('/sales-documents', data),
   updateSale: (id, data) => api.put(`/sales/${id}`, data),
   deleteSale: (id) => api.del(`/sales/${id}`),
   paySale: (id, data) => api.put(`/sales/${id}/pay`, data),
