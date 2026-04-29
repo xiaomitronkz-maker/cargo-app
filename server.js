@@ -288,11 +288,11 @@ function validatePurchaseNums({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0
 async function getAccountBalance(accountId, client = pool) {
   const row = await get(`
     SELECT
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE type='income' AND account_to_id=$1),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='expense' AND account_from_id=$1),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdraw' AND account_from_id=$1),0)
-      + COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_to_id=$1),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_from_id=$1),0)
+      COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=$1),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=$1),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=$1),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=$1),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=$1),0)
       AS balance
   `, [accountId], client);
   return +(row?.balance || 0);
@@ -300,9 +300,9 @@ async function getAccountBalance(accountId, client = pool) {
 
 async function getReceiptPaidAmount(receiptId, client = pool) {
   const row = await get(`
-    SELECT COALESCE(SUM(amount),0) AS total
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
     FROM (
-      SELECT DISTINCT p.id, p.amount
+      SELECT DISTINCT p.id, p.amount::numeric AS amount
       FROM payments p
       LEFT JOIN transactions t ON t.id = p.transaction_id
       LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
@@ -338,22 +338,22 @@ async function validateSale(productId, saleUnit, quantity, pricePerUnit, client 
 
 async function debtSummaryData(client = pool) {
   const receivable = await get(`
-    SELECT COUNT(*)::int AS count, COALESCE(SUM(total_amount - COALESCE(paid_amount,0)),0) AS total
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(total_amount::numeric - COALESCE(paid_amount::numeric,0)),0) AS total
     FROM sales
-    WHERE total_amount - COALESCE(paid_amount,0) > 0
+    WHERE total_amount::numeric - COALESCE(paid_amount::numeric,0) > 0
   `, [], client);
 
   const payable = await get(`
     WITH receipt_totals AS (
-      SELECT r.id, COALESCE(SUM(p.total_cost),0) AS total
+      SELECT r.id, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
       GROUP BY r.id
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount),0) AS paid
+      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
       FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
+        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
         FROM payments p
         LEFT JOIN transactions t ON t.id = p.transaction_id
         LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
@@ -361,16 +361,16 @@ async function debtSummaryData(client = pool) {
       ) x
       GROUP BY x.receipt_id
     )
-    SELECT COUNT(*)::int AS count, COALESCE(SUM(total - COALESCE(paid,0)),0) AS total
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(total::numeric - COALESCE(paid::numeric,0)),0) AS total
     FROM (
       SELECT rt.id, rt.total, COALESCE(rp.paid,0) AS paid
       FROM receipt_totals rt
       LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.id
-      WHERE rt.total - COALESCE(rp.paid,0) > 0
+      WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
     ) q
   `, [], client);
 
-  const totalWithdrawals = await get('SELECT COALESCE(SUM(amount),0) AS v FROM withdrawals', [], client);
+  const totalWithdrawals = await get('SELECT COALESCE(SUM(amount::numeric),0) AS v FROM withdrawals', [], client);
 
   return {
     receivable: { count: +(receivable?.count || 0), total: +(receivable?.total || 0) },
@@ -521,8 +521,8 @@ app.get('/api/receipts', async (req, res) => {
       s.name AS supplier_name,
       c.name AS client_name,
       COUNT(ri.id)::int AS items_count,
-      COALESCE(SUM(ri.weight),0) AS total_weight,
-      COALESCE(SUM(ri.quantity),0) AS total_quantity
+      COALESCE(SUM(ri.weight::numeric),0) AS total_weight,
+      COALESCE(SUM(ri.quantity::numeric),0) AS total_quantity
     FROM receipts r
     LEFT JOIN suppliers s ON s.id = r.supplier_id
     LEFT JOIN clients c ON c.id = r.client_id
@@ -695,7 +695,7 @@ app.put('/api/receipts/:id/pay', async (req, res) => {
 
   try {
     const receipt = await get(`
-      SELECT r.*, COALESCE(SUM(p.total_cost),0) AS total_cost, MIN(p.id) AS anchor_purchase_id
+      SELECT r.*, COALESCE(SUM(p.total_cost::numeric),0) AS total_cost, MIN(p.id) AS anchor_purchase_id
       FROM receipts r
       LEFT JOIN purchases p ON p.receipt_id = r.id
       WHERE r.id=$1
@@ -821,7 +821,7 @@ app.put('/api/purchases/:id/pay', async (req, res) => {
     });
 
     const paidAmount = +(await getReceiptPaidAmount(+purchase.receipt_id));
-    const receiptTotal = await get('SELECT COALESCE(SUM(total_cost),0) AS total FROM purchases WHERE receipt_id=$1', [+purchase.receipt_id]);
+    const receiptTotal = await get('SELECT COALESCE(SUM(total_cost::numeric),0) AS total FROM purchases WHERE receipt_id=$1', [+purchase.receipt_id]);
     res.json({ success: true, paid_amount: paidAmount, payable: +(receiptTotal?.total || 0) - paidAmount });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -946,16 +946,16 @@ app.delete('/api/sales/:id', async (req, res) => {
 app.get('/api/debts', async (req, res) => {
   const debts = await all(`
     WITH receipt_totals AS (
-      SELECT r.id AS receipt_id, r.date, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost),0) AS total
+      SELECT r.id AS receipt_id, r.date, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
       LEFT JOIN suppliers s ON s.id = r.supplier_id
       GROUP BY r.id, r.date, r.supplier_id, s.name
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount),0) AS paid
+      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
       FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
+        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
         FROM payments p
         LEFT JOIN transactions t ON t.id = p.transaction_id
         LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
@@ -977,19 +977,19 @@ app.get('/api/debts', async (req, res) => {
         NULL::TEXT AS supplier_name,
         s.product_id,
         p.name AS product_name,
-        s.total_amount AS amount,
-        COALESCE(s.paid_amount,0) AS paid_amount,
-        s.total_amount - COALESCE(s.paid_amount,0) AS debt,
+        s.total_amount::numeric AS amount,
+        COALESCE(s.paid_amount::numeric,0) AS paid_amount,
+        s.total_amount::numeric - COALESCE(s.paid_amount::numeric,0) AS debt,
         s.notes,
-        s.total_amount AS total,
-        COALESCE(s.paid_amount,0) AS paid,
+        s.total_amount::numeric AS total,
+        COALESCE(s.paid_amount::numeric,0) AS paid,
         NULL::TEXT AS document_label,
         s.created_at
       FROM sales s
       LEFT JOIN clients c ON c.id = s.client_id
       LEFT JOIN markings m ON m.id = s.marking_id
       LEFT JOIN products p ON p.id = s.product_id
-      WHERE s.total_amount - COALESCE(s.paid_amount,0) > 0
+      WHERE s.total_amount::numeric - COALESCE(s.paid_amount::numeric,0) > 0
       UNION ALL
       SELECT
         'payable' AS type,
@@ -1003,17 +1003,17 @@ app.get('/api/debts', async (req, res) => {
         rt.supplier_name,
         NULL::INTEGER AS product_id,
         NULL::TEXT AS product_name,
-        rt.total AS amount,
-        COALESCE(rp.paid,0) AS paid_amount,
-        rt.total - COALESCE(rp.paid,0) AS debt,
+        rt.total::numeric AS amount,
+        COALESCE(rp.paid::numeric,0) AS paid_amount,
+        rt.total::numeric - COALESCE(rp.paid::numeric,0) AS debt,
         NULL::TEXT AS notes,
-        rt.total,
-        COALESCE(rp.paid,0) AS paid,
+        rt.total::numeric AS total,
+        COALESCE(rp.paid::numeric,0) AS paid,
         'Приход №' || rt.receipt_id AS document_label,
         rt.receipt_id::text AS created_at
       FROM receipt_totals rt
       LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.receipt_id
-      WHERE rt.total - COALESCE(rp.paid,0) > 0
+      WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
     ) q
     ORDER BY date DESC, created_at DESC
   `);
@@ -1023,15 +1023,15 @@ app.get('/api/debts', async (req, res) => {
 app.get('/api/debts/by-suppliers', async (req, res) => {
   res.json(await all(`
     WITH receipt_totals AS (
-      SELECT r.id, r.supplier_id, COALESCE(SUM(p.total_cost),0) AS total
+      SELECT r.id, r.supplier_id, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
       GROUP BY r.id, r.supplier_id
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount),0) AS paid
+      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
       FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount
+        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
         FROM payments p
         LEFT JOIN transactions t ON t.id = p.transaction_id
         LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
@@ -1039,12 +1039,12 @@ app.get('/api/debts/by-suppliers', async (req, res) => {
       ) x
       GROUP BY x.receipt_id
     )
-    SELECT s.id, s.name, COALESCE(SUM(rt.total - COALESCE(rp.paid,0)),0) AS debt
+    SELECT s.id, s.name, COALESCE(SUM(rt.total::numeric - COALESCE(rp.paid::numeric,0)),0) AS debt
     FROM suppliers s
     LEFT JOIN receipt_totals rt ON rt.supplier_id = s.id
     LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.id
     GROUP BY s.id, s.name
-    HAVING COALESCE(SUM(rt.total - COALESCE(rp.paid,0)),0) > 0
+    HAVING COALESCE(SUM(rt.total::numeric - COALESCE(rp.paid::numeric,0)),0) > 0
     ORDER BY debt DESC
   `));
 });
@@ -1142,11 +1142,11 @@ app.get('/api/accounts', async (req, res) => {
   res.json(await all(`
     SELECT
       a.*,
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
-      + COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
+      COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
       AS balance
     FROM accounts a
     ORDER BY a.name
@@ -1198,9 +1198,9 @@ app.post('/api/transactions', async (req, res) => {
 
 // Audit
 app.get('/api/audit', async (req, res) => {
-  const paymentsTotal = +(await get('SELECT COALESCE(SUM(amount),0) AS total FROM payments'))?.total || 0;
+  const paymentsTotal = +(await get('SELECT COALESCE(SUM(amount::numeric),0) AS total FROM payments'))?.total || 0;
   const paymentTransactionsTotal = +(await get(`
-    SELECT COALESCE(SUM(t.amount),0) AS total
+    SELECT COALESCE(SUM(t.amount::numeric),0) AS total
     FROM payments p
     LEFT JOIN transactions t ON t.id = p.transaction_id
   `))?.total || 0;
@@ -1209,18 +1209,18 @@ app.get('/api/audit', async (req, res) => {
     SELECT
       a.id AS account_id,
       a.name AS account_name,
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
-      + COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
-      - COALESCE((SELECT SUM(amount) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
+      COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
       AS balance_actual,
       COALESCE(SUM(CASE
-        WHEN t.type='income' AND t.account_to_id=a.id THEN t.amount
-        WHEN t.type='expense' AND t.account_from_id=a.id THEN -t.amount
-        WHEN t.type='withdraw' AND t.account_from_id=a.id THEN -t.amount
-        WHEN t.type='transfer' AND t.account_to_id=a.id THEN t.amount
-        WHEN t.type='transfer' AND t.account_from_id=a.id THEN -t.amount
+        WHEN t.type='income' AND t.account_to_id=a.id THEN t.amount::numeric
+        WHEN t.type='expense' AND t.account_from_id=a.id THEN -t.amount::numeric
+        WHEN t.type='withdraw' AND t.account_from_id=a.id THEN -t.amount::numeric
+        WHEN t.type='transfer' AND t.account_to_id=a.id THEN t.amount::numeric
+        WHEN t.type='transfer' AND t.account_from_id=a.id THEN -t.amount::numeric
         ELSE 0
       END),0) AS balance_calculated
     FROM accounts a
@@ -1245,9 +1245,9 @@ app.get('/api/audit', async (req, res) => {
     ORDER BY id DESC
   `);
 
-  const receivableSystem = +(await get('SELECT COALESCE(SUM(total_amount - COALESCE(paid_amount,0)),0) AS total FROM sales'))?.total || 0;
+  const receivableSystem = +(await get('SELECT COALESCE(SUM(total_amount::numeric - COALESCE(paid_amount::numeric,0)),0) AS total FROM sales'))?.total || 0;
   const receivableLedger = +(await get(`
-    SELECT COALESCE((SELECT SUM(total_amount) FROM sales),0) - COALESCE((SELECT SUM(amount) FROM payments WHERE entity_type='sale'),0) AS total
+    SELECT COALESCE((SELECT SUM(total_amount::numeric) FROM sales),0) - COALESCE((SELECT SUM(amount::numeric) FROM payments WHERE entity_type='sale'),0) AS total
   `))?.total || 0;
   const payableSystem = (await debtSummaryData()).payable.total;
   const payableLedger = payableSystem;
@@ -1256,9 +1256,9 @@ app.get('/api/audit', async (req, res) => {
   const accountsTotal = accounts.reduce((sum, account) => sum + (+account.balance_actual || +account.balance || 0), 0);
   const transactionsTotal = +(await get(`
     SELECT COALESCE(SUM(CASE
-      WHEN type='income' THEN amount
-      WHEN type='expense' THEN -amount
-      WHEN type='withdraw' THEN -amount
+      WHEN type='income' THEN amount::numeric
+      WHEN type='expense' THEN -amount::numeric
+      WHEN type='withdraw' THEN -amount::numeric
       ELSE 0
     END),0) AS total
     FROM transactions
@@ -1346,26 +1346,26 @@ app.delete('/api/liabilities/:id', async (req, res) => {
 
 // Profit / analytics
 app.get('/api/profit/summary', async (req, res) => {
-  const revenue = +(await get('SELECT COALESCE(SUM(total_amount),0) AS total FROM sales'))?.total || 0;
-  const cost = +(await get('SELECT COALESCE(SUM(total_cost),0) AS total FROM purchases'))?.total || 0;
+  const revenue = +(await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales'))?.total || 0;
+  const cost = +(await get('SELECT COALESCE(SUM(total_cost::numeric),0) AS total FROM purchases'))?.total || 0;
   res.json({ revenue, cost, profit: revenue - cost });
 });
 
 app.get('/api/analytics/dashboard', async (req, res) => {
-  const profit = await get('SELECT COALESCE(SUM(total_amount),0) - COALESCE((SELECT SUM(total_cost) FROM purchases),0) AS total FROM sales');
+  const profit = await get('SELECT COALESCE(SUM(total_amount::numeric),0) - COALESCE((SELECT SUM(total_cost::numeric) FROM purchases),0) AS total FROM sales');
   const clients = await get('SELECT COUNT(*)::int AS count FROM clients');
   const sales = await get('SELECT COUNT(*)::int AS count FROM sales');
   const purchases = await get('SELECT COUNT(*)::int AS count FROM purchases');
   const debts = await debtSummaryData();
   const profitByDate = await all(`
-    SELECT date::text AS date, COALESCE(SUM(total_amount),0) AS value
+    SELECT date::text AS date, COALESCE(SUM(total_amount::numeric),0) AS value
     FROM sales
     GROUP BY date
     ORDER BY date
     LIMIT 30
   `);
   const topClients = await all(`
-    SELECT c.name, COALESCE(SUM(s.total_amount),0) AS value
+    SELECT c.name, COALESCE(SUM(s.total_amount::numeric),0) AS value
     FROM sales s
     LEFT JOIN clients c ON c.id = s.client_id
     GROUP BY c.name
@@ -1393,8 +1393,8 @@ app.get('/api/analytics/profit', async (req, res) => {
   const rows = await all(`
     SELECT
       s.date::text AS date,
-      COALESCE(SUM(s.total_amount),0) AS revenue,
-      COALESCE((SELECT SUM(p.total_cost) FROM purchases p WHERE p.date = s.date),0) AS cost
+      COALESCE(SUM(s.total_amount::numeric),0) AS revenue,
+      COALESCE((SELECT SUM(p.total_cost::numeric) FROM purchases p WHERE p.date = s.date),0) AS cost
     FROM sales s
     GROUP BY s.date
     ORDER BY s.date
