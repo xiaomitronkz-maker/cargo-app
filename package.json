@@ -9,7 +9,8 @@
     "dev:client": "cd client && npm run dev",
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "build": "npm install --prefix client && npm run build --prefix client",
-    "prod": "npm run build && NODE_ENV=production node server.js"
+    "prod": "npm run build && NODE_ENV=production node server.js",
+    "webhook": "node deploy-webhook.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
