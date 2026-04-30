@@ -126,7 +126,8 @@ export default function Receipts() {
       setEditing(null)
       await load()
     } catch (e) {
-      alert(e.message)
+      console.error('Delete receipt failed:', e)
+      alert(e?.message || 'Не удалось удалить приход')
     }
   }
 

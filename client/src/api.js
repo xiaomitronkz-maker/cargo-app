@@ -8,7 +8,7 @@ async function request(method, path, body) {
   if (body !== undefined) opts.body = JSON.stringify(body)
   const res = await fetch(`/api${path}`, opts)
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+  if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`)
   return data
 }
 
