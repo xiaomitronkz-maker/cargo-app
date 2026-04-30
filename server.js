@@ -17,17 +17,21 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
+const hasDatabaseUrl = Boolean(process.env.DATABASE_URL);
+let dbAvailable = hasDatabaseUrl;
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL is required');
+if (!hasDatabaseUrl) {
+  console.warn('⚠️ DATABASE_URL is not set. Server will start without database connection.');
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: isProduction
-    ? { rejectUnauthorized: false }
-    : false,
-});
+const pool = hasDatabaseUrl
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: isProduction
+        ? { rejectUnauthorized: false }
+        : false,
+    })
+  : null;
 
 app.use(cors());
 app.use(express.json());
@@ -35,6 +39,13 @@ app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
+  next();
+});
+
+app.use('/api', (req, res, next) => {
+  if (!pool || !dbAvailable) {
+    return res.status(503).json({ error: 'Database is not configured' });
+  }
   next();
 });
 
@@ -73,6 +84,8 @@ async function withTx(fn) {
 }
 
 async function initDb() {
+  if (!pool) return;
+
   await query(`
     CREATE TABLE IF NOT EXISTS clients (
       id SERIAL PRIMARY KEY,
@@ -1730,8 +1743,22 @@ if (fs.existsSync(dist)) {
 }
 
 async function start() {
-  await initDb();
-  await pool.query('SELECT 1');
+  if (pool) {
+    try {
+      await initDb();
+      await pool.query('SELECT 1');
+      dbAvailable = true;
+      console.log('✅ Running with database');
+    } catch (error) {
+      dbAvailable = false;
+      console.error('❌ Database connection failed:', error.message);
+      console.warn('⚠️ Server will continue without database');
+    }
+  } else {
+    dbAvailable = false;
+    console.warn('⚠️ Running without database');
+  }
+
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
@@ -1739,5 +1766,4 @@ async function start() {
 
 start().catch((error) => {
   console.error('Failed to start server:', error);
-  process.exit(1);
 });
