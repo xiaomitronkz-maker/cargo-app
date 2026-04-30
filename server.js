@@ -1731,6 +1731,34 @@ app.get('/api/profit/summary', async (req, res) => {
 
 app.get('/api/analytics/dashboard', async (req, res) => {
   const profit = await profitSummaryData();
+  const newSales = await get(`
+    SELECT COUNT(*)::int AS count
+    FROM sales_items si
+    JOIN sales_documents sd ON sd.id = si.sales_document_id
+  `);
+  const useNewSales = +(newSales?.count || 0) > 0;
+  const soldItemsByDateSql = useNewSales
+    ? `
+      SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    `
+    : `
+      SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    `;
+  const soldItemsByClientSql = useNewSales
+    ? `
+      SELECT sd.client_id, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    `
+    : `
+      SELECT client_id, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    `;
   const clients = await get('SELECT COUNT(*)::int AS count FROM clients');
   const sales = await get('SELECT COUNT(*)::int AS count FROM sales');
   const purchases = await get('SELECT COUNT(*)::int AS count FROM purchases');
@@ -1741,23 +1769,7 @@ app.get('/api/analytics/dashboard', async (req, res) => {
       FROM purchases
       GROUP BY product_id
     ),
-    new_sales_count AS (
-      SELECT COUNT(*)::int AS count
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-    ),
-    sold_items AS (
-      SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count > 0
-      UNION ALL
-      SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count = 0 AND sales_document_id IS NULL
-    )
+    sold_items AS (${soldItemsByDateSql})
     SELECT
       si.date::text AS date,
       COALESCE(SUM(si.revenue),0) AS sales,
@@ -1783,23 +1795,7 @@ app.get('/api/analytics/dashboard', async (req, res) => {
       FROM purchases
       GROUP BY product_id
     ),
-    new_sales_count AS (
-      SELECT COUNT(*)::int AS count
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-    ),
-    sold_items AS (
-      SELECT sd.client_id, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count > 0
-      UNION ALL
-      SELECT client_id, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count = 0 AND sales_document_id IS NULL
-    )
+    sold_items AS (${soldItemsByClientSql})
     SELECT
       c.name,
       COALESCE(SUM(si.revenue),0) AS value,
@@ -1840,29 +1836,30 @@ app.get('/api/analytics/dashboard', async (req, res) => {
 });
 
 app.get('/api/analytics/profit', async (req, res) => {
+  const newSales = await get(`
+    SELECT COUNT(*)::int AS count
+    FROM sales_items si
+    JOIN sales_documents sd ON sd.id = si.sales_document_id
+  `);
+  const useNewSales = +(newSales?.count || 0) > 0;
+  const soldItemsByDateSql = useNewSales
+    ? `
+      SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    `
+    : `
+      SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    `;
   const rows = await all(`
     WITH purchase_costs AS (
       SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
       FROM purchases
       GROUP BY product_id
     ),
-    new_sales_count AS (
-      SELECT COUNT(*)::int AS count
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-    ),
-    sold_items AS (
-      SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count > 0
-      UNION ALL
-      SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count = 0 AND sales_document_id IS NULL
-    )
+    sold_items AS (${soldItemsByDateSql})
     SELECT
       si.date::text AS date,
       COALESCE(SUM(si.revenue),0) AS revenue,
