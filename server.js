@@ -1082,19 +1082,100 @@ app.get('/api/sales', async (req, res) => {
   const { client_id, product_id, from_date, to_date } = req.query;
   const params = [];
   const where = ['1=1'];
-  if (client_id) { params.push(+client_id); where.push(`s.client_id=$${params.length}`); }
-  if (product_id) { params.push(+product_id); where.push(`s.product_id=$${params.length}`); }
-  if (from_date) { params.push(from_date); where.push(`s.date >= $${params.length}`); }
-  if (to_date) { params.push(to_date); where.push(`s.date <= $${params.length}`); }
+  const having = [];
+  if (client_id) { params.push(+client_id); where.push(`client_id=$${params.length}`); }
+  if (from_date) { params.push(from_date); where.push(`date >= $${params.length}`); }
+  if (to_date) { params.push(to_date); where.push(`date <= $${params.length}`); }
+  if (product_id) { params.push(+product_id); having.push(`BOOL_OR(product_id=$${params.length})`); }
 
   res.json(await all(`
-    SELECT s.*, c.name AS client_name, m.marking, p.name AS product_name
-    FROM sales s
-    LEFT JOIN clients c ON c.id = s.client_id
-    LEFT JOIN markings m ON m.id = s.marking_id
-    LEFT JOIN products p ON p.id = s.product_id
-    WHERE ${where.join(' AND ')}
-    ORDER BY s.date DESC, s.created_at DESC
+    WITH sales_base AS (
+      SELECT
+        s.id,
+        COALESCE(s.sales_document_id, -s.id) AS group_id,
+        s.sales_document_id,
+        COALESCE(sd.date, s.date) AS date,
+        COALESCE(sd.created_at, s.created_at) AS created_at,
+        COALESCE(sd.client_id, s.client_id) AS client_id,
+        COALESCE(sd.marking_id, s.marking_id) AS marking_id,
+        s.product_id,
+        s.sale_unit,
+        s.quantity::numeric AS quantity,
+        s.price_per_unit::numeric AS price_per_unit,
+        COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS total_amount,
+        COALESCE(s.paid_amount::numeric,0) AS paid_amount,
+        s.notes,
+        p.name AS product_name
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      LEFT JOIN products p ON p.id = s.product_id
+    ),
+    documents AS (
+      SELECT
+        group_id,
+        MIN(id) AS anchor_sale_id,
+        sales_document_id,
+        date,
+        created_at,
+        client_id,
+        marking_id,
+        COALESCE(SUM(total_amount),0) AS total_amount,
+        COALESCE(SUM(paid_amount),0) AS fallback_paid_amount,
+        COUNT(*)::int AS items_count,
+        CASE
+          WHEN COUNT(*) = 1 THEN MAX(product_name)
+          ELSE COUNT(*)::text || ' тов.'
+        END AS product_name,
+        json_agg(json_build_object(
+          'id', id,
+          'product_id', product_id,
+          'product_name', product_name,
+          'sale_unit', sale_unit,
+          'quantity', quantity,
+          'price_per_unit', price_per_unit,
+          'total_amount', total_amount,
+          'notes', notes
+        ) ORDER BY id) AS items
+      FROM sales_base
+      WHERE ${where.join(' AND ')}
+      GROUP BY group_id, sales_document_id, date, created_at, client_id, marking_id
+      HAVING ${having.length ? having.join(' AND ') : '1=1'}
+    ),
+    receivable_payments AS (
+      SELECT x.group_id, COALESCE(SUM(x.amount::numeric),0) AS paid_amount
+      FROM (
+        SELECT DISTINCT
+          p.id,
+          COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS group_id,
+          p.amount::numeric AS amount
+        FROM payments p
+        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN sales s2 ON s2.id = t.sale_id
+        WHERE COALESCE(s.id, s2.id) IS NOT NULL
+      ) x
+      GROUP BY x.group_id
+    )
+    SELECT
+      d.anchor_sale_id AS id,
+      d.sales_document_id,
+      d.date::text AS date,
+      d.created_at,
+      d.client_id,
+      c.name AS client_name,
+      d.marking_id,
+      m.marking,
+      d.items_count,
+      d.product_name,
+      d.total_amount,
+      COALESCE(rp.paid_amount, d.fallback_paid_amount, 0) AS paid_amount,
+      d.total_amount - COALESCE(rp.paid_amount, d.fallback_paid_amount, 0) AS debt,
+      d.items
+    FROM documents d
+    LEFT JOIN clients c ON c.id = d.client_id
+    LEFT JOIN markings m ON m.id = d.marking_id
+    LEFT JOIN receivable_payments rp ON rp.group_id = d.group_id
+    ORDER BY d.date DESC, d.created_at DESC
   `, params));
 });
 
@@ -1121,6 +1202,88 @@ app.post('/api/sales', async (req, res) => {
 
 app.put('/api/sales/:id', async (req, res) => {
   const body = req.body;
+  const documentItems = Array.isArray(body.items) ? body.items : null;
+
+  if (documentItems) {
+    if (!body.date || !documentItems.length) {
+      return res.status(400).json({ error: 'Заполните все обязательные поля' });
+    }
+    try {
+      const sale = await get('SELECT * FROM sales WHERE id=$1', [+req.params.id]);
+      if (!sale) return res.status(404).json({ error: 'Продажа не найдена' });
+      if (!sale.sales_document_id && documentItems.length > 1) {
+        return res.status(400).json({ error: 'Продажа не привязана к документу' });
+      }
+      if (!sale.sales_document_id) {
+        const item = documentItems[0];
+        await validateSale(item.product_id, item.sale_unit, item.quantity, item.price_per_unit);
+        const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
+        const totalAmount = Math.round(+item.quantity * +item.price_per_unit * 100) / 100;
+        await query(`
+          UPDATE sales
+          SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
+          WHERE id=$10
+        `, [body.date, cid, mid, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, totalAmount, item.notes || item.note || null, +req.params.id]);
+        return res.json({ success: true, total_amount: totalAmount });
+      }
+
+      const result = await withTx(async (client) => {
+        const salesDocumentId = +sale.sales_document_id;
+        const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id, client);
+        await query('UPDATE sales_documents SET date=$1,client_id=$2,marking_id=$3 WHERE id=$4', [body.date, cid, mid, salesDocumentId], client);
+        await query('DELETE FROM sales_items WHERE sales_document_id=$1', [salesDocumentId], client);
+
+        const existingSales = await all('SELECT id FROM sales WHERE sales_document_id=$1 ORDER BY id', [salesDocumentId], client);
+        let totalAmount = 0;
+
+        for (let index = 0; index < documentItems.length; index += 1) {
+          const item = documentItems[index];
+          if (!item.product_id) throw new Error('Выберите товар в каждой строке');
+          if (!item.sale_unit) throw new Error('Укажите единицу продажи в каждой строке');
+          if (item.quantity == null || !(+item.quantity > 0)) throw new Error('Количество в каждой строке должно быть больше 0');
+          if (item.price_per_unit == null || !(+item.price_per_unit > 0)) throw new Error('Цена в каждой строке должна быть больше 0');
+          await validateSale(item.product_id, item.sale_unit, item.quantity, item.price_per_unit, client);
+
+          const itemTotal = Math.round(+item.quantity * +item.price_per_unit * 100) / 100;
+          totalAmount += itemTotal;
+          await query(
+            'INSERT INTO sales_items(sales_document_id,product_id,sale_unit,quantity,price_per_unit,note) VALUES($1,$2,$3,$4,$5,$6)',
+            [salesDocumentId, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, item.note || item.notes || null],
+            client
+          );
+
+          const existingSale = existingSales[index];
+          if (existingSale) {
+            await query(`
+              UPDATE sales
+              SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
+              WHERE id=$10
+            `, [body.date, cid, mid, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, itemTotal, item.notes || item.note || null, existingSale.id], client);
+          } else {
+            await query(`
+              INSERT INTO sales(date,client_id,marking_id,sales_document_id,product_id,sale_unit,quantity,price_per_unit,total_amount,paid_amount,notes)
+              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            `, [body.date, cid, mid, salesDocumentId, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, itemTotal, 0, item.notes || item.note || null], client);
+          }
+        }
+
+        const staleIds = existingSales.slice(documentItems.length).map((row) => +row.id);
+        if (staleIds.length) {
+          await query('DELETE FROM transactions WHERE sale_id = ANY($1::int[])', [staleIds], client);
+          await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id = ANY($1::int[])", [staleIds], client);
+          await query('DELETE FROM sales WHERE id = ANY($1::int[])', [staleIds], client);
+        }
+
+        await rebalanceSalesDocumentPaidAmounts(salesDocumentId, client);
+        return { total_amount: Math.round(totalAmount * 100) / 100 };
+      });
+
+      return res.json({ success: true, total_amount: result.total_amount });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
+
   if (!body.date || !body.product_id || !body.sale_unit || body.quantity == null || body.price_per_unit == null) {
     return res.status(400).json({ error: 'Заполните все обязательные поля' });
   }
@@ -1181,6 +1344,20 @@ app.delete('/api/sales/:id', async (req, res) => {
   const id = +req.params.id;
   try {
     await withTx(async (client) => {
+      const sale = await get('SELECT * FROM sales WHERE id=$1', [id], client);
+      if (!sale) return;
+
+      if (sale.sales_document_id) {
+        const saleRows = await all('SELECT id FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
+        const saleIds = saleRows.map((row) => +row.id);
+        await query('DELETE FROM transactions WHERE sale_id = ANY($1::int[])', [saleIds], client);
+        await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id = ANY($1::int[])", [saleIds], client);
+        await query('DELETE FROM sales_items WHERE sales_document_id=$1', [+sale.sales_document_id], client);
+        await query('DELETE FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
+        await query('DELETE FROM sales_documents WHERE id=$1', [+sale.sales_document_id], client);
+        return;
+      }
+
       await query('DELETE FROM transactions WHERE sale_id=$1', [id], client);
       await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id=$1", [id], client);
       await query('DELETE FROM sales WHERE id=$1', [id], client);

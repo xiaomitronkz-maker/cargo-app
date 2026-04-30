@@ -58,6 +58,9 @@ export default function Sales() {
 
   const previewTotal = items.reduce((sum, item) => sum + (toNumber(item.quantity) * toNumber(item.price_per_unit)), 0)
   const totalAmount = normalizeArray(sales).reduce((sum, row) => sum + toNumber(row.total_amount), 0)
+  const saleItems = (sale) => normalizeArray(sale.items)
+  const itemCount = (sale) => toNumber(sale.items_count) || saleItems(sale).length
+  const itemQty = (item) => `${toNumber(item.quantity).toLocaleString('ru-RU', { maximumFractionDigits: 3 })} ${UNIT_LABELS[item.sale_unit] || item.sale_unit || ''}`.trim()
 
   const openCreate = () => {
     setSelected(null)
@@ -68,19 +71,20 @@ export default function Sales() {
   }
 
   const openEdit = (sale) => {
+    const rows = saleItems(sale)
     setSelected(sale)
     setForm({
       date: sale.date || today(),
       client_id: String(sale.client_id || ''),
       marking_id: String(sale.marking_id || ''),
     })
-    setItems([{
-      product_id: String(sale.product_id || ''),
-      sale_unit: sale.sale_unit || '',
-      quantity: sale.quantity ?? '',
-      price_per_unit: sale.price_per_unit ?? '',
-      notes: sale.notes || '',
-    }])
+    setItems((rows.length ? rows : [sale]).map((item) => ({
+      product_id: String(item.product_id || ''),
+      sale_unit: item.sale_unit || '',
+      quantity: item.quantity ?? '',
+      price_per_unit: item.price_per_unit ?? '',
+      notes: item.notes || '',
+    })))
     setError('')
     setModal('edit')
   }
@@ -96,6 +100,8 @@ export default function Sales() {
     try {
       if (modal === 'create') {
         await api.createSalesDocument({ ...form, items })
+      } else if (selected.sales_document_id) {
+        await api.updateSale(selected.id, { ...form, items })
       } else {
         const item = items[0] || EMPTY_ITEM
         await api.updateSale(selected.id, {
@@ -131,7 +137,7 @@ export default function Sales() {
       <div className="page-header">
         <div>
           <div className="page-title">Реализация</div>
-          <div className="page-subtitle">{normalizeArray(sales).length} продаж · итого {fmt(totalAmount)}</div>
+          <div className="page-subtitle">{normalizeArray(sales).length} реализаций · итого {fmt(totalAmount)}</div>
         </div>
         <button className="btn btn-primary" onClick={openCreate}>+ Добавить продажу</button>
       </div>
@@ -162,40 +168,57 @@ export default function Sales() {
                 <th>Дата</th>
                 <th>Клиент</th>
                 <th>Маркировка</th>
-                <th>Товар</th>
-                <th>Ед.</th>
-                <th>Кол-во</th>
-                <th>Цена/ед</th>
+                <th>Товары</th>
                 <th>Итого</th>
-                <th>Заметки</th>
+                <th>Оплачено</th>
+                <th>Долг</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
               {normalizeArray(sales).length === 0 && (
-                <tr><td colSpan={10}>
+                <tr><td colSpan={8}>
                   <div className="empty-state"><div className="empty-icon">📤</div><p>Продаж нет</p></div>
                 </td></tr>
               )}
-              {normalizeArray(sales).map((sale) => (
-                <tr key={sale.id}>
-                  <td className="td-muted">{sale.date}</td>
-                  <td>{sale.client_name || '—'}</td>
-                  <td>{sale.marking ? <span className="badge badge-primary">{sale.marking}</span> : '—'}</td>
-                  <td>{sale.product_name}</td>
-                  <td><span className={`badge ${sale.sale_unit === 'kg' ? 'badge-warning' : 'badge-primary'}`}>{UNIT_LABELS[sale.sale_unit] || sale.sale_unit}</span></td>
-                  <td className="td-mono">{toNumber(sale.quantity).toFixed(3)}</td>
-                  <td className="td-mono td-muted">{fmt(sale.price_per_unit)}</td>
-                  <td><span className="badge badge-success">{fmt(sale.total_amount)}</span></td>
-                  <td className="td-muted" style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sale.notes || '—'}</td>
-                  <td>
-                    <div className="td-actions">
-                      <button className="btn btn-ghost btn-sm" onClick={() => openEdit(sale)}>Изм.</button>
-                      <button className="btn btn-danger btn-sm" onClick={() => openDelete(sale)}>✕</button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {normalizeArray(sales).map((sale) => {
+                const rows = saleItems(sale)
+                return (
+                  <tr key={sale.sales_document_id ? `doc-${sale.sales_document_id}` : `sale-${sale.id}`}>
+                    <td className="td-muted">{sale.date}</td>
+                    <td>{sale.client_name || '—'}</td>
+                    <td>{sale.marking ? <span className="badge badge-primary">{sale.marking}</span> : '—'}</td>
+                    <td>
+                      <div style={{ display: 'grid', gap: 6 }}>
+                        <span className="badge badge-primary" style={{ width: 'fit-content' }}>{itemCount(sale)} тов.</span>
+                        <div style={{ display: 'grid', gap: 4 }}>
+                          {rows.map((item) => (
+                            <div key={item.id} className="td-muted" style={{ fontSize: 12 }}>
+                              <strong style={{ color: 'var(--text-primary)' }}>{item.product_name || 'Товар'}</strong>
+                              {' — '}{itemQty(item)} × {fmt(item.price_per_unit)} = {fmt(item.total_amount)}
+                              {item.notes ? <span> · {item.notes}</span> : null}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </td>
+                    <td><span className="badge badge-success">{fmt(sale.total_amount)}</span></td>
+                    <td className="td-mono td-muted">{fmt(sale.paid_amount)}</td>
+                    <td><span className={`badge ${toNumber(sale.debt) > 0 ? 'badge-warning' : 'badge-success'}`}>{fmt(sale.debt)}</span></td>
+                    <td>
+                      <div className="td-actions">
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => openEdit(sale)}
+                        >
+                          Изм.
+                        </button>
+                        <button className="btn btn-danger btn-sm" onClick={() => openDelete(sale)}>✕</button>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -251,8 +274,15 @@ export default function Sales() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 12 }}>
                   <strong>Товар {index + 1}</strong>
                   <div className="td-actions">
-                    {modal === 'create' && <button type="button" className="btn btn-secondary btn-sm" onClick={addItem}>Добавить товар</button>}
-                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => removeItem(index)} disabled={items.length === 1 || modal === 'edit'}>Удалить товар</button>
+                    {(modal === 'create' || selected?.sales_document_id) && <button type="button" className="btn btn-secondary btn-sm" onClick={addItem}>Добавить товар</button>}
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => removeItem(index)}
+                      disabled={items.length === 1 || (modal === 'edit' && !selected?.sales_document_id)}
+                    >
+                      Удалить товар
+                    </button>
                   </div>
                 </div>
 
@@ -338,7 +368,7 @@ export default function Sales() {
 
       {modal === 'delete' && (
         <ConfirmModal
-          message="Удалить запись о продаже?"
+          message="Удалить реализацию?"
           onConfirm={del}
           onCancel={() => setModal(null)}
         />
