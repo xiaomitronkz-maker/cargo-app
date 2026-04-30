@@ -521,6 +521,54 @@ async function debtSummaryData(client = pool) {
   };
 }
 
+async function profitSummaryData(client = pool) {
+  const row = await get(`
+    WITH purchase_costs AS (
+      SELECT
+        product_id,
+        COALESCE(SUM(total_cost::numeric),0) AS total_cost,
+        COALESCE(SUM(weight_kg::numeric),0) AS total_weight,
+        COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
+      FROM purchases
+      GROUP BY product_id
+    ),
+    sold_items AS (
+      SELECT
+        si.product_id,
+        si.sale_unit,
+        si.quantity::numeric AS quantity,
+        si.price_per_unit::numeric AS price_per_unit,
+        si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+      UNION ALL
+      SELECT
+        product_id,
+        sale_unit,
+        quantity::numeric AS quantity,
+        price_per_unit::numeric AS price_per_unit,
+        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    )
+    SELECT
+      COALESCE(SUM(si.revenue),0) AS revenue,
+      COALESCE(SUM(CASE
+        WHEN si.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0
+          THEN si.quantity * pc.total_cost / pc.total_weight
+        WHEN si.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0
+          THEN si.quantity * pc.total_cost / pc.total_quantity
+        ELSE 0
+      END),0) AS cost
+    FROM sold_items si
+    LEFT JOIN purchase_costs pc ON pc.product_id = si.product_id
+  `, [], client);
+
+  const revenue = +(row?.revenue || 0);
+  const cost = +(row?.cost || 0);
+  return { revenue, cost, profit: revenue - cost };
+}
+
 // Clients
 app.get('/api/clients', async (req, res) => {
   res.json(await all('SELECT * FROM clients ORDER BY name'));
@@ -1668,40 +1716,92 @@ app.delete('/api/liabilities/:id', async (req, res) => {
 
 // Profit / analytics
 app.get('/api/profit/summary', async (req, res) => {
-  const revenue = +(await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales WHERE sales_document_id IS NULL'))?.total || 0;
-  const cost = +(await get('SELECT COALESCE(SUM(total_cost::numeric),0) AS total FROM purchases'))?.total || 0;
-  res.json({ revenue, cost, profit: revenue - cost });
+  res.json(await profitSummaryData());
 });
 
 app.get('/api/analytics/dashboard', async (req, res) => {
-  const profit = await get('SELECT COALESCE(SUM(total_amount::numeric),0) - COALESCE((SELECT SUM(total_cost::numeric) FROM purchases),0) AS total FROM sales WHERE sales_document_id IS NULL');
+  const profit = await profitSummaryData();
   const clients = await get('SELECT COUNT(*)::int AS count FROM clients');
   const sales = await get('SELECT COUNT(*)::int AS count FROM sales');
   const purchases = await get('SELECT COUNT(*)::int AS count FROM purchases');
   const debts = await debtSummaryData();
   const profitByDate = await all(`
-    SELECT date::text AS date, COALESCE(SUM(total_amount::numeric),0) AS value
-    FROM sales
-    WHERE sales_document_id IS NULL
-    GROUP BY date
-    ORDER BY date
+    WITH purchase_costs AS (
+      SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
+      FROM purchases
+      GROUP BY product_id
+    ),
+    sold_items AS (
+      SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+      UNION ALL
+      SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    )
+    SELECT
+      si.date::text AS date,
+      COALESCE(SUM(si.revenue),0) AS sales,
+      COALESCE(SUM(CASE
+        WHEN si.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN si.quantity * pc.total_cost / pc.total_weight
+        WHEN si.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN si.quantity * pc.total_cost / pc.total_quantity
+        ELSE 0
+      END),0) AS costs,
+      COALESCE(SUM(si.revenue),0) - COALESCE(SUM(CASE
+        WHEN si.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN si.quantity * pc.total_cost / pc.total_weight
+        WHEN si.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN si.quantity * pc.total_cost / pc.total_quantity
+        ELSE 0
+      END),0) AS profit
+    FROM sold_items si
+    LEFT JOIN purchase_costs pc ON pc.product_id = si.product_id
+    GROUP BY si.date
+    ORDER BY si.date
     LIMIT 30
   `);
   const topClients = await all(`
-    SELECT c.name, COALESCE(SUM(s.total_amount::numeric),0) AS value
-    FROM sales s
-    LEFT JOIN clients c ON c.id = s.client_id
-    WHERE s.sales_document_id IS NULL
+    WITH purchase_costs AS (
+      SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
+      FROM purchases
+      GROUP BY product_id
+    ),
+    sold_items AS (
+      SELECT sd.client_id, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+      UNION ALL
+      SELECT client_id, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    )
+    SELECT
+      c.name,
+      COALESCE(SUM(si.revenue),0) AS value,
+      COALESCE(SUM(si.revenue),0) AS total_sales,
+      COALESCE(SUM(CASE
+        WHEN si.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN si.quantity * pc.total_cost / pc.total_weight
+        WHEN si.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN si.quantity * pc.total_cost / pc.total_quantity
+        ELSE 0
+      END),0) AS total_costs,
+      COALESCE(SUM(si.revenue),0) - COALESCE(SUM(CASE
+        WHEN si.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN si.quantity * pc.total_cost / pc.total_weight
+        WHEN si.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN si.quantity * pc.total_cost / pc.total_quantity
+        ELSE 0
+      END),0) AS profit
+    FROM sold_items si
+    LEFT JOIN clients c ON c.id = si.client_id
+    LEFT JOIN purchase_costs pc ON pc.product_id = si.product_id
     GROUP BY c.name
     ORDER BY value DESC
     LIMIT 5
   `);
 
   res.json({
-    totalProfit: +(profit?.total || 0),
-    todayProfit: +(profit?.total || 0),
-    weekProfit: +(profit?.total || 0),
-    monthProfit: +(profit?.total || 0),
+    totalProfit: profit.profit,
+    totalSales: profit.revenue,
+    todayProfit: profit.profit,
+    weekProfit: profit.profit,
+    monthProfit: profit.profit,
     clientCount: +(clients?.count || 0),
     saleCount: +(sales?.count || 0),
     purchaseCount: +(purchases?.count || 0),
@@ -1715,14 +1815,32 @@ app.get('/api/analytics/dashboard', async (req, res) => {
 
 app.get('/api/analytics/profit', async (req, res) => {
   const rows = await all(`
+    WITH purchase_costs AS (
+      SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
+      FROM purchases
+      GROUP BY product_id
+    ),
+    sold_items AS (
+      SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+      UNION ALL
+      SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    )
     SELECT
-      s.date::text AS date,
-      COALESCE(SUM(s.total_amount::numeric),0) AS revenue,
-      COALESCE((SELECT SUM(p.total_cost::numeric) FROM purchases p WHERE p.date = s.date),0) AS cost
-    FROM sales s
-    WHERE s.sales_document_id IS NULL
-    GROUP BY s.date
-    ORDER BY s.date
+      si.date::text AS date,
+      COALESCE(SUM(si.revenue),0) AS revenue,
+      COALESCE(SUM(CASE
+        WHEN si.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN si.quantity * pc.total_cost / pc.total_weight
+        WHEN si.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN si.quantity * pc.total_cost / pc.total_quantity
+        ELSE 0
+      END),0) AS cost
+    FROM sold_items si
+    LEFT JOIN purchase_costs pc ON pc.product_id = si.product_id
+    GROUP BY si.date
+    ORDER BY si.date
   `);
   res.json(rows.map((row) => ({ ...row, profit: (+row.revenue || 0) - (+row.cost || 0) })));
 });
