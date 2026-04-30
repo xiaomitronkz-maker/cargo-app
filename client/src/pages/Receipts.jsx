@@ -120,10 +120,14 @@ export default function Receipts() {
 
   const deleteReceipt = async (receipt) => {
     if (!confirm('Удалить приход?')) return
-    await api.deleteReceipt(receipt.id)
-    setSelected(null)
-    setEditing(null)
-    await load()
+    try {
+      await api.deleteReceipt(receipt.id)
+      setSelected(null)
+      setEditing(null)
+      await load()
+    } catch (e) {
+      alert(e.message)
+    }
   }
 
   return (

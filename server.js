@@ -843,21 +843,50 @@ app.put('/api/receipts/:id', async (req, res) => {
 app.delete('/api/receipts/:id', async (req, res) => {
   const id = +req.params.id;
   try {
-    const receipt = await get('SELECT * FROM receipts WHERE id=$1', [id]);
-    if (!receipt) return res.status(404).json({ error: 'Приход не найден' });
     await withTx(async (client) => {
-      const purchaseIds = await all('SELECT id FROM purchases WHERE receipt_id=$1', [id], client);
-      await query('DELETE FROM transactions WHERE receipt_id=$1', [id], client);
-      for (const purchase of purchaseIds) {
-        await query("DELETE FROM payments WHERE entity_type='purchase' AND entity_id=$1", [purchase.id], client);
+      const receipt = await get('SELECT * FROM receipts WHERE id=$1', [id], client);
+      if (!receipt) throw new Error('Приход не найден');
+
+      const usedSale = await get(`
+        SELECT s.id, pr.name AS product_name
+        FROM sales s
+        JOIN (
+          SELECT DISTINCT product_id
+          FROM purchases
+          WHERE receipt_id=$1
+        ) rp ON rp.product_id = s.product_id
+        LEFT JOIN products pr ON pr.id = s.product_id
+        WHERE COALESCE(s.quantity::numeric,0) > 0
+        LIMIT 1
+      `, [id], client);
+      if (usedSale) {
+        throw new Error('Нельзя удалить приход: товар уже использован в реализации');
       }
+
+      const purchaseRows = await all('SELECT id FROM purchases WHERE receipt_id=$1', [id], client);
+      const purchaseIds = purchaseRows.map((purchase) => +purchase.id);
+      const transactionRows = await all(`
+        SELECT DISTINCT t.id
+        FROM transactions t
+        LEFT JOIN payments p ON p.transaction_id = t.id
+        WHERE t.receipt_id=$1
+           OR (p.entity_type='purchase' AND p.entity_id = ANY($2::int[]))
+      `, [id, purchaseIds], client);
+      const transactionIds = transactionRows.map((transaction) => +transaction.id);
+
+      await query(`
+        DELETE FROM payments
+        WHERE (entity_type='purchase' AND entity_id = ANY($1::int[]))
+           OR transaction_id = ANY($2::int[])
+      `, [purchaseIds, transactionIds], client);
+      await query('DELETE FROM transactions WHERE id = ANY($1::int[])', [transactionIds], client);
       await query('DELETE FROM purchases WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM receipt_items WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM receipts WHERE id=$1', [id], client);
     });
     res.json({ success: true });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.message === 'Приход не найден' ? 404 : 400).json({ error: e.message });
   }
 });
 
