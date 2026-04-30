@@ -63,11 +63,24 @@ function runStep(label, command, args, cwd) {
 }
 
 async function deploy() {
+  log('deploy started');
   await runStep('git pull', 'git', ['pull', '--ff-only'], DEPLOY_PATH);
   await runStep('backend npm install', 'npm', ['install'], DEPLOY_PATH);
   await runStep('client npm install', 'npm', ['install'], CLIENT_PATH);
   await runStep('client build', 'npm', ['run', 'build'], CLIENT_PATH);
   await runStep('pm2 restart', 'pm2', ['restart', PM2_APP_NAME, '--update-env'], DEPLOY_PATH);
+  log('deploy finished');
+}
+
+function startDeployInBackground() {
+  deploying = true;
+  deploy()
+    .catch((error) => {
+      console.error('[deploy] deploy failed', error);
+    })
+    .finally(() => {
+      deploying = false;
+    });
 }
 
 async function webhookHandler(req, res) {
@@ -85,23 +98,19 @@ async function webhookHandler(req, res) {
   }
 
   if (deploying) {
-    return res.status(409).json({ ok: false, error: 'Deployment already running' });
+    return res.status(202).json({ ok: true, message: 'deploy already running' });
   }
 
-  deploying = true;
-  try {
-    await deploy();
-    res.json({ ok: true, message: 'deploy finished' });
-  } catch (error) {
-    console.error('[deploy] deploy failed', error);
-    res.status(500).json({ ok: false, error: error.message });
-  } finally {
-    deploying = false;
-  }
+  startDeployInBackground();
+  return res.status(202).json({ ok: true, message: 'deploy started' });
 }
 
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'cargo-app deploy webhook' });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, service: 'deploy-webhook' });
 });
 
 app.post('/webhook', webhookHandler);
