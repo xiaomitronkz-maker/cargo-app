@@ -532,6 +532,11 @@ async function profitSummaryData(client = pool) {
       FROM purchases
       GROUP BY product_id
     ),
+    new_sales_count AS (
+      SELECT COUNT(*)::int AS count
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    ),
     sold_items AS (
       SELECT
         si.product_id,
@@ -541,6 +546,8 @@ async function profitSummaryData(client = pool) {
         si.quantity::numeric * si.price_per_unit::numeric AS revenue
       FROM sales_items si
       JOIN sales_documents sd ON sd.id = si.sales_document_id
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count > 0
       UNION ALL
       SELECT
         product_id,
@@ -549,7 +556,8 @@ async function profitSummaryData(client = pool) {
         price_per_unit::numeric AS price_per_unit,
         COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
       FROM sales
-      WHERE sales_document_id IS NULL
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count = 0 AND sales_document_id IS NULL
     )
     SELECT
       COALESCE(SUM(si.revenue),0) AS revenue,
@@ -1731,14 +1739,22 @@ app.get('/api/analytics/dashboard', async (req, res) => {
       FROM purchases
       GROUP BY product_id
     ),
+    new_sales_count AS (
+      SELECT COUNT(*)::int AS count
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    ),
     sold_items AS (
       SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
       FROM sales_items si
       JOIN sales_documents sd ON sd.id = si.sales_document_id
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count > 0
       UNION ALL
       SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
       FROM sales
-      WHERE sales_document_id IS NULL
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count = 0 AND sales_document_id IS NULL
     )
     SELECT
       si.date::text AS date,
@@ -1765,14 +1781,22 @@ app.get('/api/analytics/dashboard', async (req, res) => {
       FROM purchases
       GROUP BY product_id
     ),
+    new_sales_count AS (
+      SELECT COUNT(*)::int AS count
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    ),
     sold_items AS (
       SELECT sd.client_id, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
       FROM sales_items si
       JOIN sales_documents sd ON sd.id = si.sales_document_id
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count > 0
       UNION ALL
       SELECT client_id, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
       FROM sales
-      WHERE sales_document_id IS NULL
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count = 0 AND sales_document_id IS NULL
     )
     SELECT
       c.name,
@@ -1820,14 +1844,22 @@ app.get('/api/analytics/profit', async (req, res) => {
       FROM purchases
       GROUP BY product_id
     ),
+    new_sales_count AS (
+      SELECT COUNT(*)::int AS count
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    ),
     sold_items AS (
       SELECT sd.date, si.product_id, si.sale_unit, si.quantity::numeric AS quantity, si.quantity::numeric * si.price_per_unit::numeric AS revenue
       FROM sales_items si
       JOIN sales_documents sd ON sd.id = si.sales_document_id
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count > 0
       UNION ALL
       SELECT date, product_id, sale_unit, quantity::numeric AS quantity, COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
       FROM sales
-      WHERE sales_document_id IS NULL
+      CROSS JOIN new_sales_count nsc
+      WHERE nsc.count = 0 AND sales_document_id IS NULL
     )
     SELECT
       si.date::text AS date,
