@@ -522,6 +522,34 @@ async function debtSummaryData(client = pool) {
 }
 
 async function profitSummaryData(client = pool) {
+  const newSales = await get(`
+    SELECT COUNT(*)::int AS count
+    FROM sales_items si
+    JOIN sales_documents sd ON sd.id = si.sales_document_id
+  `, [], client);
+  const useNewSales = +(newSales?.count || 0) > 0;
+  const soldItemsSql = useNewSales
+    ? `
+      SELECT
+        si.product_id,
+        si.sale_unit,
+        si.quantity::numeric AS quantity,
+        si.price_per_unit::numeric AS price_per_unit,
+        si.quantity::numeric * si.price_per_unit::numeric AS revenue
+      FROM sales_items si
+      JOIN sales_documents sd ON sd.id = si.sales_document_id
+    `
+    : `
+      SELECT
+        product_id,
+        sale_unit,
+        quantity::numeric AS quantity,
+        price_per_unit::numeric AS price_per_unit,
+        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
+      FROM sales
+      WHERE sales_document_id IS NULL
+    `;
+
   const row = await get(`
     WITH purchase_costs AS (
       SELECT
@@ -532,33 +560,7 @@ async function profitSummaryData(client = pool) {
       FROM purchases
       GROUP BY product_id
     ),
-    new_sales_count AS (
-      SELECT COUNT(*)::int AS count
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-    ),
-    sold_items AS (
-      SELECT
-        si.product_id,
-        si.sale_unit,
-        si.quantity::numeric AS quantity,
-        si.price_per_unit::numeric AS price_per_unit,
-        si.quantity::numeric * si.price_per_unit::numeric AS revenue
-      FROM sales_items si
-      JOIN sales_documents sd ON sd.id = si.sales_document_id
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count > 0
-      UNION ALL
-      SELECT
-        product_id,
-        sale_unit,
-        quantity::numeric AS quantity,
-        price_per_unit::numeric AS price_per_unit,
-        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-      CROSS JOIN new_sales_count nsc
-      WHERE nsc.count = 0 AND sales_document_id IS NULL
-    )
+    sold_items AS (${soldItemsSql})
     SELECT
       COALESCE(SUM(si.revenue),0) AS revenue,
       COALESCE(SUM(CASE
