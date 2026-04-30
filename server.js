@@ -18,10 +18,10 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 const hasDatabaseUrl = Boolean(process.env.DATABASE_URL);
-let dbAvailable = hasDatabaseUrl;
+let databaseReady = false;
 
 if (!hasDatabaseUrl) {
-  console.warn('⚠️ DATABASE_URL is not set. Server will start without database connection.');
+  console.warn('⚠️ DATABASE_URL is not set. API will return 503, frontend will work.');
 }
 
 const pool = hasDatabaseUrl
@@ -43,8 +43,8 @@ app.use((req, res, next) => {
 });
 
 app.use('/api', (req, res, next) => {
-  if (!pool || !dbAvailable) {
-    return res.status(503).json({ error: 'Database is not configured' });
+  if (!pool || !databaseReady) {
+    return res.status(503).json({ error: 'Database is not available' });
   }
   next();
 });
@@ -1742,25 +1742,28 @@ if (fs.existsSync(dist)) {
   });
 }
 
-async function start() {
-  if (pool) {
-    try {
-      await initDb();
-      await pool.query('SELECT 1');
-      dbAvailable = true;
-      console.log('✅ Running with database');
-    } catch (error) {
-      dbAvailable = false;
-      console.error('❌ Database connection failed:', error.message);
-      console.warn('⚠️ Server will continue without database');
-    }
-  } else {
-    dbAvailable = false;
+async function connectDatabaseSafely() {
+  if (!pool) {
     console.warn('⚠️ Running without database');
+    return;
   }
 
+  try {
+    await initDb();
+    await pool.query('SELECT 1');
+    databaseReady = true;
+    console.log('✅ Running with database');
+  } catch (error) {
+    databaseReady = false;
+    console.error('❌ Database connection failed:', error.message);
+    console.warn('⚠️ Server continues without database. API will return 503.');
+  }
+}
+
+async function start() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+    connectDatabaseSafely();
   });
 }
 
