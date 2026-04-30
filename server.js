@@ -1,3 +1,4 @@
+require('dotenv').config();
 /**
  * Cargo Manager — PostgreSQL Backend
  *
@@ -15,6 +16,7 @@ const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const isProduction = process.env.NODE_ENV === 'production';
 
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is required');
@@ -22,7 +24,9 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: isProduction
+    ? { rejectUnauthorized: false }
+    : false,
 });
 
 app.use(cors());
@@ -1714,22 +1718,22 @@ app.post('/api/ai/command', async (req, res) => {
   res.json({ reply: `Команда принята: ${req.body.command || ''}`.trim() });
 });
 
-if (process.env.NODE_ENV === 'production') {
-  const dist = path.join(__dirname, 'client', 'dist');
-  if (fs.existsSync(dist)) {
-    app.use(express.static(dist));
-    app.get('*', (req, res, next) => {
-      if (req.path.startsWith('/api/')) return next();
-      res.sendFile(path.join(dist, 'index.html'));
-    });
-  }
+const dist = process.env.CLIENT_DIST || '/root/cargo-app/client/dist';
+
+if (fs.existsSync(dist)) {
+  app.use(express.static(dist));
+
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    res.sendFile(path.join(dist, 'index.html'));
+  });
 }
 
 async function start() {
   await initDb();
   await pool.query('SELECT 1');
-  app.listen(PORT, () => {
-    console.log(`Server listening on http://localhost:${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
 
