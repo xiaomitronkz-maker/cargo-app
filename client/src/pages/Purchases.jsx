@@ -3,6 +3,11 @@ import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
 
 const today = () => new Date().toISOString().slice(0, 10)
+const purchaseTotalCost = (row) => {
+  const weight = +(row.weight_kg ?? row.weight) || 0
+  const quantity = +(row.quantity_pcs ?? row.quantity) || 0
+  return (weight * (+row.cost_dubai || 0)) + (quantity * (+row.cost_almaty || 0))
+}
 
 const EMPTY = {
   date: today(),
@@ -158,8 +163,8 @@ export default function Purchases() {
   const previewTotalCost = (() => {
     const a = parseFloat(form.cost_almaty)
     const d = parseFloat(form.cost_dubai)
-    if (isNaN(a) && isNaN(d)) return null
-    return ((isNaN(a) ? 0 : a) + (isNaN(d) ? 0 : d)).toFixed(2)
+    if (isNaN(a) && isNaN(d) && !(+form.weight_kg > 0) && !(+form.quantity_pcs > 0)) return null
+    return purchaseTotalCost(form).toFixed(2)
   })()
 
   // Итоги по таблице
@@ -167,9 +172,7 @@ export default function Purchases() {
   const totalCost   = purchases.reduce((s, p) => s + (+p.total_cost || 0), 0)
   const itemsTotalWeight = items.reduce((sum, i) => sum + Number(i.weight || 0), 0)
   const itemsTotalQty = items.reduce((sum, i) => sum + Number(i.quantity || 0), 0)
-  const itemsTotalCost =
-    items.reduce((sum, i) => sum + Number(i.cost_almaty || 0), 0) +
-    items.reduce((sum, i) => sum + Number(i.cost_dubai || 0), 0)
+  const itemsTotalCost = items.reduce((sum, i) => sum + purchaseTotalCost(i), 0)
   const pricePerKg = itemsTotalWeight ? itemsTotalCost / itemsTotalWeight : 0
   const pricePerItem = itemsTotalQty ? itemsTotalCost / itemsTotalQty : 0
   const valueTone = (value) => ({ color: value > 0 ? 'var(--text)' : 'var(--text-muted)' })
@@ -177,14 +180,14 @@ export default function Purchases() {
     const prices = purchaseHistory
       .filter(p => String(p.product_id) === String(item.product_id))
       .map(p => {
-        const cost = (+p.cost_almaty || 0) + (+p.cost_dubai || 0)
+        const cost = (+p.total_cost || 0) || purchaseTotalCost(p)
         const base = (+p.weight_kg || 0) > 0 ? (+p.weight_kg || 0) : (+p.quantity_pcs || 0)
         return base ? cost / base : 0
       })
       .filter(price => price > 0)
     const avgPrice = prices.length ? prices.reduce((sum, price) => sum + price, 0) / prices.length : 0
     const lastPrice = prices.length ? prices[0] : 0
-    const currentCost = (+item.cost_almaty || 0) + (+item.cost_dubai || 0)
+    const currentCost = purchaseTotalCost(item)
     const currentBase = (+item.weight || 0) || (+item.quantity || 0) || 1
     const currentPrice = currentCost / currentBase
     const diff = currentPrice - avgPrice
@@ -242,8 +245,8 @@ export default function Purchases() {
                 <th>Вес (кг)</th>
                 <th>Шт</th>
                 <th>Коробки</th>
-                <th>Алматы</th>
-                <th>Дубай</th>
+                <th>Алматы $/шт</th>
+                <th>Dubai $/кг</th>
                 <th>Итого себест.</th>
                 <th></th>
               </tr>
@@ -384,7 +387,7 @@ export default function Purchases() {
 	          {modal === 'create' ? (
 	            <>
 		              {items.map((item, index) => {
-		                const cost = (+item.cost_almaty || 0) + (+item.cost_dubai || 0)
+		                const cost = purchaseTotalCost(item)
 		                const costControl = getCostControl(item)
 		                return (
 	                  <div key={index} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 14 }}>
@@ -415,16 +418,16 @@ export default function Purchases() {
 	                    </div>
 	                    <div className="form-row">
 	                      <div className="form-group">
-	                        <label className="form-label">Стоимость Алматы</label>
+	                        <label className="form-label">Алматы $/шт</label>
 	                        <input type="number" step="0.01" min="0" className="form-input" value={item.cost_almaty} onChange={e => setItemF(index, 'cost_almaty', e.target.value)} placeholder="0.00" />
 	                      </div>
 	                      <div className="form-group">
-	                        <label className="form-label">Стоимость Дубай</label>
+	                        <label className="form-label">Dubai $/кг</label>
 	                        <input type="number" step="0.01" min="0" className="form-input" value={item.cost_dubai} onChange={e => setItemF(index, 'cost_dubai', e.target.value)} placeholder="0.00" />
 	                      </div>
 	                    </div>
 		                    <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
-		                      <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Себестоимость за кг</span>
+		                      <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Итого себестоимость</span>
 		                      <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--warning)', fontFamily: 'monospace', marginLeft: 8 }}>
 		                        {fmt(cost)}
 		                      </span>
@@ -499,12 +502,12 @@ export default function Purchases() {
 	              </div>
 	              <div className="form-row">
 	                <div className="form-group">
-	                  <label className="form-label">Стоимость Алматы</label>
+	                  <label className="form-label">Алматы $/шт</label>
 	                  <input type="number" step="0.01" min="0" className="form-input"
 	                    value={form.cost_almaty} onChange={e => setF('cost_almaty', e.target.value)} placeholder="0.00" />
 	                </div>
 	                <div className="form-group">
-	                  <label className="form-label">Стоимость Дубай</label>
+	                  <label className="form-label">Dubai $/кг</label>
 	                  <input type="number" step="0.01" min="0" className="form-input"
 	                    value={form.cost_dubai} onChange={e => setF('cost_dubai', e.target.value)} placeholder="0.00" />
 	                </div>
@@ -513,7 +516,7 @@ export default function Purchases() {
 	                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
 	                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Итоговая себестоимость</span>
 	                  <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--warning)', fontFamily: 'monospace', marginLeft: 8 }}>
-	                    = {fmt(form.cost_almaty || 0)} + {fmt(form.cost_dubai || 0)} = <strong>${previewTotalCost}</strong>
+	                    = ({form.weight_kg || 0} кг × {fmt(form.cost_dubai || 0)}) + ({form.quantity_pcs || 0} шт × {fmt(form.cost_almaty || 0)}) = <strong>${previewTotalCost}</strong>
 	                  </span>
 	                </div>
 	              )}

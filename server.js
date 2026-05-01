@@ -275,21 +275,6 @@ async function initDb() {
   `);
 
   await query(`
-    UPDATE purchases
-    SET cost_per_kg = COALESCE(cost_almaty,0) + COALESCE(cost_dubai,0)
-    WHERE COALESCE(cost_per_kg,0) = 0
-      AND (COALESCE(cost_almaty,0) > 0 OR COALESCE(cost_dubai,0) > 0);
-  `);
-
-  await query(`
-    UPDATE purchases
-    SET total_cost = COALESCE(cost_per_kg,0) * COALESCE(weight_kg,0)
-    WHERE COALESCE(total_cost,0) = 0
-      AND COALESCE(cost_per_kg,0) > 0
-      AND COALESCE(weight_kg,0) > 0;
-  `);
-
-  await query(`
     UPDATE payments p
     SET transaction_id = t.id
     FROM transactions t
@@ -318,8 +303,19 @@ async function resolveClientMarking(clientId, markingId, client = pool) {
 function validatePurchaseNums({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0, cost_dubai = 0 }) {
   if (+weight_kg < 0) throw new Error('Вес (weight_kg) не может быть отрицательным');
   if (+quantity_pcs < 0) throw new Error('Количество (quantity_pcs) не может быть отрицательным');
-  if (+cost_almaty < 0) throw new Error('Стоимость Алматы не может быть отрицательной');
-  if (+cost_dubai < 0) throw new Error('Стоимость Дубай не может быть отрицательной');
+  if (+cost_almaty < 0) throw new Error('Тариф Алматы не может быть отрицательным');
+  if (+cost_dubai < 0) throw new Error('Тариф Дубай не может быть отрицательным');
+}
+
+function calculatePurchaseCost({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0, cost_dubai = 0 }) {
+  const weight = +weight_kg || 0;
+  const quantity = +quantity_pcs || 0;
+  const almatyRate = +cost_almaty || 0;
+  const dubaiRate = +cost_dubai || 0;
+  return {
+    costPerKg: dubaiRate,
+    totalCost: (weight * dubaiRate) + (quantity * almatyRate),
+  };
 }
 
 async function getAccountBalance(accountId, client = pool) {
@@ -758,8 +754,12 @@ app.post('/api/receipts', async (req, res) => {
 
         const costAlmaty = +item.cost_almaty || 0;
         const costDubai = +item.cost_dubai || 0;
-        const costPerKg = costAlmaty + costDubai;
-        const totalCost = costPerKg * weight;
+        const { costPerKg, totalCost } = calculatePurchaseCost({
+          weight_kg: weight,
+          quantity_pcs: quantity,
+          cost_almaty: costAlmaty,
+          cost_dubai: costDubai,
+        });
         const note = item.note || item.notes || null;
 
         await query(
@@ -819,8 +819,12 @@ app.put('/api/receipts/:id', async (req, res) => {
 
         const costAlmaty = +item.cost_almaty || 0;
         const costDubai = +item.cost_dubai || 0;
-        const costPerKg = costAlmaty + costDubai;
-        const totalCost = costPerKg * weight;
+        const { costPerKg, totalCost } = calculatePurchaseCost({
+          weight_kg: weight,
+          quantity_pcs: quantity,
+          cost_almaty: costAlmaty,
+          cost_dubai: costDubai,
+        });
         const note = item.note || item.notes || null;
 
         await query('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES($1,$2,$3,$4,$5,$6,$7)', [id, +item.product_id, weight, quantity, costAlmaty, costDubai, note], client);
@@ -964,14 +968,21 @@ app.post('/api/purchases', async (req, res) => {
     validatePurchaseNums(body);
     const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
     const weight = +body.weight_kg || 0;
-    const costPerKg = (+body.cost_almaty || 0) + (+body.cost_dubai || 0);
-    const totalCost = costPerKg * weight;
+    const quantity = +body.quantity_pcs || 0;
+    const costAlmaty = +body.cost_almaty || 0;
+    const costDubai = +body.cost_dubai || 0;
+    const { costPerKg, totalCost } = calculatePurchaseCost({
+      weight_kg: weight,
+      quantity_pcs: quantity,
+      cost_almaty: costAlmaty,
+      cost_dubai: costDubai,
+    });
     const paidAmount = +body.paid_amount || 0;
     const row = await get(`
       INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING id
-    `, [body.date, cid, mid, +body.supplier_id, +body.product_id, +body.quantity_pcs || 0, weight, +body.boxes_count || 0, +body.cost_almaty || 0, +body.cost_dubai || 0, costPerKg, totalCost, paidAmount, body.notes || null]);
+    `, [body.date, cid, mid, +body.supplier_id, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, totalCost, paidAmount, body.notes || null]);
     res.json({ id: row.id, cost_per_kg: costPerKg, total_cost: totalCost, paid_amount: paidAmount, payable: totalCost - paidAmount });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -985,13 +996,20 @@ app.put('/api/purchases/:id', async (req, res) => {
     validatePurchaseNums(body);
     const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
     const weight = +body.weight_kg || 0;
-    const costPerKg = (+body.cost_almaty || 0) + (+body.cost_dubai || 0);
-    const totalCost = costPerKg * weight;
+    const quantity = +body.quantity_pcs || 0;
+    const costAlmaty = +body.cost_almaty || 0;
+    const costDubai = +body.cost_dubai || 0;
+    const { costPerKg, totalCost } = calculatePurchaseCost({
+      weight_kg: weight,
+      quantity_pcs: quantity,
+      cost_almaty: costAlmaty,
+      cost_dubai: costDubai,
+    });
     await query(`
       UPDATE purchases
       SET date=$1,client_id=$2,marking_id=$3,product_id=$4,quantity_pcs=$5,weight_kg=$6,boxes_count=$7,cost_almaty=$8,cost_dubai=$9,cost_per_kg=$10,total_cost=$11,notes=$12
       WHERE id=$13
-    `, [body.date, cid, mid, +body.product_id, +body.quantity_pcs || 0, weight, +body.boxes_count || 0, +body.cost_almaty || 0, +body.cost_dubai || 0, costPerKg, totalCost, body.notes || null, +req.params.id]);
+    `, [body.date, cid, mid, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, totalCost, body.notes || null, +req.params.id]);
     res.json({ success: true, cost_per_kg: costPerKg, total_cost: totalCost });
   } catch (e) {
     res.status(400).json({ error: e.message });

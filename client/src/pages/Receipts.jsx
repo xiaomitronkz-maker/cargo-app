@@ -3,7 +3,9 @@ import Modal from '../components/Modal'
 import api from '../api'
 
 const fmtNum = (n, digits = 2) => (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+const fmtMoney = (n) => '$' + fmtNum(n, 2)
 const emptyItem = () => ({ product_id: '', weight: '', quantity: '', cost_almaty: '', cost_dubai: '', note: '' })
+const itemTotalCost = (item) => ((+item.weight || 0) * (+item.cost_dubai || 0)) + ((+item.quantity || 0) * (+item.cost_almaty || 0))
 
 export default function Receipts() {
   const [receipts, setReceipts] = useState([])
@@ -226,6 +228,9 @@ export default function Receipts() {
                   <th>Товар</th>
                   <th>Количество</th>
                   <th>Вес</th>
+                  <th>Dubai $/кг</th>
+                  <th>Алматы $/шт</th>
+                  <th>Итого себест.</th>
                   <th>Заметка</th>
                 </tr>
               </thead>
@@ -235,6 +240,9 @@ export default function Receipts() {
                     <td>{item.product_name || '—'}</td>
                     <td className="td-mono">{fmtNum(item.quantity, 0)} шт</td>
                     <td className="td-mono">{fmtNum(item.weight, 3)} кг</td>
+                    <td className="td-mono">{fmtMoney(item.cost_dubai)}</td>
+                    <td className="td-mono">{fmtMoney(item.cost_almaty)}</td>
+                    <td><span className="badge badge-warning">{fmtMoney(itemTotalCost(item))}</span></td>
                     <td className="td-muted">{item.note || '—'}</td>
                   </tr>
                 ))}
@@ -310,19 +318,25 @@ export default function Receipts() {
                   <input type="number" min="0" step="0.001" className="form-input" value={item.weight} onChange={e => setItemF(index, 'weight', e.target.value)} />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Количество</label>
+                  <label className="form-label">Кол-во (шт)</label>
                   <input type="number" min="0" step="1" className="form-input" value={item.quantity} onChange={e => setItemF(index, 'quantity', e.target.value)} />
                 </div>
               </div>
               <div className="form-row">
                 <div className="form-group">
-                  <label className="form-label">Стоимость Алматы</label>
+                  <label className="form-label">Алматы $/шт</label>
                   <input type="number" min="0" step="0.01" className="form-input" value={item.cost_almaty} onChange={e => setItemF(index, 'cost_almaty', e.target.value)} />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Стоимость Дубай</label>
+                  <label className="form-label">Dubai $/кг</label>
                   <input type="number" min="0" step="0.01" className="form-input" value={item.cost_dubai} onChange={e => setItemF(index, 'cost_dubai', e.target.value)} />
                 </div>
+              </div>
+              <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Итого себестоимость</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--warning)', fontFamily: 'monospace', marginLeft: 8 }}>
+                  {fmtMoney(itemTotalCost(item))}
+                </span>
               </div>
               <div className="form-group">
                 <label className="form-label">Заметка</label>
