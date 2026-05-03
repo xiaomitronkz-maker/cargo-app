@@ -80,6 +80,7 @@ const api = {
   payPurchase: (id, data) => api.put(`/purchases/${id}/pay`, data),
   getPayments: () => api.get('/payments'),
   getLedger: (params) => api.get('/ledger', { params }),
+  getReconciliationAct: (params) => api.get('/reconciliation-act', { params }),
 
   // Accounts
   getAccounts: () => api.get('/accounts'),

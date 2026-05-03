@@ -747,3 +747,75 @@ tbody tr:hover { background: var(--surface-2); }
     grid-template-columns: 1fr;
   }
 }
+
+@media print {
+  :root {
+    --bg: #fff;
+    --surface: #fff;
+    --surface-2: #fff;
+    --surface-3: #fff;
+    --border: #d4d4d8;
+    --text: #111827;
+    --text-secondary: #374151;
+    --text-muted: #6b7280;
+  }
+
+  body {
+    background: #fff;
+    color: #111827;
+    overflow: visible;
+  }
+
+  .sidebar,
+  .no-print {
+    display: none !important;
+  }
+
+  .app-shell,
+  .main-content,
+  .page {
+    display: block;
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+    padding: 0;
+  }
+
+  .reconciliation-print-area {
+    display: block;
+    color: #111827;
+  }
+
+  .reconciliation-print-area .chart-card,
+  .reconciliation-print-area .balance-card,
+  .reconciliation-print-area .table-wrapper {
+    border-color: #d4d4d8;
+    box-shadow: none;
+    break-inside: avoid;
+  }
+
+  .reconciliation-print-area .balance-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .reconciliation-print-area .table-wrapper {
+    overflow: visible;
+  }
+
+  .reconciliation-print-area table {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .reconciliation-print-area th,
+  .reconciliation-print-area td {
+    color: #111827;
+    border-color: #d4d4d8;
+  }
+
+  .badge {
+    border: 1px solid #d4d4d8;
+    color: #111827 !important;
+    background: #fff !important;
+  }
+}

@@ -25,7 +25,7 @@ const NAV = [
     { path: '/liabilities', icon: '◆', label: 'Обязательства' },
     { path: '/debts', icon: '◌', label: 'Долги' },
     { path: '/payments', icon: '◍', label: 'Платежи' },
-    { path: '/ledger', icon: '≡', label: 'История' },
+    { path: '/ledger', icon: '≡', label: 'Акт сверки' },
     { path: '/audit', icon: '✓', label: 'Аудит' },
   ]},
 ]

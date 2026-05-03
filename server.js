@@ -758,6 +758,81 @@ async function debtsLedgerData(client = pool) {
   };
 }
 
+function isDateParam(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+async function reconciliationActData({ type, id, date_from, date_to }, client = pool) {
+  const counterpartyId = +id;
+  if (!['customer', 'supplier'].includes(type) || !counterpartyId) {
+    const error = new Error('type=customer|supplier и id обязательны');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!isDateParam(date_from) || !isDateParam(date_to)) {
+    const error = new Error('date_from и date_to обязательны в формате YYYY-MM-DD');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (date_from > date_to) {
+    const error = new Error('date_from не может быть позже date_to');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const table = type === 'customer' ? 'clients' : 'suppliers';
+  const counterparty = await get(`SELECT id,name FROM ${table} WHERE id=$1`, [counterpartyId], client);
+  if (!counterparty) {
+    const error = new Error(type === 'customer' ? 'Клиент не найден' : 'Поставщик не найден');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const ledger = await debtsLedgerData(client);
+  const group = (type === 'customer' ? ledger.customers : ledger.suppliers)
+    .find((row) => +row.counterparty_id === counterpartyId);
+  const allEntries = group?.entries || [];
+
+  const openingBalance = allEntries
+    .filter((entry) => (entry.date || '') < date_from)
+    .reduce((sum, entry) => sum + ledgerNumber(entry.charge) - ledgerNumber(entry.payment), 0);
+  const periodEntries = allEntries.filter((entry) => {
+    const date = entry.date || '';
+    return date >= date_from && date <= date_to;
+  });
+  const totalCharged = periodEntries.reduce((sum, entry) => sum + ledgerNumber(entry.charge), 0);
+  const totalPaid = periodEntries.reduce((sum, entry) => sum + ledgerNumber(entry.payment), 0);
+
+  let running = ledgerNumber(openingBalance);
+  const entries = periodEntries.map((entry) => {
+    running = ledgerNumber(running + ledgerNumber(entry.charge) - ledgerNumber(entry.payment));
+    return {
+      date: entry.date,
+      operation: entry.description || (entry.kind === 'payment'
+        ? (type === 'customer' ? 'Оплата клиента' : 'Оплата поставщику')
+        : type === 'customer' ? 'Реализация' : 'Приход'),
+      document_id: entry.document_id,
+      charge: ledgerNumber(entry.charge),
+      payment: ledgerNumber(entry.payment),
+      balance_after: running,
+      comment: entry.comment || '',
+    };
+  });
+
+  return {
+    type,
+    counterparty_id: counterpartyId,
+    counterparty_name: counterparty.name,
+    date_from,
+    date_to,
+    opening_balance: ledgerNumber(openingBalance),
+    total_charged: ledgerNumber(totalCharged),
+    total_paid: ledgerNumber(totalPaid),
+    closing_balance: ledgerNumber(openingBalance + totalCharged - totalPaid),
+    entries,
+  };
+}
+
 async function profitSummaryData(client = pool) {
   const row = await get(`
     WITH purchase_costs AS (
@@ -1657,6 +1732,14 @@ app.delete('/api/sales/:id', async (req, res) => {
 });
 
 // Debts
+app.get('/api/reconciliation-act', async (req, res) => {
+  try {
+    res.json(await reconciliationActData(req.query));
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 app.get('/api/debts/ledger', async (req, res) => {
   try {
     res.json(await debtsLedgerData());
