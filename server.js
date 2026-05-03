@@ -517,6 +517,247 @@ async function debtSummaryData(client = pool) {
   };
 }
 
+function ledgerNumber(value) {
+  return Math.round((+value || 0) * 100) / 100;
+}
+
+function buildCounterpartyLedger(type, chargeRows, paymentRows) {
+  const groups = new Map();
+  const ensureGroup = (row) => {
+    const id = +(row.counterparty_id || 0);
+    if (!id) return null;
+    const key = `${type}-${id}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        type,
+        counterparty_id: id,
+        counterparty_name: row.counterparty_name || 'Без названия',
+        total_charged: 0,
+        total_paid: 0,
+        balance: 0,
+        documents_count: 0,
+        payments_count: 0,
+        last_operation_date: null,
+        status: 'closed',
+        entries: [],
+      });
+    }
+    return groups.get(key);
+  };
+
+  for (const row of chargeRows) {
+    const group = ensureGroup(row);
+    if (!group) continue;
+    const amount = ledgerNumber(row.charge);
+    group.total_charged += amount;
+    group.documents_count += 1;
+    group.entries.push({
+      date: row.date || null,
+      kind: row.kind || (type === 'customer' ? 'sale' : 'receipt'),
+      document_id: row.document_id == null ? null : +row.document_id,
+      description: row.description || (type === 'customer' ? 'Реализация' : 'Приход'),
+      charge: amount,
+      payment: 0,
+      balance_after: 0,
+      comment: row.comment || '',
+      created_at: row.created_at || null,
+      sort_order: 0,
+      source_id: row.source_id == null ? null : +row.source_id,
+    });
+  }
+
+  for (const row of paymentRows) {
+    const group = ensureGroup(row);
+    if (!group) continue;
+    const amount = ledgerNumber(row.payment);
+    group.total_paid += amount;
+    group.payments_count += 1;
+    group.entries.push({
+      date: row.date || null,
+      kind: 'payment',
+      document_id: null,
+      description: row.description || (type === 'customer' ? 'Оплата клиента' : 'Оплата поставщику'),
+      charge: 0,
+      payment: amount,
+      balance_after: 0,
+      comment: row.comment || '',
+      created_at: row.created_at || null,
+      sort_order: 1,
+      source_id: row.source_id == null ? null : +row.source_id,
+    });
+  }
+
+  return Array.from(groups.values()).map((group) => {
+    group.entries.sort((a, b) => {
+      const dateA = `${a.date || ''}T${a.created_at || ''}`;
+      const dateB = `${b.date || ''}T${b.created_at || ''}`;
+      if (dateA !== dateB) return dateA.localeCompare(dateB);
+      if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+      return (a.source_id || 0) - (b.source_id || 0);
+    });
+
+    let running = 0;
+    group.entries = group.entries.map((entry) => {
+      running = ledgerNumber(running + entry.charge - entry.payment);
+      return {
+        date: entry.date,
+        kind: entry.kind,
+        document_id: entry.document_id,
+        description: entry.description,
+        charge: ledgerNumber(entry.charge),
+        payment: ledgerNumber(entry.payment),
+        balance_after: running,
+        comment: entry.comment,
+      };
+    });
+
+    group.total_charged = ledgerNumber(group.total_charged);
+    group.total_paid = ledgerNumber(group.total_paid);
+    group.balance = ledgerNumber(group.total_charged - group.total_paid);
+    group.last_operation_date = group.entries.length ? group.entries[group.entries.length - 1].date : null;
+    group.status = Math.abs(group.balance) < 0.01 ? 'closed' : 'open';
+    return group;
+  }).sort((a, b) => {
+    if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
+    if (Math.abs(a.balance) !== Math.abs(b.balance)) return Math.abs(b.balance) - Math.abs(a.balance);
+    return (a.counterparty_name || '').localeCompare(b.counterparty_name || '');
+  });
+}
+
+async function debtsLedgerData(client = pool) {
+  const customerCharges = await all(`
+      SELECT
+        MIN(s.id)::integer AS source_id,
+        CASE WHEN sd.id IS NOT NULL THEN sd.id ELSE MIN(s.id) END::integer AS document_id,
+      COALESCE(sd.date, s.date)::text AS date,
+      COALESCE(sd.created_at, s.created_at)::text AS created_at,
+      COALESCE(sd.client_id, s.client_id)::integer AS counterparty_id,
+      c.name::text AS counterparty_name,
+      COALESCE(SUM(s.total_amount::numeric),0) AS charge,
+      'sale'::text AS kind,
+      CASE
+        WHEN sd.id IS NOT NULL THEN 'Реализация №' || sd.id
+        ELSE 'Реализация №' || MIN(s.id)
+      END AS description,
+      NULL::text AS comment
+    FROM sales s
+    LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+    LEFT JOIN clients c ON c.id = COALESCE(sd.client_id, s.client_id)
+    WHERE COALESCE(sd.client_id, s.client_id) IS NOT NULL
+    GROUP BY
+      COALESCE(sd.id, -s.id),
+      sd.id,
+      COALESCE(sd.date, s.date),
+      COALESCE(sd.created_at, s.created_at),
+      COALESCE(sd.client_id, s.client_id),
+      c.name
+    HAVING COALESCE(SUM(s.total_amount::numeric),0) <> 0
+  `, [], client);
+
+  const customerPayments = await all(`
+    SELECT DISTINCT ON (p.id)
+      p.id::integer AS source_id,
+      NULL::integer AS document_id,
+      p.date::text AS date,
+      p.created_at::text AS created_at,
+      COALESCE(s.client_id, s2.client_id)::integer AS counterparty_id,
+      c.name::text AS counterparty_name,
+      p.amount::numeric AS payment,
+      'payment'::text AS kind,
+      'Оплата клиента'::text AS description,
+      p.comment::text AS comment
+    FROM payments p
+    LEFT JOIN transactions t ON t.id = p.transaction_id
+    LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+    LEFT JOIN sales s2 ON s2.id = t.sale_id
+    LEFT JOIN clients c ON c.id = COALESCE(s.client_id, s2.client_id)
+    WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
+    ORDER BY p.id, p.created_at DESC
+  `, [], client);
+
+  const supplierCharges = await all(`
+    SELECT * FROM (
+      SELECT
+        r.id::integer AS source_id,
+        r.id::integer AS document_id,
+        r.date::text AS date,
+        r.created_at::text AS created_at,
+        r.supplier_id::integer AS counterparty_id,
+        s.name::text AS counterparty_name,
+        COALESCE(SUM(p.total_cost::numeric),0) AS charge,
+        'receipt'::text AS kind,
+        'Приход №' || r.id AS description,
+        NULL::text AS comment
+      FROM receipts r
+      JOIN purchases p ON p.receipt_id = r.id
+      LEFT JOIN suppliers s ON s.id = r.supplier_id
+      WHERE r.supplier_id IS NOT NULL
+      GROUP BY r.id, r.date, r.created_at, r.supplier_id, s.name
+      HAVING COALESCE(SUM(p.total_cost::numeric),0) <> 0
+      UNION ALL
+      SELECT
+        p.id::integer AS source_id,
+        p.id::integer AS document_id,
+        p.date::text AS date,
+        p.created_at::text AS created_at,
+        p.supplier_id::integer AS counterparty_id,
+        s.name::text AS counterparty_name,
+        COALESCE(p.total_cost::numeric,0) AS charge,
+        'receipt'::text AS kind,
+        'Приход №' || p.id AS description,
+        p.notes::text AS comment
+      FROM purchases p
+      LEFT JOIN suppliers s ON s.id = p.supplier_id
+      WHERE p.receipt_id IS NULL
+        AND p.supplier_id IS NOT NULL
+        AND COALESCE(p.total_cost::numeric,0) <> 0
+    ) q
+  `, [], client);
+
+  const supplierPayments = await all(`
+    SELECT DISTINCT ON (p.id)
+      p.id::integer AS source_id,
+      NULL::integer AS document_id,
+      p.date::text AS date,
+      p.created_at::text AS created_at,
+      COALESCE(r.supplier_id, pu.supplier_id)::integer AS counterparty_id,
+      s.name::text AS counterparty_name,
+      p.amount::numeric AS payment,
+      'payment'::text AS kind,
+      'Оплата поставщику'::text AS description,
+      p.comment::text AS comment
+    FROM payments p
+    LEFT JOIN transactions t ON t.id = p.transaction_id
+    LEFT JOIN receipts r ON r.id = t.receipt_id
+    LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
+    LEFT JOIN suppliers s ON s.id = COALESCE(r.supplier_id, pu.supplier_id)
+    WHERE p.entity_type='purchase' AND COALESCE(r.supplier_id, pu.supplier_id) IS NOT NULL
+    ORDER BY p.id, p.created_at DESC
+  `, [], client);
+
+  const customers = buildCounterpartyLedger('customer', customerCharges, customerPayments);
+  const suppliers = buildCounterpartyLedger('supplier', supplierCharges, supplierPayments);
+  const closed = [...customers, ...suppliers]
+    .filter((row) => Math.abs(row.balance) < 0.01 && (row.total_charged > 0 || row.total_paid > 0))
+    .sort((a, b) => (b.last_operation_date || '').localeCompare(a.last_operation_date || ''));
+  const receivable = customers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
+  const payable = suppliers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
+
+  return {
+    summary: {
+      receivable: ledgerNumber(receivable),
+      payable: ledgerNumber(payable),
+      balance: ledgerNumber(receivable - payable),
+      customersCount: customers.length,
+      suppliersCount: suppliers.length,
+      closedCount: closed.length,
+    },
+    customers,
+    suppliers,
+    closed,
+  };
+}
+
 async function profitSummaryData(client = pool) {
   const row = await get(`
     WITH purchase_costs AS (
@@ -1416,6 +1657,14 @@ app.delete('/api/sales/:id', async (req, res) => {
 });
 
 // Debts
+app.get('/api/debts/ledger', async (req, res) => {
+  try {
+    res.json(await debtsLedgerData());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/debts', async (req, res) => {
   const debts = await all(`
     WITH receivable_totals AS (

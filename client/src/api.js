@@ -74,6 +74,7 @@ const api = {
   // Debts
   getDebts: () => api.get('/debts'),
   getDebtsSummary: () => api.get('/debts/summary'),
+  getDebtsLedger: () => api.get('/debts/ledger'),
   getDebtsBySuppliers: () => api.get('/debts/by-suppliers'),
   payReceipt: (id, data) => api.put(`/receipts/${id}/pay`, data),
   payPurchase: (id, data) => api.put(`/purchases/${id}/pay`, data),
