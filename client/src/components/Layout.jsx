@@ -39,21 +39,23 @@ export default function Layout() {
           <span>Dubai → Kazakhstan</span>
         </div>
 
-        {NAV.map(({ section, items }) => (
-          <div className="sidebar-section" key={section}>
-            <div className="sidebar-section-label">{section}</div>
-            {items.map(({ path, icon, label }) => (
-              <NavLink
-                key={path}
-                to={path}
-                className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
-              >
-                <span className="icon">{icon}</span>
-                {label}
-              </NavLink>
-            ))}
-          </div>
-        ))}
+        <nav className="sidebar-nav">
+          {NAV.map(({ section, items }) => (
+            <div className="sidebar-section" key={section}>
+              <div className="sidebar-section-label">{section}</div>
+              {items.map(({ path, icon, label }) => (
+                <NavLink
+                  key={path}
+                  to={path}
+                  className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
+                >
+                  <span className="icon">{icon}</span>
+                  {label}
+                </NavLink>
+              ))}
+            </div>
+          ))}
+        </nav>
       </aside>
 
       <main className="main-content">
