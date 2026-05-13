@@ -17,6 +17,18 @@ function StatusText({ isOk }) {
     : <span className="badge badge-danger">Ошибка</span>
 }
 
+function AuditBreakdown({ rows }) {
+  return (
+    <div className="stat-sub audit-breakdown">
+      {rows.map(({ label, value, tone }) => (
+        <div key={label}>
+          {label}: <strong className={tone || ''}>{value}</strong>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export default function Audit() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -44,9 +56,21 @@ export default function Audit() {
   const orphanTransactions = normalizeArray(data?.orphan_transactions)
   const debts = data?.debts_check || {}
   const global = data?.global_check || {}
-  const accountsDifference = accounts.reduce((sum, account) => sum + Math.abs(toNumber(account.difference)), 0)
-  const debtsDifference = debts.diff ?? debts.difference
-  const globalDifference = toNumber(global.diff)
+  const accountFactTotal = accounts.reduce((sum, account) => sum + toNumber(account.balance_actual ?? account.balance), 0)
+  const accountCalculatedTotal = accounts.reduce((sum, account) => sum + toNumber(account.balance_calculated ?? account.recalculated_balance), 0)
+  const accountDifference = accountFactTotal - accountCalculatedTotal
+  const accountsDifference = accounts.reduce((sum, account) => {
+    const actual = toNumber(account.balance_actual ?? account.balance)
+    const calculated = toNumber(account.balance_calculated ?? account.recalculated_balance)
+    return sum + Math.abs(toNumber(account.diff ?? account.difference ?? (actual - calculated)))
+  }, 0)
+  const accountsOk = ok(accountsDifference)
+  const paymentsDifference = toNumber(payments.difference)
+  const debtsDifference = toNumber(debts.diff ?? debts.difference)
+  const legacyDebtsDifference = toNumber(debts.difference)
+  const globalAccountsTotal = toNumber(global.accounts_total)
+  const globalTransactionsTotal = toNumber(global.transactions_total)
+  const globalDifference = toNumber(global.diff ?? (globalAccountsTotal - globalTransactionsTotal))
   const globalOk = global.ok ?? ok(globalDifference)
 
   return (
@@ -62,10 +86,15 @@ export default function Audit() {
       <div className="stat-grid">
         <div className="stat-card">
           <div className="stat-label">💰 Кассы</div>
-          <div className={`stat-value ${ok(accountsDifference) ? 'positive' : 'negative'}`}>
-            {fmt(accountsDifference)}
+          <div className={`stat-value ${accountsOk ? 'positive' : 'negative'}`}>
+            Расхождение: {fmt(accountDifference)}
           </div>
-          <div className="stat-sub">{accounts.length} касс проверено</div>
+          <AuditBreakdown rows={[
+            { label: 'Факт', value: fmt(accountFactTotal) },
+            { label: 'Пересчитано', value: fmt(accountCalculatedTotal) },
+            ...(!ok(accountsDifference - Math.abs(accountDifference)) ? [{ label: 'По кассам', value: fmt(accountsDifference) }] : []),
+            { label: 'Касс проверено', value: accounts.length },
+          ]} />
           <Status difference={accountsDifference} />
         </div>
 
@@ -81,37 +110,49 @@ export default function Audit() {
         <div className="stat-card">
           <div className="stat-label">📊 Долги</div>
           <div className={`stat-value ${ok(debtsDifference) ? 'positive' : 'negative'}`}>
-            {fmt(debtsDifference)}
+            Расхождение: {fmt(debtsDifference)}
           </div>
-          <div className="stat-sub">клиенты и поставщики сверены с оплатами</div>
+          <AuditBreakdown rows={[
+            { label: 'Дебиторка', value: fmt(debts.receivable_system) },
+            { label: 'Журнал', value: fmt(debts.receivable_ledger) },
+          ]} />
           <Status difference={debtsDifference} />
         </div>
 
         <div className="stat-card">
           <div className="stat-label">🧮 Общий баланс</div>
           <div className={`stat-value ${globalOk ? 'positive' : 'negative'}`}>
-            {globalOk ? 'OK' : fmt(globalDifference)}
+            Расхождение: {fmt(globalDifference)}
           </div>
-          <div className="stat-sub">кассы: {fmt(global.accounts_total)} · движения: {fmt(global.transactions_total)}</div>
+          <AuditBreakdown rows={[
+            { label: 'Кассы', value: fmt(globalAccountsTotal) },
+            { label: 'Движения', value: fmt(globalTransactionsTotal) },
+          ]} />
           <StatusText isOk={globalOk} />
         </div>
 
         <div className="stat-card">
           <div className="stat-label">Оплаты и движения</div>
-          <div className={`stat-value ${ok(payments.difference) ? 'positive' : 'negative'}`}>
-            {fmt(payments.difference)}
+          <div className={`stat-value ${ok(paymentsDifference) ? 'positive' : 'negative'}`}>
+            Расхождение: {fmt(paymentsDifference)}
           </div>
-          <div className="stat-sub">оплаты: {fmt(payments.payments_total)} · движения: {fmt(payments.transactions_total)}</div>
-          <Status difference={payments.difference} />
+          <AuditBreakdown rows={[
+            { label: 'Оплаты', value: fmt(payments.payments_total) },
+            { label: 'Движения', value: fmt(payments.transactions_total) },
+          ]} />
+          <Status difference={paymentsDifference} />
         </div>
 
         <div className="stat-card">
           <div className="stat-label">Долги по журналу</div>
-          <div className={`stat-value ${ok(debts.difference) ? 'positive' : 'negative'}`}>
-            {fmt(debts.difference)}
+          <div className={`stat-value ${ok(legacyDebtsDifference) ? 'positive' : 'negative'}`}>
+            Расхождение: {fmt(legacyDebtsDifference)}
           </div>
-          <div className="stat-sub">дебиторка: {fmt(debts.receivable_total)} · журнал: {fmt(debts.ledger_total)}</div>
-          <Status difference={debts.difference} />
+          <AuditBreakdown rows={[
+            { label: 'Дебиторка', value: fmt(debts.receivable_total) },
+            { label: 'Журнал', value: fmt(debts.ledger_total) },
+          ]} />
+          <Status difference={legacyDebtsDifference} />
         </div>
       </div>
 
@@ -122,7 +163,7 @@ export default function Audit() {
               <th>Касса</th>
               <th>Факт</th>
               <th>Пересчитано</th>
-              <th>Разница</th>
+              <th>Расхождение</th>
               <th>Статус</th>
             </tr>
           </thead>

@@ -194,6 +194,15 @@ input, select, textarea { font-family: inherit; }
   color: var(--text-muted);
   margin-top: 4px;
 }
+.audit-breakdown {
+  display: grid;
+  gap: 3px;
+  margin: 8px 0 10px;
+}
+.audit-breakdown strong {
+  color: var(--text);
+  font-weight: 700;
+}
 
 /* ─── Tables ────────────────────────────────────────────────────────────── */
 .table-wrapper {
