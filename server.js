@@ -218,7 +218,7 @@ async function initDb() {
 
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
-      type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw')),
+      type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw','owner_contribution','owner_withdrawal')),
       amount NUMERIC NOT NULL,
       account_from_id INTEGER REFERENCES accounts(id),
       account_to_id INTEGER REFERENCES accounts(id),
@@ -272,6 +272,8 @@ async function initDb() {
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL;
+    ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
+    ALTER TABLE transactions ADD CONSTRAINT transactions_type_check CHECK(type IN ('income','expense','transfer','withdraw','owner_contribution','owner_withdrawal'));
   `);
 
   await query(`
@@ -322,8 +324,10 @@ async function getAccountBalance(accountId, client = pool) {
   const row = await get(`
     SELECT
       COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=$1),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=$1),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=$1),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=$1),0)
       AS balance
@@ -989,8 +993,10 @@ async function analyticsProfitData(period = '') {
     all(`
       SELECT
         COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
+        + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
+        - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=a.id),0)
         + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
         AS balance
@@ -2174,8 +2180,10 @@ app.get('/api/accounts', async (req, res) => {
     SELECT
       a.*,
       COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=a.id),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
       AS balance
@@ -2227,6 +2235,34 @@ app.post('/api/transactions', async (req, res) => {
   res.json({ id: row.id });
 });
 
+app.post('/api/transactions/manual', async (req, res) => {
+  const { type, amount, date, comment } = req.body;
+  const accountId = +(req.body.cash_account_id || req.body.account_id);
+  const context = { type, amount: +amount, account_id: accountId || null, receipt_id: null, sale_id: null };
+
+  if (!['owner_contribution', 'owner_withdrawal', 'income', 'expense'].includes(type)) {
+    return validationError(res, 'Некорректный тип операции', context);
+  }
+  if (!accountId) return validationError(res, 'Касса обязательна', context);
+  if (!(+amount > 0)) return validationError(res, 'Сумма должна быть больше 0', context);
+  if (!date) return validationError(res, 'Дата обязательна', context);
+
+  const isOutflow = type === 'owner_withdrawal' || type === 'expense';
+  const accountFromId = isOutflow ? accountId : null;
+  const accountToId = isOutflow ? null : accountId;
+
+  if (isOutflow && await getAccountBalance(accountId) < +amount) {
+    return validationError(res, 'Недостаточно средств в кассе', context);
+  }
+
+  const row = await get(`
+    INSERT INTO transactions(type,amount,account_from_id,account_to_id,date,comment,related_type)
+    VALUES($1,$2,$3,$4,$5,$6,$7)
+    RETURNING id
+  `, [type, +amount, accountFromId, accountToId, date, comment || null, 'manual']);
+  res.json({ id: row.id });
+});
+
 // Audit
 app.get('/api/audit', async (req, res) => {
   const paymentsTotal = +(await get('SELECT COALESCE(SUM(amount::numeric),0) AS total FROM payments'))?.total || 0;
@@ -2241,15 +2277,19 @@ app.get('/api/audit', async (req, res) => {
       a.id AS account_id,
       a.name AS account_name,
       COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=a.id),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
       AS balance_actual,
       COALESCE(SUM(CASE
         WHEN t.type='income' AND t.account_to_id=a.id THEN t.amount::numeric
+        WHEN t.type='owner_contribution' AND t.account_to_id=a.id THEN t.amount::numeric
         WHEN t.type='expense' AND t.account_from_id=a.id THEN -t.amount::numeric
         WHEN t.type='withdraw' AND t.account_from_id=a.id THEN -t.amount::numeric
+        WHEN t.type='owner_withdrawal' AND t.account_from_id=a.id THEN -t.amount::numeric
         WHEN t.type='transfer' AND t.account_to_id=a.id THEN t.amount::numeric
         WHEN t.type='transfer' AND t.account_from_id=a.id THEN -t.amount::numeric
         ELSE 0
@@ -2271,8 +2311,8 @@ app.get('/api/audit', async (req, res) => {
   const orphanTransactions = await all(`
     SELECT id,type,amount,comment
     FROM transactions
-    WHERE (type='income' AND sale_id IS NULL)
-       OR (type='expense' AND receipt_id IS NULL)
+    WHERE (type='income' AND sale_id IS NULL AND COALESCE(related_type,'') <> 'manual')
+       OR (type='expense' AND receipt_id IS NULL AND COALESCE(related_type,'') <> 'manual')
     ORDER BY id DESC
   `);
 
@@ -2314,21 +2354,43 @@ app.get('/api/audit', async (req, res) => {
     FROM receivable_groups rg
     LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rg.receivable_group_id
   `))?.total || 0;
-  const payableSystem = (await debtSummaryData()).payable.total;
+  const debtSummary = await debtSummaryData();
+  const payableSystem = debtSummary.payable.total;
   const payableLedger = payableSystem;
   const debtsDiff = (receivableSystem - receivableLedger) + (payableSystem - payableLedger);
+  const profit = await profitSummaryData();
+  const ownerContributionRow = await get(`
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM transactions
+    WHERE type='owner_contribution'
+  `);
+  const ownerWithdrawalRow = await get(`
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM transactions
+    WHERE type='owner_withdrawal'
+  `);
+  const ownerContributionTotal = +(ownerContributionRow?.total || 0);
+  const ownerWithdrawalTotal = +(ownerWithdrawalRow?.total || 0);
 
   const accountsTotal = accounts.reduce((sum, account) => sum + (+account.balance_actual || +account.balance || 0), 0);
   const transactionsTotal = +(await get(`
     SELECT COALESCE(SUM(CASE
       WHEN type='income' THEN amount::numeric
+      WHEN type='owner_contribution' THEN amount::numeric
       WHEN type='expense' THEN -amount::numeric
       WHEN type='withdraw' THEN -amount::numeric
+      WHEN type='owner_withdrawal' THEN -amount::numeric
       ELSE 0
     END),0) AS total
     FROM transactions
   `))?.total || 0;
   const globalDiff = accountsTotal - transactionsTotal;
+  const controlWithOwnerOps = accountsTotal
+    + (+(debtSummary.receivable?.total || 0))
+    - (+(debtSummary.payable?.total || 0))
+    - (+(profit.profit || 0))
+    - ownerContributionTotal
+    + ownerWithdrawalTotal;
 
   res.json({
     payments_vs_transactions: {
@@ -2355,9 +2417,19 @@ app.get('/api/audit', async (req, res) => {
     global_check: {
       accounts_total: accountsTotal,
       transactions_total: transactionsTotal,
+      receivable_total: +(debtSummary.receivable?.total || 0),
+      payable_total: +(debtSummary.payable?.total || 0),
+      profit_total: +(profit.profit || 0),
+      owner_contribution_total: ownerContributionTotal,
+      owner_withdrawal_total: ownerWithdrawalTotal,
+      control_with_owner_ops: controlWithOwnerOps,
+      control_with_owner_ok: Math.abs(controlWithOwnerOps) < 0.01,
       diff: globalDiff,
       ok: Math.abs(globalDiff) < 0.01,
     },
+    owner_contribution_total: ownerContributionTotal,
+    owner_withdrawal_total: ownerWithdrawalTotal,
+    control_with_owner_ops: controlWithOwnerOps,
   });
 });
 

@@ -22,6 +22,8 @@ export const TYPE_LABELS = {
   income: 'Доход',
   transfer: 'Перевод',
   withdraw: 'Вывод',
+  owner_contribution: 'Пополнение владельцем',
+  owner_withdrawal: 'Снятие владельцем',
   dubai: 'Дубай',
   almaty: 'Алматы',
   receivable: 'Нам должны',

@@ -22,6 +22,7 @@ export default function Finance() {
   const [debts, setDebts] = useState([])
   const [suppliers, setSuppliers] = useState([])
   const [accounts, setAccounts] = useState([])
+  const [transactions, setTransactions] = useState([])
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
   const [accountForm, setAccountForm] = useState({ name: '', currency: 'USD' })
@@ -30,14 +31,15 @@ export default function Finance() {
 
   const load = () => {
     setLoading(true)
-    Promise.all([api.getDebtsSummary(), api.getDebtsBySuppliers(), api.getAccounts(), api.getProfitSummary(), api.getDebts()])
-      .then(([summaryData, suppliersData, accountsData, profitData, debtsData]) => {
-        console.log('Analytics data:', { summaryData, suppliersData, accountsData, profitData, debtsData })
+    Promise.all([api.getDebtsSummary(), api.getDebtsBySuppliers(), api.getAccounts(), api.getProfitSummary(), api.getDebts(), api.getTransactions()])
+      .then(([summaryData, suppliersData, accountsData, profitData, debtsData, transactionsData]) => {
+        console.log('Analytics data:', { summaryData, suppliersData, accountsData, profitData, debtsData, transactionsData })
         setSummary(summaryData && typeof summaryData === 'object' ? summaryData : {})
         setSuppliers(normalizeArray(suppliersData))
         setAccounts(normalizeArray(accountsData))
         setProfitSummary(profitData && typeof profitData === 'object' ? profitData : {})
         setDebts(normalizeArray(debtsData))
+        setTransactions(normalizeArray(transactionsData))
       })
       .catch(() => {
         console.log('Analytics data:', null)
@@ -46,6 +48,7 @@ export default function Finance() {
         setAccounts([])
         setProfitSummary({})
         setDebts([])
+        setTransactions([])
       })
       .finally(() => setLoading(false))
   }
@@ -68,6 +71,7 @@ export default function Finance() {
   const safeDebts = normalizeArray(debts)
   const safeSuppliers = normalizeArray(suppliers)
   const safeAccounts = normalizeArray(accounts)
+  const safeTransactions = normalizeArray(transactions)
   const receivable = toNumber(summary?.receivable?.total)
   const payable = safeDebts
     .filter(debt => debt.type === 'payable')
@@ -75,9 +79,15 @@ export default function Finance() {
   const balance = receivable - payable
   const profit = toNumber(profitSummary?.profit)
   const cash = safeAccounts.reduce((sum, account) => sum + toNumber(account.balance), 0)
+  const ownerContribution = safeTransactions
+    .filter(transaction => transaction.type === 'owner_contribution')
+    .reduce((sum, transaction) => sum + toNumber(transaction.amount), 0)
+  const ownerWithdrawal = safeTransactions
+    .filter(transaction => transaction.type === 'owner_withdrawal')
+    .reduce((sum, transaction) => sum + toNumber(transaction.amount), 0)
   const assets = cash + receivable
   const liabilities = payable
-  const control = assets - (liabilities + profit)
+  const control = assets - (liabilities + profit) - ownerContribution + ownerWithdrawal
   const isOk = Math.abs(control) < 0.01
 
   return (
@@ -98,6 +108,8 @@ export default function Finance() {
         <FinanceCard label="📥 Нам должны" value={receivable} tone="positive" />
         <FinanceCard label="📤 Мы должны" value={payable} tone="negative" />
         <FinanceCard label="📊 Прибыль" value={profit} tone={profit >= 0 ? 'positive' : 'negative'} />
+        <FinanceCard label="Вложения владельца" value={ownerContribution} tone="positive" />
+        <FinanceCard label="Снятия владельца" value={ownerWithdrawal} tone="negative" />
         <FinanceCard label="🧮 Контроль" value={control} tone={isOk ? 'positive' : 'negative'} />
       </div>
 
@@ -105,7 +117,7 @@ export default function Finance() {
         {isOk ? 'Баланс сошелся' : `Ошибка баланса: ${fmt(control)}`}
         {!isOk && (
           <div style={{ marginTop: 8 }}>
-            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)}
+            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)} · вложения: {fmt(ownerContribution)} · снятия: {fmt(ownerWithdrawal)}
           </div>
         )}
       </div>

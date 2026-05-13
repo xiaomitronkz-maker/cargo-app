@@ -87,6 +87,7 @@ const api = {
   createAccount: (data) => api.post('/accounts', data),
   getTransactions: () => api.get('/transactions'),
   createTransaction: (data) => api.post('/transactions', data),
+  createManualTransaction: (data) => api.post('/transactions/manual', data),
   getAudit: () => api.get('/audit'),
 
   // Money Assets

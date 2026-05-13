@@ -27,6 +27,7 @@ export default function Dashboard() {
   const [debts, setDebts] = useState([])
   const [sales, setSales] = useState([])
   const [receipts, setReceipts] = useState([])
+  const [transactions, setTransactions] = useState([])
   const [profitSummary, setProfitSummary] = useState({})
   const [loading, setLoading] = useState(true)
 
@@ -34,18 +35,20 @@ export default function Dashboard() {
     const load = async () => {
       setLoading(true)
       try {
-        const [accountsData, debtsData, salesData, receiptsData, profitData] = await Promise.all([
+        const [accountsData, debtsData, salesData, receiptsData, profitData, transactionsData] = await Promise.all([
           api.getAccounts(),
           api.getDebts(),
           api.getSales(),
           api.getReceipts(),
           api.getProfitSummary(),
+          api.getTransactions(),
         ])
-        console.log('Analytics data:', { accountsData, debtsData, salesData, receiptsData, profitData })
+        console.log('Analytics data:', { accountsData, debtsData, salesData, receiptsData, profitData, transactionsData })
         setAccounts(normalizeArray(accountsData))
         setDebts(normalizeArray(debtsData))
         setSales(normalizeArray(salesData))
         setReceipts(normalizeArray(receiptsData))
+        setTransactions(normalizeArray(transactionsData))
         setProfitSummary(profitData && typeof profitData === 'object' ? profitData : {})
       } catch (e) {
         console.log('Analytics data:', null)
@@ -53,6 +56,7 @@ export default function Dashboard() {
         setDebts([])
         setSales([])
         setReceipts([])
+        setTransactions([])
         setProfitSummary({})
       } finally {
         setLoading(false)
@@ -65,12 +69,15 @@ export default function Dashboard() {
   const safeDebts = normalizeArray(debts)
   const safeSales = normalizeArray(sales)
   const safeReceipts = normalizeArray(receipts)
+  const safeTransactions = normalizeArray(transactions)
 
   const cash = useMemo(() => safeAccounts.reduce((sum, account) => sum + toNumber(account.balance), 0), [safeAccounts])
   const receivable = useMemo(() => safeDebts.filter((d) => d.type === 'receivable').reduce((sum, debt) => sum + toNumber(debt.debt), 0), [safeDebts])
   const payable = useMemo(() => safeDebts.filter((d) => d.type === 'payable').reduce((sum, debt) => sum + toNumber(debt.debt), 0), [safeDebts])
   const profit = toNumber(profitSummary?.profit)
-  const control = cash + receivable - (payable + profit)
+  const ownerContribution = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_contribution').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
+  const ownerWithdrawal = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_withdrawal').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
+  const control = cash + receivable - payable - profit - ownerContribution + ownerWithdrawal
 
   const latestSales = useMemo(() => [...safeSales].slice(0, 5), [safeSales])
   const latestReceipts = useMemo(() => [...safeReceipts].slice(0, 5), [safeReceipts])

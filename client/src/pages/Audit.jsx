@@ -72,6 +72,10 @@ export default function Audit() {
   const globalTransactionsTotal = toNumber(global.transactions_total)
   const globalDifference = toNumber(global.diff ?? (globalAccountsTotal - globalTransactionsTotal))
   const globalOk = global.ok ?? ok(globalDifference)
+  const ownerContributionTotal = toNumber(data?.owner_contribution_total ?? global.owner_contribution_total)
+  const ownerWithdrawalTotal = toNumber(data?.owner_withdrawal_total ?? global.owner_withdrawal_total)
+  const ownerControl = toNumber(data?.control_with_owner_ops ?? global.control_with_owner_ops)
+  const ownerControlOk = global.control_with_owner_ok ?? ok(ownerControl)
 
   return (
     <div className="page">
@@ -141,6 +145,18 @@ export default function Audit() {
             { label: 'Движения', value: fmt(payments.transactions_total) },
           ]} />
           <Status difference={paymentsDifference} />
+        </div>
+
+        <div className="stat-card">
+          <div className="stat-label">Капитал владельца</div>
+          <div className={`stat-value ${ownerControlOk ? 'positive' : 'negative'}`}>
+            Контроль: {fmt(ownerControl)}
+          </div>
+          <AuditBreakdown rows={[
+            { label: 'Вложения', value: fmt(ownerContributionTotal) },
+            { label: 'Снятия', value: fmt(ownerWithdrawalTotal) },
+          ]} />
+          <StatusText isOk={ownerControlOk} />
         </div>
 
         <div className="stat-card">
