@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
-import { normalizeArray, toNumber } from '../utils/data'
+import { formatType, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const ok = (n) => Math.abs(toNumber(n)) < 0.01
@@ -74,7 +74,7 @@ export default function Audit() {
           <div className={`stat-value ${orphanTransactions.length === 0 ? 'positive' : 'negative'}`}>
             {orphanTransactions.length}
           </div>
-          <div className="stat-sub">income без sale_id · expense без receipt_id</div>
+          <div className="stat-sub">доход без продажи · расход без прихода</div>
           <StatusText isOk={orphanTransactions.length === 0} />
         </div>
 
@@ -83,7 +83,7 @@ export default function Audit() {
           <div className={`stat-value ${ok(debtsDifference) ? 'positive' : 'negative'}`}>
             {fmt(debtsDifference)}
           </div>
-          <div className="stat-sub">клиенты и поставщики сверены с payments</div>
+          <div className="stat-sub">клиенты и поставщики сверены с оплатами</div>
           <Status difference={debtsDifference} />
         </div>
 
@@ -92,25 +92,25 @@ export default function Audit() {
           <div className={`stat-value ${globalOk ? 'positive' : 'negative'}`}>
             {globalOk ? 'OK' : fmt(globalDifference)}
           </div>
-          <div className="stat-sub">кассы: {fmt(global.accounts_total)} · transactions: {fmt(global.transactions_total)}</div>
+          <div className="stat-sub">кассы: {fmt(global.accounts_total)} · движения: {fmt(global.transactions_total)}</div>
           <StatusText isOk={globalOk} />
         </div>
 
         <div className="stat-card">
-          <div className="stat-label">Payments vs Transactions</div>
+          <div className="stat-label">Оплаты и движения</div>
           <div className={`stat-value ${ok(payments.difference) ? 'positive' : 'negative'}`}>
             {fmt(payments.difference)}
           </div>
-          <div className="stat-sub">payments: {fmt(payments.payments_total)} · transactions: {fmt(payments.transactions_total)}</div>
+          <div className="stat-sub">оплаты: {fmt(payments.payments_total)} · движения: {fmt(payments.transactions_total)}</div>
           <Status difference={payments.difference} />
         </div>
 
         <div className="stat-card">
-          <div className="stat-label">Долги legacy</div>
+          <div className="stat-label">Долги по журналу</div>
           <div className={`stat-value ${ok(debts.difference) ? 'positive' : 'negative'}`}>
             {fmt(debts.difference)}
           </div>
-          <div className="stat-sub">дебиторка: {fmt(debts.receivable_total)} · ledger: {fmt(debts.ledger_total)}</div>
+          <div className="stat-sub">дебиторка: {fmt(debts.receivable_total)} · журнал: {fmt(debts.ledger_total)}</div>
           <Status difference={debts.difference} />
         </div>
       </div>
@@ -167,7 +167,7 @@ export default function Audit() {
             {orphanTransactions.map(tx => (
               <tr key={tx.id}>
                 <td className="td-mono">#{tx.id}</td>
-                <td><span className="badge badge-danger">{tx.type}</span></td>
+                <td><span className="badge badge-danger">{formatType(tx.type)}</span></td>
                 <td className="td-mono">{fmt(tx.amount)}</td>
                 <td className="td-muted">{tx.comment || '—'}</td>
                 <td><span className="badge badge-danger">Нет связи</span></td>
@@ -183,7 +183,7 @@ export default function Audit() {
           <div className={`stat-value ${ok((debts.receivable_system || 0) - (debts.receivable_ledger || 0)) ? 'positive' : 'negative'}`}>
             {fmt((debts.receivable_system || 0) - (debts.receivable_ledger || 0))}
           </div>
-          <div className="stat-sub">system: {fmt(debts.receivable_system)} · payments: {fmt(debts.receivable_ledger)}</div>
+          <div className="stat-sub">система: {fmt(debts.receivable_system)} · оплаты: {fmt(debts.receivable_ledger)}</div>
         </div>
 
         <div className="stat-card">
@@ -191,7 +191,7 @@ export default function Audit() {
           <div className={`stat-value ${ok((debts.payable_system || 0) - (debts.payable_ledger || 0)) ? 'positive' : 'negative'}`}>
             {fmt((debts.payable_system || 0) - (debts.payable_ledger || 0))}
           </div>
-          <div className="stat-sub">system: {fmt(debts.payable_system)} · payments: {fmt(debts.payable_ledger)}</div>
+          <div className="stat-sub">система: {fmt(debts.payable_system)} · оплаты: {fmt(debts.payable_ledger)}</div>
         </div>
       </div>
     </div>

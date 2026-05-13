@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
+import { formatDate } from '../utils/data'
 
 const EMPTY = { client_id: '', marking: '' }
 
@@ -87,7 +88,7 @@ export default function Markings() {
                 <tr key={m.id}>
                   <td><span className="badge badge-primary td-mono" style={{ fontSize: 13 }}>{m.marking}</span></td>
                   <td style={{ fontWeight: 500 }}>{m.client_name}</td>
-                  <td className="td-muted">{new Date(m.created_at).toLocaleDateString('ru-RU')}</td>
+                  <td className="td-muted td-date">{formatDate(m.created_at)}</td>
                   <td>
                     <div className="td-actions">
                       <button className="btn btn-ghost btn-sm" onClick={() => openEdit(m)}>Изм.</button>
@@ -138,7 +139,7 @@ export default function Markings() {
 
       {modal === 'delete' && (
         <ConfirmModal
-          message={`Удалить маркировку "${selected?.marking}"? Приходы и продажи с этой маркировкой сохранятся.`}
+          message={`Удалить маркировку "${selected?.marking}"? Это действие нельзя отменить. Приходы и продажи с этой маркировкой сохранятся.`}
           onConfirm={del}
           onCancel={() => setModal(null)}
         />

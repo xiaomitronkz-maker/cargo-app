@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
+import { formatDate } from '../utils/data'
 
 const today = () => new Date().toISOString().slice(0, 10)
 const purchaseTotalCost = (row) => {
@@ -246,7 +247,7 @@ export default function Purchases() {
                 <th>Шт</th>
                 <th>Коробки</th>
                 <th>Алматы $/шт</th>
-                <th>Dubai $/кг</th>
+                <th>Дубай $/кг</th>
                 <th>Итого себест.</th>
                 <th></th>
               </tr>
@@ -259,7 +260,7 @@ export default function Purchases() {
               )}
               {purchases.map(p => (
                 <tr key={p.id}>
-                  <td className="td-muted">{p.date}</td>
+                  <td className="td-muted td-date">{formatDate(p.date)}</td>
                   <td>{p.client_name || '—'}</td>
                   <td>{p.marking ? <span className="badge badge-primary">{p.marking}</span> : '—'}</td>
                   <td>{p.product_name}</td>
@@ -422,7 +423,7 @@ export default function Purchases() {
 	                        <input type="number" step="0.01" min="0" className="form-input" value={item.cost_almaty} onChange={e => setItemF(index, 'cost_almaty', e.target.value)} placeholder="0.00" />
 	                      </div>
 	                      <div className="form-group">
-	                        <label className="form-label">Dubai $/кг</label>
+	                        <label className="form-label">Дубай $/кг</label>
 	                        <input type="number" step="0.01" min="0" className="form-input" value={item.cost_dubai} onChange={e => setItemF(index, 'cost_dubai', e.target.value)} placeholder="0.00" />
 	                      </div>
 	                    </div>
@@ -507,7 +508,7 @@ export default function Purchases() {
 	                    value={form.cost_almaty} onChange={e => setF('cost_almaty', e.target.value)} placeholder="0.00" />
 	                </div>
 	                <div className="form-group">
-	                  <label className="form-label">Dubai $/кг</label>
+	                  <label className="form-label">Дубай $/кг</label>
 	                  <input type="number" step="0.01" min="0" className="form-input"
 	                    value={form.cost_dubai} onChange={e => setF('cost_dubai', e.target.value)} placeholder="0.00" />
 	                </div>
@@ -532,7 +533,7 @@ export default function Purchases() {
 
       {modal === 'delete' && (
         <ConfirmModal
-          message="Удалить запись прихода?"
+          message="Удалить запись прихода? Это действие нельзя отменить."
           onConfirm={del}
           onCancel={() => setModal(null)}
         />

@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { formatDate, formatType, normalizeArray } from '../utils/data'
 
 const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 const typeMeta = {
-  sale: { label: 'sale', badge: 'badge-success' },
-  purchase: { label: 'purchase', badge: 'badge-warning' },
+  sale: { label: 'Реализация', badge: 'badge-success' },
+  purchase: { label: 'Приход', badge: 'badge-warning' },
 }
 
 export default function Payments() {
@@ -14,7 +15,7 @@ export default function Payments() {
 
   const load = () => {
     setLoading(true)
-    api.getPayments().then(setPayments).finally(() => setLoading(false))
+    api.getPayments().then((rows) => setPayments(normalizeArray(rows))).finally(() => setLoading(false))
   }
 
   useEffect(() => { load() }, [])
@@ -42,11 +43,11 @@ export default function Payments() {
                   <div className="record-subtitle">{payment.product_name || 'Без товара'}</div>
                 </div>
                 <span className={`badge ${typeMeta[payment.entity_type]?.badge || 'badge-neutral'}`}>
-                  {typeMeta[payment.entity_type]?.label || payment.entity_type}
+                  {typeMeta[payment.entity_type]?.label || formatType(payment.entity_type)}
                 </span>
               </div>
               <div className="record-meta">
-                <span>{payment.date}</span>
+                <span>{formatDate(payment.date)}</span>
                 <strong>{fmt(payment.amount)}</strong>
               </div>
               {payment.comment && <div className="record-note">{payment.comment}</div>}

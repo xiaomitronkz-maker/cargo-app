@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import api from '../api'
-import { normalizeArray, toNumber } from '../utils/data'
+import { formatDate, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
@@ -15,7 +15,7 @@ function StatCard({ label, value, tone }) {
 
 function SectionCard({ title, children }) {
   return (
-    <div className="table-wrapper" style={{ marginTop: 20 }}>
+    <div className="table-wrapper dashboard-section-card" style={{ marginTop: 20 }}>
       <div style={{ padding: '14px 16px 0', fontWeight: 700 }}>{title}</div>
       {children}
     </div>
@@ -89,7 +89,7 @@ export default function Dashboard() {
     <div className="page">
       <div className="page-header">
         <div>
-          <div className="page-title">Dashboard</div>
+          <div className="page-title">Обзор</div>
           <div className="page-subtitle">Деньги, долги и риски</div>
         </div>
       </div>
@@ -106,7 +106,7 @@ export default function Dashboard() {
         {Math.abs(control) < 0.01 ? 'Баланс сошелся' : `Контроль: ${fmt(control)}`}
       </div>
 
-      <div className="record-grid" style={{ marginTop: 20 }}>
+      <div className="record-grid dashboard-section-grid" style={{ marginTop: 20 }}>
         <SectionCard title="Последние продажи">
           <table>
             <thead>
@@ -123,7 +123,7 @@ export default function Dashboard() {
               )}
               {latestSales.map((sale) => (
                 <tr key={sale.id}>
-                  <td className="td-muted">{sale.date || '—'}</td>
+                  <td className="td-muted td-date">{formatDate(sale.date)}</td>
                   <td>{sale.client_name || '—'}</td>
                   <td>{sale.product_name || '—'}</td>
                   <td className="td-mono">{fmt(sale.total_amount)}</td>
@@ -149,7 +149,7 @@ export default function Dashboard() {
               )}
               {latestReceipts.map((receipt) => (
                 <tr key={receipt.id}>
-                  <td className="td-muted">{receipt.date || '—'}</td>
+                  <td className="td-muted td-date">{formatDate(receipt.date)}</td>
                   <td>{receipt.supplier_name || '—'}</td>
                   <td>{receipt.client_name || '—'}</td>
                   <td className="td-mono">{toNumber(receipt.items_count)}</td>

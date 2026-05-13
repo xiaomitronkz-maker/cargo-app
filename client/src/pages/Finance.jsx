@@ -105,7 +105,7 @@ export default function Finance() {
         {isOk ? 'Баланс сошелся' : `Ошибка баланса: ${fmt(control)}`}
         {!isOk && (
           <div style={{ marginTop: 8 }}>
-            assets: {fmt(assets)} · liabilities: {fmt(liabilities)} · profit: {fmt(profit)}
+            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)}
           </div>
         )}
       </div>

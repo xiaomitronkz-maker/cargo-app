@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import Modal from '../components/Modal'
 import api from '../api'
+import { formatDate } from '../utils/data'
 
 const emptyLedger = {
   summary: {
@@ -116,7 +117,7 @@ export default function Debts() {
           </span>
         </td>
         {activeTab !== 'history' && <td className="td-mono">{row.documents_count || 0}</td>}
-        <td className="td-muted">{row.last_operation_date || '—'}</td>
+        <td className="td-muted td-date">{formatDate(row.last_operation_date)}</td>
         {activeTab !== 'history' && (
           <td>
             <span className={`badge ${statusBadge(row)}`}>{statusLabel(row)}</span>
@@ -265,7 +266,7 @@ export default function Debts() {
                   </tr>
                 ) : normalizeArray(selected.entries).map((entry, index) => (
                   <tr key={`${entry.kind}-${entry.document_id || 'payment'}-${index}`}>
-                    <td className="td-muted">{entry.date || '—'}</td>
+                    <td className="td-muted td-date">{formatDate(entry.date)}</td>
                     <td>
                       <div style={{ fontWeight: 600 }}>{entry.description || operationKind(entry.kind)}</div>
                       <div className="td-muted">{operationKind(entry.kind)}</div>

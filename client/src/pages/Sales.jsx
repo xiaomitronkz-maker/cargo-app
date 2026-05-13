@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
-import { normalizeArray, toNumber } from '../utils/data'
+import { formatDate, formatType, normalizeArray, toNumber } from '../utils/data'
 
 const today = () => new Date().toISOString().slice(0, 10)
 const EMPTY_FORM = { date: today(), client_id: '', marking_id: '' }
@@ -185,7 +185,7 @@ export default function Sales() {
                 const rows = saleItems(sale)
                 return (
                   <tr key={sale.sales_document_id ? `doc-${sale.sales_document_id}` : `sale-${sale.id}`}>
-                    <td className="td-muted">{sale.date}</td>
+                    <td className="td-muted td-date">{formatDate(sale.date)}</td>
                     <td>{sale.client_name || '—'}</td>
                     <td>{sale.marking ? <span className="badge badge-primary">{sale.marking}</span> : '—'}</td>
                     <td>
@@ -305,7 +305,7 @@ export default function Sales() {
                       <option value="">— Выберите товар —</option>
                       {normalizeArray(products).map((p) => (
                         <option key={p.id} value={String(p.id)}>
-                          {p.name} {p.sale_type ? `[${p.sale_type}]` : '[нет правила]'}
+                          {p.name} {p.sale_type ? `[${formatType(p.sale_type)}]` : '[нет правила]'}
                         </option>
                       ))}
                     </select>
@@ -319,14 +319,14 @@ export default function Sales() {
                       disabled={product?.sale_type && product.sale_type !== 'both'}
                     >
                       <option value="">— Выберите —</option>
-                      {options.map((u) => <option key={u} value={u}>{u === 'kg' ? 'кг (kg)' : 'шт (pcs)'}</option>)}
+                      {options.map((u) => <option key={u} value={u}>{formatType(u)}</option>)}
                     </select>
                   </div>
                 </div>
 
                 {product && (
                   <div className="alert alert-info" style={{ fontSize: 12, marginBottom: 10, padding: '6px 12px' }}>
-                    Правило: <strong>{product.sale_type || 'не задано'}</strong>
+                    Правило: <strong>{product.sale_type ? formatType(product.sale_type) : 'не задано'}</strong>
                     {product.sale_type === 'pcs' && ' — только по штукам'}
                     {product.sale_type === 'kg' && ' — только по килограммам'}
                     {product.sale_type === 'both' && ' — любая единица'}
@@ -368,7 +368,7 @@ export default function Sales() {
 
       {modal === 'delete' && (
         <ConfirmModal
-          message="Удалить реализацию?"
+          message="Удалить реализацию? Это действие нельзя отменить."
           onConfirm={del}
           onCancel={() => setModal(null)}
         />

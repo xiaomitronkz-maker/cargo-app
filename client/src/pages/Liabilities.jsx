@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
-import { normalizeArray, toNumber } from '../utils/data'
+import { formatDate, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
@@ -65,7 +65,7 @@ export default function Liabilities() {
               )}
               {safePayables.map(debt => (
                 <tr key={debt.id}>
-                  <td className="td-muted">{debt.date || '—'}</td>
+                  <td className="td-muted td-date">{formatDate(debt.date)}</td>
                   <td style={{ fontWeight: 600 }}>{debt.supplier_name || 'Без поставщика'}</td>
                   <td>{debt.document_label || `Приход №${debt.id}`}</td>
                   <td><span className="badge badge-danger" style={{ fontSize: 13 }}>{fmt(debt.debt)}</span></td>

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import Modal from '../components/Modal'
 import api from '../api'
+import { formatDate } from '../utils/data'
 
 const EMPTY = { name: '', phone: '', notes: '' }
 
@@ -79,7 +80,7 @@ export default function Suppliers() {
                   <td style={{ fontWeight: 600 }}>{s.name}</td>
                   <td className="td-muted">{s.phone || '—'}</td>
                   <td className="td-muted" style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.notes || '—'}</td>
-                  <td className="td-muted">{new Date(s.created_at).toLocaleDateString('ru-RU')}</td>
+                  <td className="td-muted td-date">{formatDate(s.created_at)}</td>
                   <td>
                     <div className="td-actions">
                       <button className="btn btn-ghost btn-sm" onClick={() => openEdit(s)}>Изм.</button>
@@ -137,7 +138,7 @@ export default function Suppliers() {
         >
           {error && <div className="alert alert-error">{error}</div>}
           <p style={{ color: 'var(--text-secondary)', fontSize: 14 }}>
-            Удалить поставщика "{selected?.name}"?
+            Удалить поставщика "{selected?.name}"? Это действие нельзя отменить.
           </p>
         </Modal>
       )}

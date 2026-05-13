@@ -871,6 +871,155 @@ async function profitSummaryData(client = pool) {
   return { revenue, cost, profit: revenue - cost };
 }
 
+function periodStartDate(period) {
+  const toDateOnly = (date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+  const key = String(period || '').toLowerCase();
+  const now = new Date();
+  if (key === 'today') return toDateOnly(now);
+  if (key === 'week') {
+    now.setDate(now.getDate() - 6);
+    return toDateOnly(now);
+  }
+  if (key === 'month') {
+    return toDateOnly(new Date(now.getFullYear(), now.getMonth(), 1));
+  }
+  if (key === 'year') {
+    return toDateOnly(new Date(now.getFullYear(), 0, 1));
+  }
+  return null;
+}
+
+async function analyticsProfitData(period = '') {
+  const startDate = periodStartDate(period);
+  const params = startDate ? [startDate] : [];
+  const salesWhere = startDate ? 'WHERE s.date >= $1::date' : '';
+  const purchasesWhere = startDate ? 'WHERE p.date >= $1::date' : '';
+
+  const baseCte = `
+    WITH purchase_costs AS (
+      SELECT
+        product_id,
+        COALESCE(SUM(total_cost::numeric),0) AS total_cost,
+        COALESCE(SUM(weight_kg::numeric),0) AS total_weight,
+        COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
+      FROM purchases
+      GROUP BY product_id
+    ),
+    sales_base AS (
+      SELECT DISTINCT
+        s.id,
+        s.date,
+        s.client_id,
+        s.product_id,
+        s.sale_unit,
+        s.quantity::numeric AS quantity,
+        COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue
+      FROM sales s
+      ${salesWhere}
+    ),
+    sales_costed AS (
+      SELECT
+        sb.*,
+        CASE
+          WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
+          WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
+          ELSE 0
+        END AS cost
+      FROM sales_base sb
+      LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
+    )
+  `;
+
+  const [byClient, byProduct, salesByPeriod, purchasesByPeriod, totals, debts, accounts] = await Promise.all([
+    all(`
+      ${baseCte}
+      SELECT
+        COALESCE(c.name, 'Без клиента') AS name,
+        COALESCE(SUM(sc.revenue),0) AS total_sales,
+        COALESCE(SUM(sc.cost),0) AS total_costs,
+        COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) AS profit
+      FROM sales_costed sc
+      LEFT JOIN clients c ON c.id = sc.client_id
+      GROUP BY COALESCE(c.name, 'Без клиента')
+      ORDER BY total_sales DESC
+    `, params),
+    all(`
+      ${baseCte}
+      SELECT
+        COALESCE(pr.name, 'Без товара') AS name,
+        COALESCE(SUM(sc.revenue),0) AS total_sales,
+        COALESCE(SUM(sc.cost),0) AS total_costs,
+        COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) AS profit
+      FROM sales_costed sc
+      LEFT JOIN products pr ON pr.id = sc.product_id
+      GROUP BY COALESCE(pr.name, 'Без товара')
+      ORDER BY total_sales DESC
+    `, params),
+    all(`
+      ${baseCte}
+      SELECT
+        sc.date::text AS date,
+        COALESCE(SUM(sc.revenue),0) AS total
+      FROM sales_costed sc
+      GROUP BY sc.date
+      ORDER BY sc.date
+    `, params),
+    all(`
+      SELECT
+        p.date::text AS date,
+        COALESCE(SUM(p.total_cost::numeric),0) AS total
+      FROM purchases p
+      ${purchasesWhere}
+      GROUP BY p.date
+      ORDER BY p.date
+    `, params),
+    get(`
+      ${baseCte}
+      SELECT
+        COALESCE(SUM(sc.revenue),0) AS revenue,
+        COALESCE(SUM(sc.cost),0) AS cost
+      FROM sales_costed sc
+    `, params),
+    debtSummaryData(),
+    all(`
+      SELECT
+        COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
+        - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
+        - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
+        + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
+        - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
+        AS balance
+      FROM accounts a
+    `),
+  ]);
+
+  const cash = accounts.reduce((sum, account) => sum + (+(account.balance || 0)), 0);
+  const receivable = +(debts?.receivable?.total || 0);
+  const payable = +(debts?.payable?.total || 0);
+  const revenue = +(totals?.revenue || 0);
+  const cost = +(totals?.cost || 0);
+
+  return {
+    byClient,
+    byProduct,
+    salesByPeriod,
+    purchasesByPeriod,
+    assetsByType: [
+      { asset_type: 'cash', total: cash },
+      { asset_type: 'debtors', total: receivable },
+    ],
+    totalLiab: payable,
+    totalSales: revenue,
+    totalCosts: cost,
+    profit: revenue - cost,
+  };
+}
+
 // Clients
 app.get('/api/clients', async (req, res) => {
   res.json(await all('SELECT * FROM clients ORDER BY name'));
@@ -2362,40 +2511,89 @@ app.get('/api/analytics/dashboard', async (req, res) => {
 });
 
 app.get('/api/analytics/profit', async (req, res) => {
-  const rows = await all(`
-    WITH purchase_costs AS (
-      SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
-      FROM purchases
-      GROUP BY product_id
-    ),
-    sales_base AS (
-      SELECT DISTINCT
-        id,
-        date,
-        product_id,
-        sale_unit,
-        quantity::numeric AS quantity,
-        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-    )
-    SELECT
-      sb.date::text AS date,
-      COALESCE(SUM(sb.revenue),0) AS revenue,
-      COALESCE(SUM(CASE
-        WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
-        WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
-        ELSE 0
-      END),0) AS cost
-    FROM sales_base sb
-    LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
-    GROUP BY sb.date
-    ORDER BY sb.date
-  `);
-  res.json(rows.map((row) => ({ ...row, profit: (+row.revenue || 0) - (+row.cost || 0) })));
+  res.json(await analyticsProfitData(req.query.period));
 });
 
 app.post('/api/ai/command', async (req, res) => {
-  res.json({ reply: `Команда принята: ${req.body.command || ''}`.trim() });
+  const command = String(req.body.command || '').trim();
+  const text = command.toLowerCase();
+
+  if (!command) {
+    return res.status(400).json({ type: 'error', message: 'Введите команду' });
+  }
+
+  if (text.includes('прибыл')) {
+    const period = text.includes('сегодня')
+      ? 'today'
+      : text.includes('недел')
+        ? 'week'
+        : text.includes('месяц')
+          ? 'month'
+          : text.includes('год')
+            ? 'year'
+            : '';
+    const data = await analyticsProfitData(period);
+    const label = period === 'today'
+      ? 'за сегодня'
+      : period === 'week'
+        ? 'за неделю'
+        : period === 'month'
+          ? 'за месяц'
+          : period === 'year'
+            ? 'за год'
+            : 'за всё время';
+    return res.json({
+      type: 'analytics',
+      message: `Прибыль ${label}: $${(+(data.profit || 0)).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+      data: {
+        sales: +(data.totalSales || 0),
+        costs: +(data.totalCosts || 0),
+        profit: +(data.profit || 0),
+      },
+    });
+  }
+
+  if (text.includes('баланс')) {
+    const debts = await debtSummaryData();
+    return res.json({
+      type: 'balance',
+      message: 'Баланс рассчитан',
+      data: {
+        assets: +(debts?.receivable?.total || 0),
+        liabilities: +(debts?.payable?.total || 0),
+        balance: +(debts?.balance || 0),
+      },
+    });
+  }
+
+  if (text.includes('должник') || text.includes('долг')) {
+    const rows = await all(`
+      SELECT id,date,total_amount::numeric - COALESCE(paid_amount::numeric,0) AS amount, notes AS comment
+      FROM sales
+      WHERE total_amount::numeric - COALESCE(paid_amount::numeric,0) > 0
+      ORDER BY date DESC
+      LIMIT 10
+    `);
+    return res.json({
+      type: 'debtors',
+      message: rows.length ? `Найдено долгов: ${rows.length}` : 'Должников нет',
+      data: rows,
+    });
+  }
+
+  if (text.includes('клиент')) {
+    const rows = await all('SELECT id,name,phone FROM clients ORDER BY name LIMIT 20');
+    return res.json({
+      type: 'clients',
+      message: rows.length ? `Клиентов в списке: ${rows.length}` : 'Клиентов пока нет',
+      data: rows,
+    });
+  }
+
+  return res.json({
+    type: 'info',
+    message: `Команда принята: ${command}. Для отчётов попробуйте “прибыль за неделю”, “баланс” или “должники”.`,
+  });
 });
 
 const dist = process.env.CLIENT_DIST || '/root/cargo-app/client/dist';

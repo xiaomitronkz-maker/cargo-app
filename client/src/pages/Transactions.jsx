@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { formatDate, formatType, normalizeArray } from '../utils/data'
 
 const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const today = () => new Date().toISOString().slice(0, 10)
@@ -22,8 +23,8 @@ export default function Transactions() {
     setLoading(true)
     Promise.all([api.getTransactions(), api.getAccounts()])
       .then(([transactionsData, accountsData]) => {
-        setTransactions(transactionsData)
-        setAccounts(accountsData)
+        setTransactions(normalizeArray(transactionsData))
+        setAccounts(normalizeArray(accountsData))
       })
       .finally(() => setLoading(false))
   }
@@ -128,8 +129,8 @@ export default function Transactions() {
               )}
               {transactions.map(tx => (
                 <tr key={tx.id}>
-                  <td className="td-muted">{tx.date}</td>
-                  <td><span className="badge badge-neutral">{tx.type}</span></td>
+                  <td className="td-muted td-date">{formatDate(tx.date)}</td>
+                  <td><span className="badge badge-neutral">{formatType(tx.type)}</span></td>
                   <td className="td-mono">{fmt(tx.amount)}</td>
                   <td>{accountName(tx)}</td>
                   <td className="td-muted">{tx.comment || '—'}</td>

@@ -2,7 +2,7 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 
 const NAV = [
   { section: 'Обзор', items: [
-    { path: '/dashboard', icon: '◈', label: 'Dashboard' },
+    { path: '/dashboard', icon: '◈', label: 'Обзор' },
     { path: '/analytics', icon: '◉', label: 'Аналитика' },
     { path: '/ai', icon: '⌬', label: 'AI Команды' },
   ]},
@@ -36,7 +36,7 @@ export default function Layout() {
       <aside className="sidebar">
         <div className="sidebar-logo">
           <h1>📦 Cargo Manager</h1>
-          <span>Dubai → Kazakhstan</span>
+          <span>Дубай → Казахстан</span>
         </div>
 
         <nav className="sidebar-nav">

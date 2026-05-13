@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
+import { formatDate } from '../utils/data'
 
 const EMPTY = { name: '', phone: '', notes: '' }
 
@@ -81,7 +82,7 @@ export default function Clients() {
                   <td style={{ fontWeight: 600 }}>{c.name}</td>
                   <td className="td-muted">{c.phone || '—'}</td>
                   <td className="td-muted" style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.notes || '—'}</td>
-                  <td className="td-muted">{new Date(c.created_at).toLocaleDateString('ru-RU')}</td>
+                  <td className="td-muted td-date">{formatDate(c.created_at)}</td>
                   <td>
                     <div className="td-actions">
                       <button className="btn btn-ghost btn-sm" onClick={() => openMarkings(c)} title="Маркировки">🏷</button>
@@ -129,7 +130,7 @@ export default function Clients() {
       {/* Delete confirmation */}
       {modal === 'delete' && (
         <ConfirmModal
-          message={`Удалить клиента "${selected?.name}"? Все маркировки будут удалены. Приходы и продажи сохранятся.`}
+          message={`Удалить клиента "${selected?.name}"? Это действие нельзя отменить. Все маркировки будут удалены. Приходы и продажи сохранятся.`}
           onConfirm={del}
           onCancel={() => setModal(null)}
         />

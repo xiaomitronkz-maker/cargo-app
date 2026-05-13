@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import api from '../api'
-import { normalizeArray, toNumber } from '../utils/data'
+import { formatDate, normalizeArray, toNumber } from '../utils/data'
 
 const formatLocalDate = (date) => {
   const year = date.getFullYear()
@@ -26,7 +26,7 @@ function buildCsv(act) {
   const rows = [
     ['Акт сверки'],
     ['Контрагент', act.counterparty_name],
-    ['Период', `${act.date_from} — ${act.date_to}`],
+    ['Период', `${formatDate(act.date_from)} — ${formatDate(act.date_to)}`],
     ['Остаток на начало', act.opening_balance],
     ['Начислено', act.total_charged],
     ['Оплачено', act.total_paid],
@@ -34,7 +34,7 @@ function buildCsv(act) {
     [],
     ['Дата', 'Операция', 'Документ', 'Начислено', 'Оплачено', 'Остаток', 'Комментарий'],
     ...normalizeArray(act.entries).map(entry => [
-      entry.date || '',
+      formatDate(entry.date),
       entry.operation || '',
       entry.document_id ? `№${entry.document_id}` : '',
       entry.charge || 0,
@@ -175,7 +175,7 @@ export default function Ledger() {
             <div className="chart-card">
               <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 8 }}>Акт сверки</div>
               <div className="page-subtitle">Контрагент: {act.counterparty_name || selectedName || '—'}</div>
-              <div className="page-subtitle">Период: {act.date_from} — {act.date_to}</div>
+              <div className="page-subtitle">Период: {formatDate(act.date_from)} — {formatDate(act.date_to)}</div>
             </div>
 
             <div className="balance-grid">
@@ -222,7 +222,7 @@ export default function Ledger() {
                   )}
                   {entries.map((entry, index) => (
                     <tr key={`${entry.operation}-${entry.document_id || 'payment'}-${index}`}>
-                      <td className="td-muted">{entry.date || '—'}</td>
+                      <td className="td-muted td-date">{formatDate(entry.date)}</td>
                       <td>{entry.operation || '—'}</td>
                       <td className="td-muted">{entry.document_id ? `№${entry.document_id}` : '—'}</td>
                       <td className="td-mono">{fmtPlain(entry.charge)}</td>

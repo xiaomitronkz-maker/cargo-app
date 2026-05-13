@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts'
 import api from '../api'
-import { normalizeArray, toNumber } from '../utils/data'
+import { formatDate, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const fmtShort = (n) => { const value = toNumber(n); if (Math.abs(value) >= 1000) return '$' + (value / 1000).toFixed(1) + 'k'; return '$' + value.toFixed(0) }
@@ -44,7 +44,9 @@ export default function Analytics() {
       try {
         const result = await api.getProfit(period)
         console.log('Analytics data:', result)
-        setData(result && typeof result === 'object' ? result : {})
+        setData(result && typeof result === 'object' && !Array.isArray(result)
+          ? result
+          : { salesByPeriod: normalizeArray(result) })
       } catch (e) {
         console.log('Analytics data:', null)
         setData({})
@@ -97,6 +99,7 @@ export default function Analytics() {
 function ClientsTab({ data }) {
   const byClient = normalizeArray(data?.byClient).map(row => ({
     ...row,
+    name: row?.name || row?.client_name || 'Без клиента',
     total_sales: toNumber(row?.total_sales),
     total_costs: toNumber(row?.total_costs),
     profit: toNumber(row?.profit),
@@ -143,6 +146,7 @@ function ClientsTab({ data }) {
 function ProductsTab({ data }) {
   const byProduct = normalizeArray(data?.byProduct).map(row => ({
     ...row,
+    name: row?.name || row?.product_name || 'Без товара',
     total_sales: toNumber(row?.total_sales),
     total_costs: toNumber(row?.total_costs),
     profit: toNumber(row?.profit),
@@ -187,11 +191,11 @@ function ProductsTab({ data }) {
 }
 
 function TimelineTab({ data }) {
-  const salesByPeriod = normalizeArray(data?.salesByPeriod).map(row => ({ ...row, total: toNumber(row?.total) }))
-  const purchasesByPeriod = normalizeArray(data?.purchasesByPeriod).map(row => ({ ...row, total: toNumber(row?.total) }))
+  const salesByPeriod = normalizeArray(data?.salesByPeriod).map(row => ({ ...row, total: toNumber(row?.total ?? row?.revenue) }))
+  const purchasesByPeriod = normalizeArray(data?.purchasesByPeriod).map(row => ({ ...row, total: toNumber(row?.total ?? row?.cost) }))
   const dates = [...new Set([...salesByPeriod.map(r => r.date), ...purchasesByPeriod.map(r => r.date)].filter(Boolean))].sort()
   const combined = dates.map(d => ({
-    date: String(d || '').slice(5),
+    date: formatDate(d),
     sales: toNumber(salesByPeriod.find(r => r.date === d)?.total),
     costs: toNumber(purchasesByPeriod.find(r => r.date === d)?.total),
   }))

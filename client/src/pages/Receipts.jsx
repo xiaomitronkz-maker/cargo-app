@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import Modal from '../components/Modal'
 import api from '../api'
+import { formatDate } from '../utils/data'
 
 const fmtNum = (n, digits = 2) => (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 const fmtMoney = (n) => '$' + fmtNum(n, 2)
@@ -121,7 +122,7 @@ export default function Receipts() {
   }
 
   const deleteReceipt = async (receipt) => {
-    if (!confirm('Удалить приход?')) return
+    if (!confirm('Удалить приход? Это действие нельзя отменить.')) return
     try {
       await api.deleteReceipt(receipt.id)
       setSelected(null)
@@ -167,7 +168,7 @@ export default function Receipts() {
               )}
               {receipts.map(receipt => (
                 <tr key={receipt.id}>
-                  <td className="td-muted">{receipt.date || '—'}</td>
+                  <td className="td-muted td-date">{formatDate(receipt.date)}</td>
                   <td>{receipt.supplier_name || '—'}</td>
                   <td>{receipt.client_name || '—'}</td>
                   <td className="td-mono">{receipt.items_count || 0}</td>
@@ -208,7 +209,7 @@ export default function Receipts() {
             <div style={{ fontWeight: 700, marginBottom: 10 }}>📄 Приход №{selected.id}</div>
             <div className="record-meta" style={{ marginBottom: 6 }}>
               <span>Дата</span>
-              <strong>{selected.date || '—'}</strong>
+              <strong>{formatDate(selected.date)}</strong>
             </div>
             <div className="record-meta" style={{ marginBottom: 6 }}>
               <span>Поставщик</span>
@@ -228,7 +229,7 @@ export default function Receipts() {
                   <th>Товар</th>
                   <th>Количество</th>
                   <th>Вес</th>
-                  <th>Dubai $/кг</th>
+                  <th>Дубай $/кг</th>
                   <th>Алматы $/шт</th>
                   <th>Итого себест.</th>
                   <th>Заметка</th>
@@ -328,7 +329,7 @@ export default function Receipts() {
                   <input type="number" min="0" step="0.01" className="form-input" value={item.cost_almaty} onChange={e => setItemF(index, 'cost_almaty', e.target.value)} />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Dubai $/кг</label>
+                  <label className="form-label">Дубай $/кг</label>
                   <input type="number" min="0" step="0.01" className="form-input" value={item.cost_dubai} onChange={e => setItemF(index, 'cost_dubai', e.target.value)} />
                 </div>
               </div>

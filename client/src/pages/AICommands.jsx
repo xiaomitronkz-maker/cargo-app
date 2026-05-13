@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import api from '../api'
+import { formatDate, formatType, normalizeArray, toNumber } from '../utils/data'
 
 const EXAMPLES = [
   'продай Жанибек 2 iphone по 650',
@@ -11,15 +12,40 @@ const EXAMPLES = [
   'клиенты',
 ]
 
-const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+function normalizeCommandResult(result) {
+  if (!result || typeof result !== 'object') {
+    return { type: 'info', message: 'Команда выполнена, но данных не найдено' }
+  }
+  if (!result.message && result.reply) {
+    return { ...result, type: result.type || 'info', message: result.reply }
+  }
+  if (!result.message) {
+    return { ...result, type: result.type || 'info', message: 'Команда выполнена, но данных не найдено' }
+  }
+  return result
+}
+
+function resultSummary(result) {
+  const safe = normalizeCommandResult(result)
+  return safe.message || safe.reply || 'Команда выполнена'
+}
 
 function ResultCard({ result, onConfirmSale }) {
-  const { type, message, data, suggestions } = result
+  const safeResult = normalizeCommandResult(result)
+  const { type, message, data, suggestions } = safeResult
   const isError = type === 'error' || type === 'help'
-  const isSuccess = type === 'sale_preview' || type === 'analytics' || type === 'balance' || type === 'debtors' || type === 'clients'
+  const isSuccess = type === 'sale_preview' || type === 'analytics' || type === 'balance' || type === 'debtors' || type === 'clients' || type === 'info'
+  const analyticsSales = toNumber(data?.sales ?? data?.revenue)
+  const analyticsCosts = toNumber(data?.costs ?? data?.cost)
+  const analyticsProfit = toNumber(data?.profit)
+  const debtors = normalizeArray(data)
+  const clients = normalizeArray(data)
 
   return (
     <div className={`ai-result ${isError ? 'type-error' : isSuccess ? 'type-success' : ''}`}>
+      <div className="ai-result-kicker">Результат</div>
       <div className="ai-result-msg">{message}</div>
 
       {type === 'sale_preview' && data && (
@@ -27,9 +53,9 @@ function ResultCard({ result, onConfirmSale }) {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)' }}>
             <div>Клиент: <strong style={{ color: 'var(--text)' }}>{data.client_name}</strong></div>
             <div>Товар: <strong style={{ color: 'var(--text)' }}>{data.product_name}</strong></div>
-            <div>Кол-во: <strong style={{ color: 'var(--text)' }}>{data.quantity} {data.sale_unit}</strong></div>
+            <div>Кол-во: <strong style={{ color: 'var(--text)' }}>{data.quantity} {formatType(data.sale_unit)}</strong></div>
             <div>Цена/ед: <strong style={{ color: 'var(--text)' }}>{fmt(data.price_per_unit)}</strong></div>
-            <div>Правило: <strong style={{ color: 'var(--text)' }}>{data.sale_type || 'не задано'}</strong></div>
+            <div>Правило: <strong style={{ color: 'var(--text)' }}>{data.sale_type ? formatType(data.sale_type) : 'не задано'}</strong></div>
             <div>Итого: <strong style={{ color: '#22c55e', fontSize: 15 }}>{fmt(data.total_amount)}</strong></div>
           </div>
           <button className="btn btn-primary" onClick={() => onConfirmSale(data)}>
@@ -42,15 +68,15 @@ function ResultCard({ result, onConfirmSale }) {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, fontSize: 13 }}>
           <div style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '10px 14px' }}>
             <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>ПРОДАЖИ</div>
-            <div style={{ fontWeight: 700, color: 'var(--primary-hover)' }}>{fmt(data.sales)}</div>
+            <div style={{ fontWeight: 700, color: 'var(--primary-hover)' }}>{fmt(analyticsSales)}</div>
           </div>
           <div style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '10px 14px' }}>
             <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>ЗАТРАТЫ</div>
-            <div style={{ fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.costs)}</div>
+            <div style={{ fontWeight: 700, color: 'var(--danger)' }}>{fmt(analyticsCosts)}</div>
           </div>
           <div style={{ background: 'var(--surface-2)', borderRadius: 8, padding: '10px 14px' }}>
             <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 3 }}>ПРИБЫЛЬ</div>
-            <div style={{ fontWeight: 700, color: data.profit >= 0 ? 'var(--success)' : 'var(--danger)' }}>{fmt(data.profit)}</div>
+            <div style={{ fontWeight: 700, color: analyticsProfit >= 0 ? 'var(--success)' : 'var(--danger)' }}>{fmt(analyticsProfit)}</div>
           </div>
         </div>
       )}
@@ -72,7 +98,7 @@ function ResultCard({ result, onConfirmSale }) {
         </div>
       )}
 
-      {type === 'debtors' && data && data.length > 0 && (
+      {type === 'debtors' && debtors.length > 0 && (
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginTop: 8 }}>
           <thead>
             <tr>
@@ -82,9 +108,9 @@ function ResultCard({ result, onConfirmSale }) {
             </tr>
           </thead>
           <tbody>
-            {data.map(d => (
+            {debtors.map(d => (
               <tr key={d.id}>
-                <td style={{ padding: '4px 8px', color: 'var(--text-secondary)' }}>{d.date}</td>
+                <td style={{ padding: '4px 8px', color: 'var(--text-secondary)' }}>{formatDate(d.date)}</td>
                 <td style={{ padding: '4px 8px', fontWeight: 700, color: 'var(--danger)' }}>{fmt(d.amount)}</td>
                 <td style={{ padding: '4px 8px', color: 'var(--text-secondary)' }}>{d.comment || '—'}</td>
               </tr>
@@ -93,13 +119,19 @@ function ResultCard({ result, onConfirmSale }) {
         </table>
       )}
 
-      {type === 'clients' && data && (
+      {type === 'clients' && clients.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-          {data.map(c => (
+          {clients.map(c => (
             <span key={c.id} style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px', fontSize: 13 }}>
               {c.name} {c.phone ? `· ${c.phone}` : ''}
             </span>
           ))}
+        </div>
+      )}
+
+      {type === 'info' && !data && (
+        <div className="alert alert-info" style={{ marginTop: 8, marginBottom: 0 }}>
+          Команда выполнена. Дополнительных данных нет.
         </div>
       )}
 
@@ -130,7 +162,7 @@ export default function AICommands() {
     if (!c) return
     setLoading(true)
     try {
-      const result = await api.sendCommand(c)
+      const result = normalizeCommandResult(await api.sendCommand(c))
       setHistory(h => [{ command: c, result, ts: new Date().toLocaleTimeString('ru-RU') }, ...h])
       setCommand('')
     } catch (e) {
@@ -218,6 +250,9 @@ export default function AICommands() {
                 <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
                   <span style={{ fontFamily: 'monospace', color: 'var(--primary-hover)' }}>→ {h.command}</span>
                   <span style={{ marginLeft: 8 }}>{h.ts}</span>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>
+                  {resultSummary(h.result)}
                 </div>
                 <ResultCard result={h.result} onConfirmSale={handleConfirmSale} />
               </div>

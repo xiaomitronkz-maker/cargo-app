@@ -147,9 +147,9 @@ export default function Products() {
             <label className="form-label">Правило продажи</label>
             <select className="form-select" value={form.sale_type} onChange={e => setForm(f => ({ ...f, sale_type: e.target.value }))}>
               <option value="">— Не задано —</option>
-              <option value="pcs">По штукам (pcs) — например iPhone</option>
-              <option value="kg">По килограммам (kg) — карго товар</option>
-              <option value="both">Оба варианта (both) — гибкий товар</option>
+              <option value="pcs">По штукам — например iPhone</option>
+              <option value="kg">По килограммам — карго товар</option>
+              <option value="both">Оба варианта — гибкий товар</option>
             </select>
             <span style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
               Без правила продажа этого товара будет заблокирована
@@ -160,7 +160,7 @@ export default function Products() {
 
       {modal === 'delete' && (
         <ConfirmModal
-          message={`Удалить товар "${selected?.name}"? Связанное правило продажи тоже будет удалено.`}
+          message={`Удалить товар "${selected?.name}"? Это действие нельзя отменить. Связанное правило продажи тоже будет удалено.`}
           onConfirm={del}
           onCancel={() => setModal(null)}
         />
