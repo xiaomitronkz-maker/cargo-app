@@ -141,6 +141,9 @@ async function initDb() {
       quantity NUMERIC DEFAULT 0,
       cost_almaty NUMERIC DEFAULT 0,
       cost_dubai NUMERIC DEFAULT 0,
+      ala_unit TEXT CHECK(ala_unit IN ('kg','pcs')) DEFAULT 'kg',
+      total_cost NUMERIC DEFAULT 0,
+      class_code TEXT,
       note TEXT
     );
 
@@ -158,6 +161,8 @@ async function initDb() {
       cost_almaty NUMERIC DEFAULT 0,
       cost_dubai NUMERIC DEFAULT 0,
       cost_per_kg NUMERIC DEFAULT 0,
+      ala_unit TEXT CHECK(ala_unit IN ('kg','pcs')) DEFAULT 'kg',
+      class_code TEXT,
       total_cost NUMERIC DEFAULT 0,
       paid_amount NUMERIC DEFAULT 0,
       notes TEXT,
@@ -256,6 +261,32 @@ async function initDb() {
       date DATE NOT NULL DEFAULT CURRENT_DATE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS tariffs (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      product_pattern TEXT,
+      class_code TEXT,
+      dxb_rate NUMERIC DEFAULT 5.5,
+      ala_rate NUMERIC DEFAULT 0,
+      ala_unit TEXT CHECK(ala_unit IN ('kg','pcs')) DEFAULT 'kg',
+      is_default BOOLEAN DEFAULT FALSE,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS import_records (
+      id SERIAL PRIMARY KEY,
+      source_type TEXT NOT NULL,
+      spreadsheet_id TEXT,
+      gid TEXT,
+      source_row INTEGER,
+      source_date DATE,
+      source_marking TEXT,
+      receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(source_type, spreadsheet_id, gid, source_row)
+    );
   `);
 
   await query(`
@@ -264,8 +295,13 @@ async function initDb() {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cost_almaty NUMERIC DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cost_dubai NUMERIC DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cost_per_kg NUMERIC DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS ala_unit TEXT DEFAULT 'kg';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS class_code TEXT;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total_cost NUMERIC DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
+    ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS ala_unit TEXT DEFAULT 'kg';
+    ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS total_cost NUMERIC DEFAULT 0;
+    ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS class_code TEXT;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE SET NULL;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
@@ -284,6 +320,16 @@ async function initDb() {
       AND t.related_type = 'payment'
       AND t.related_id = p.id;
   `);
+
+  const tariffCount = await get('SELECT COUNT(*)::int AS count FROM tariffs');
+  if (!tariffCount?.count) {
+    await query(`
+      INSERT INTO tariffs(name,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,is_default,is_active)
+      VALUES
+        ('Базовый тариф', NULL, NULL, 5.5, 3, 'kg', TRUE, TRUE),
+        ('Телефоны', 'phone,iphone,айфон,телефон,smartphone', NULL, 5.5, 3, 'pcs', FALSE, TRUE)
+    `);
+  }
 }
 
 async function resolveClientMarking(clientId, markingId, client = pool) {
@@ -309,14 +355,104 @@ function validatePurchaseNums({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0
   if (+cost_dubai < 0) throw new Error('Тариф Дубай не может быть отрицательным');
 }
 
-function calculatePurchaseCost({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0, cost_dubai = 0 }) {
-  const weight = +weight_kg || 0;
-  const quantity = +quantity_pcs || 0;
-  const almatyRate = +cost_almaty || 0;
-  const dubaiRate = +cost_dubai || 0;
+function normalizeText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isPhoneProduct(productName) {
+  const name = normalizeText(productName);
+  return (
+    name.includes('iphone') ||
+    name.includes('айфон') ||
+    name.includes('smartphone') ||
+    name.includes('android phone') ||
+    name.includes('samsung phone') ||
+    name.includes('телефон') ||
+    /(^|[^a-z0-9])phone([^a-z0-9]|$)/i.test(name)
+  );
+}
+
+function splitPattern(pattern) {
+  return String(pattern || '')
+    .split(',')
+    .map((part) => normalizeText(part))
+    .filter(Boolean);
+}
+
+function tariffProductMatches(tariff, productName) {
+  const product = normalizeText(productName);
+  const patterns = splitPattern(tariff.product_pattern);
+  return patterns.length > 0 && patterns.some((pattern) => {
+    if (pattern === 'phone') return /(^|[^a-z0-9])phone([^a-z0-9]|$)/i.test(product);
+    return product.includes(pattern);
+  });
+}
+
+function tariffClassMatches(tariff, classCode) {
+  const tariffClass = normalizeText(tariff.class_code);
+  return Boolean(tariffClass) && tariffClass === normalizeText(classCode);
+}
+
+function matchTariff(productName, classCode, tariffs = []) {
+  const active = tariffs.filter((tariff) => tariff && tariff.is_active !== false);
+  const productAndClass = active.find((tariff) => tariffProductMatches(tariff, productName) && tariffClassMatches(tariff, classCode));
+  if (productAndClass) return productAndClass;
+
+  const productOnly = active.find((tariff) => tariffProductMatches(tariff, productName) && !normalizeText(tariff.class_code));
+  if (productOnly) return productOnly;
+
+  const classOnly = active.find((tariff) => !splitPattern(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
+  if (classOnly) return classOnly;
+
+  const defaultTariff = active.find((tariff) => tariff.is_default);
+  if (defaultTariff) return defaultTariff;
+
   return {
-    costPerKg: dubaiRate,
-    totalCost: (weight * dubaiRate) + (quantity * almatyRate),
+    id: null,
+    name: 'Авто',
+    dxb_rate: 5.5,
+    ala_rate: 0,
+    ala_unit: isPhoneProduct(productName) ? 'pcs' : 'kg',
+  };
+}
+
+function calculateImportCost({ productName = '', classCode = '', weightKg = 0, quantityPcs = 0, dxbRate = 5.5, alaRate = 0, alaUnit }) {
+  const weight = +weightKg || 0;
+  const quantity = +quantityPcs || 0;
+  const dubaiRate = +dxbRate || 0;
+  const almatyRate = +alaRate || 0;
+  const resolvedAlaUnit = alaUnit === 'pcs' || alaUnit === 'kg'
+    ? alaUnit
+    : (isPhoneProduct(productName) ? 'pcs' : 'kg');
+  const dxbCost = weight * dubaiRate;
+  const alaBase = resolvedAlaUnit === 'pcs' ? quantity : weight;
+  const alaCost = alaBase * almatyRate;
+  return {
+    dxbRate: dubaiRate,
+    alaRate: almatyRate,
+    alaUnit: resolvedAlaUnit,
+    dxbCost,
+    alaCost,
+    totalCost: dxbCost + alaCost,
+  };
+}
+
+function calculatePurchaseCost({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0, cost_dubai = 0, product_name = '', class_code = '', ala_unit = null }) {
+  const result = calculateImportCost({
+    productName: product_name,
+    classCode: class_code,
+    weightKg: weight_kg,
+    quantityPcs: quantity_pcs,
+    dxbRate: cost_dubai,
+    alaRate: cost_almaty,
+    alaUnit: ala_unit,
+  });
+  return {
+    costPerKg: result.dxbRate,
+    totalCost: result.totalCost,
+    alaUnit: result.alaUnit,
+    dxbCost: result.dxbCost,
+    alaCost: result.alaCost,
   };
 }
 
@@ -347,6 +483,129 @@ async function getReceiptPaidAmount(receiptId, client = pool) {
     ) x
   `, [receiptId], client);
   return +(row?.total || 0);
+}
+
+function parseGoogleSheetUrl(url) {
+  const value = String(url || '').trim();
+  const spreadsheetMatch = value.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/) || value.match(/[?&]id=([a-zA-Z0-9-_]+)/);
+  if (!spreadsheetMatch) throw new Error('Не удалось определить ID Google Sheets из ссылки');
+  let gid = '0';
+  let range = null;
+  try {
+    const parsed = new URL(value);
+    gid = parsed.searchParams.get('gid') || (parsed.hash.match(/gid=([0-9]+)/)?.[1]) || '0';
+    range = parsed.searchParams.get('range') || parsed.hash.match(/range=([^&]+)/)?.[1] || null;
+  } catch (_) {
+    gid = value.match(/gid=([0-9]+)/)?.[1] || '0';
+    range = value.match(/range=([^&]+)/)?.[1] || null;
+  }
+  return { spreadsheetId: spreadsheetMatch[1], gid, range: range ? decodeURIComponent(range) : null };
+}
+
+function sheetRangeStartRow(range) {
+  const match = String(range || '').match(/[A-Z]+(\d+)/i);
+  return match ? Math.max(+match[1], 1) : 1;
+}
+
+function parseCsv(csv) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  const text = String(csv || '').replace(/^\uFEFF/, '');
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const next = text[i + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      cell += '"';
+      i += 1;
+    } else if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      row.push(cell);
+      cell = '';
+    } else if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && next === '\n') i += 1;
+      row.push(cell);
+      if (row.some((value) => String(value || '').trim() !== '')) rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += char;
+    }
+  }
+
+  row.push(cell);
+  if (row.some((value) => String(value || '').trim() !== '')) rows.push(row);
+  return rows;
+}
+
+function normalizeHeader(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-ZА-Я0-9]/g, '');
+}
+
+function buildSheetHeaderMap(row) {
+  const map = {};
+  row.forEach((cell, index) => {
+    const header = normalizeHeader(cell);
+    if (header === 'DATE' || header === 'ДАТА') map.date = index;
+    if (header === 'MARKING' || header === 'МАРКИРОВКА') map.marking = index;
+    if (header === 'BREAND' || header === 'BRAND' || header === 'ТОВАР' || header === 'БРЕНД') map.brand = index;
+    if (header === 'PCS' || header === 'ШТ' || header === 'КОЛВО') map.pcs = index;
+    if (header === 'BOX' || header === 'BOXES' || header === 'КОРОБ') map.box = index;
+    if (header === 'KG' || header === 'КГ' || header === 'WEIGHT') map.kg = index;
+    if (header === 'CLASS' || header === 'КЛАСС') map.class = index;
+    if (header === 'TARIFDXB' || header === 'TARIFFDXB') map.tarifDxb = index;
+    if (header === 'TARIFALA' || header === 'TARIFFALA') map.tarifAla = index;
+    if (header === 'CREDITDXB') map.creditDxb = index;
+    if (header === 'CREDITALA') map.creditAla = index;
+    if (header === 'TOTAL' || header === 'ИТОГО') map.total = index;
+  });
+  return map.date != null && map.marking != null && map.pcs != null && map.kg != null ? map : null;
+}
+
+function parseSheetNumber(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return 0;
+  let cleaned = raw.replace(/\s/g, '').replace(/[^\d,.-]/g, '');
+  if (!cleaned) return 0;
+  if (cleaned.includes(',') && cleaned.includes('.')) {
+    cleaned = cleaned.replace(/,/g, '');
+  } else {
+    cleaned = cleaned.replace(',', '.');
+  }
+  const number = Number(cleaned);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function normalizeSheetDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const iso = raw.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, '0')}-${String(iso[3]).padStart(2, '0')}`;
+  const local = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  if (local) {
+    const year = local[3].length === 2 ? `20${local[3]}` : local[3];
+    return `${year}-${String(local[2]).padStart(2, '0')}-${String(local[1]).padStart(2, '0')}`;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function isTotalOrEmptySheetRow(row) {
+  const joined = row.map((cell) => String(cell || '').trim()).filter(Boolean).join(' ').toLowerCase();
+  if (!joined) return true;
+  return /^(итого|total|grand total)\b/.test(joined) || /\b(итого|grand total)\b/.test(joined);
+}
+
+async function findOrCreateProductByName(productName, client = pool) {
+  const name = String(productName || '').trim();
+  if (!name) throw new Error('Название товара обязательно');
+  const existing = await get('SELECT id,name FROM products WHERE lower(name)=lower($1) LIMIT 1', [name], client);
+  if (existing) return existing;
+  return get('INSERT INTO products(name,is_active) VALUES($1,TRUE) RETURNING id,name', [name], client);
 }
 
 async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
@@ -1158,6 +1417,300 @@ app.delete('/api/products/:id', async (req, res) => {
   res.json({ success: true });
 });
 
+// Tariffs
+app.get('/api/tariffs', async (req, res) => {
+  res.json(await all('SELECT * FROM tariffs ORDER BY is_default DESC, is_active DESC, name'));
+});
+
+app.post('/api/tariffs', async (req, res) => {
+  const body = req.body;
+  if (!body.name?.trim()) return res.status(400).json({ error: 'Название обязательно' });
+  if (!['kg', 'pcs'].includes(body.ala_unit)) return res.status(400).json({ error: 'ALA единица обязательна' });
+  const row = await get(`
+    INSERT INTO tariffs(name,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,is_default,is_active)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    RETURNING id
+  `, [
+    body.name.trim(),
+    body.product_pattern?.trim() || null,
+    body.class_code?.trim() || null,
+    +body.dxb_rate || 0,
+    +body.ala_rate || 0,
+    body.ala_unit,
+    Boolean(body.is_default),
+    body.is_active !== false,
+  ]);
+  res.json({ id: row.id });
+});
+
+app.put('/api/tariffs/:id', async (req, res) => {
+  const body = req.body;
+  if (!body.name?.trim()) return res.status(400).json({ error: 'Название обязательно' });
+  if (!['kg', 'pcs'].includes(body.ala_unit)) return res.status(400).json({ error: 'ALA единица обязательна' });
+  await query(`
+    UPDATE tariffs
+    SET name=$1,product_pattern=$2,class_code=$3,dxb_rate=$4,ala_rate=$5,ala_unit=$6,is_default=$7,is_active=$8
+    WHERE id=$9
+  `, [
+    body.name.trim(),
+    body.product_pattern?.trim() || null,
+    body.class_code?.trim() || null,
+    +body.dxb_rate || 0,
+    +body.ala_rate || 0,
+    body.ala_unit,
+    Boolean(body.is_default),
+    body.is_active !== false,
+    +req.params.id,
+  ]);
+  res.json({ success: true });
+});
+
+app.delete('/api/tariffs/:id', async (req, res) => {
+  await query('UPDATE tariffs SET is_active=FALSE WHERE id=$1', [+req.params.id]);
+  res.json({ success: true, soft_deleted: true });
+});
+
+// Google Sheets import
+app.post('/api/import/google-sheets/preview', async (req, res) => {
+  try {
+    const { url, date_from, date_to } = req.body;
+    if (!url?.trim()) return res.status(400).json({ error: 'Ссылка на Google Sheet обязательна' });
+
+    const { spreadsheetId, gid, range } = parseGoogleSheetUrl(url);
+    const csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${encodeURIComponent(gid)}${range ? `&range=${encodeURIComponent(range)}` : ''}`;
+    const response = await fetch(csvUrl);
+    if (!response.ok) throw new Error('Не удалось скачать Google Sheet. Проверьте доступ по ссылке.');
+    const csv = await response.text();
+    if (/^\s*</.test(csv)) throw new Error('Google Sheet не отдал CSV. Проверьте, что файл доступен по ссылке.');
+
+    const tariffs = await all('SELECT * FROM tariffs WHERE is_active=TRUE ORDER BY is_default DESC, name');
+    const markings = await all(`
+      SELECT m.id,m.marking,m.client_id,c.name AS client_name
+      FROM markings m
+      JOIN clients c ON c.id = m.client_id
+    `);
+    const products = await all('SELECT id,name FROM products');
+    const imported = await all(
+      'SELECT source_row FROM import_records WHERE source_type=$1 AND spreadsheet_id=$2 AND gid=$3',
+      ['google_sheets', spreadsheetId, gid]
+    );
+    const sourceRowOffset = sheetRangeStartRow(range) - 1;
+    const importedRows = new Set(imported.map((row) => +row.source_row));
+    const markingByName = new Map(markings.map((marking) => [normalizeText(marking.marking), marking]));
+    const productByName = new Map(products.map((product) => [normalizeText(product.name), product]));
+
+    let headerMap = null;
+    const rows = [];
+    parseCsv(csv).forEach((sheetRow, rowIndex) => {
+      const maybeHeader = buildSheetHeaderMap(sheetRow);
+      if (maybeHeader) {
+        headerMap = maybeHeader;
+        return;
+      }
+      if (!headerMap || isTotalOrEmptySheetRow(sheetRow)) return;
+
+      const date = normalizeSheetDate(sheetRow[headerMap.date]);
+      const markingName = String(sheetRow[headerMap.marking] || '').trim();
+      const productName = String(sheetRow[headerMap.brand] || '').trim();
+      const quantityPcs = parseSheetNumber(sheetRow[headerMap.pcs]);
+      const weightKg = parseSheetNumber(sheetRow[headerMap.kg]);
+      if (!date || !markingName || !productName || (!(quantityPcs > 0) && !(weightKg > 0))) return;
+      if (date_from && date < date_from) return;
+      if (date_to && date > date_to) return;
+
+      const classCode = String(sheetRow[headerMap.class] || '').trim() || null;
+      const marking = markingByName.get(normalizeText(markingName));
+      const product = productByName.get(normalizeText(productName));
+      const tariff = matchTariff(productName, classCode, tariffs);
+      const cost = calculateImportCost({
+        productName,
+        classCode,
+        weightKg,
+        quantityPcs,
+        dxbRate: tariff.dxb_rate,
+        alaRate: tariff.ala_rate,
+        alaUnit: tariff.ala_unit,
+      });
+      const sheetDxbRate = parseSheetNumber(sheetRow[headerMap.tarifDxb]);
+      const sheetAlaRate = parseSheetNumber(sheetRow[headerMap.tarifAla]);
+      const sheetCreditDxb = parseSheetNumber(sheetRow[headerMap.creditDxb]);
+      const sheetCreditAla = parseSheetNumber(sheetRow[headerMap.creditAla]);
+      const sheetTotal = parseSheetNumber(sheetRow[headerMap.total]);
+      const warnings = [];
+      if (!product) warnings.push('Товар будет создан при импорте');
+      if (sheetTotal && Math.abs(sheetTotal - cost.totalCost) > 0.01) warnings.push('TOTAL в таблице отличается от расчёта приложения');
+
+      let status = 'ready';
+      if (!marking) status = 'marking_not_found';
+      const sourceRow = sourceRowOffset + rowIndex + 1;
+      if (importedRows.has(sourceRow)) status = 'already_imported';
+
+      rows.push({
+        spreadsheet_id: spreadsheetId,
+        gid,
+        source_row: sourceRow,
+        date,
+        marking: markingName,
+        marking_id: marking?.id || null,
+        client_id: marking?.client_id || null,
+        client_name: marking?.client_name || null,
+        product_id: product?.id || null,
+        product_name: productName,
+        quantity_pcs: quantityPcs,
+        box: parseSheetNumber(sheetRow[headerMap.box]),
+        weight_kg: weightKg,
+        class: classCode,
+        sheet_dxb_rate: sheetDxbRate,
+        sheet_ala_rate: sheetAlaRate,
+        sheet_credit_dxb: sheetCreditDxb,
+        sheet_credit_ala: sheetCreditAla,
+        sheet_total: sheetTotal,
+        tariff_id: tariff.id || null,
+        tariff_name: tariff.name || 'Авто',
+        app_dxb_rate: cost.dxbRate,
+        app_ala_rate: cost.alaRate,
+        app_ala_unit: cost.alaUnit,
+        app_dxb_cost: cost.dxbCost,
+        app_ala_cost: cost.alaCost,
+        app_total: cost.totalCost,
+        status,
+        warnings,
+      });
+    });
+
+    const groupsMap = new Map();
+    rows.forEach((row) => {
+      const key = `${row.date}||${row.marking}`;
+      if (!groupsMap.has(key)) {
+        groupsMap.set(key, {
+          date: row.date,
+          marking: row.marking,
+          client_id: row.client_id,
+          client_name: row.client_name,
+          items_count: 0,
+          total_weight: 0,
+          total_quantity: 0,
+          app_total: 0,
+          status: 'ready',
+        });
+      }
+      const group = groupsMap.get(key);
+      group.items_count += 1;
+      group.total_weight += +row.weight_kg || 0;
+      group.total_quantity += +row.quantity_pcs || 0;
+      group.app_total += +row.app_total || 0;
+      if (row.status === 'marking_not_found') group.status = 'marking_not_found';
+      if (group.status === 'ready' && row.status === 'already_imported') group.status = 'already_imported';
+      if (group.status === 'already_imported' && row.status === 'ready') group.status = 'partial';
+    });
+
+    res.json({
+      spreadsheet_id: spreadsheetId,
+      gid,
+      rows,
+      groups: Array.from(groupsMap.values()),
+      summary: {
+        rows_count: rows.length,
+        ready_count: rows.filter((row) => row.status === 'ready').length,
+        already_imported_count: rows.filter((row) => row.status === 'already_imported').length,
+        marking_not_found_count: rows.filter((row) => row.status === 'marking_not_found').length,
+      },
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/import/google-sheets/commit', async (req, res) => {
+  const { supplier_id, mode = 'receipt_only' } = req.body;
+  const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+  if (mode === 'receipt_and_sale') return res.status(400).json({ error: 'Создание реализации из импорта будет добавлено следующим этапом' });
+  if (mode !== 'receipt_only') return res.status(400).json({ error: 'Неизвестный режим импорта' });
+  if (!supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
+  if (!rows.length) return res.status(400).json({ error: 'Нет строк для импорта' });
+  if (rows.some((row) => row.status === 'marking_not_found' || !row.marking_id || !row.client_id)) {
+    return res.status(400).json({ error: 'Есть строки без найденной маркировки' });
+  }
+
+  try {
+    const result = await withTx(async (client) => {
+      const groups = new Map();
+      let skippedRows = 0;
+      for (const row of rows) {
+        if (row.status === 'already_imported') {
+          skippedRows += 1;
+          continue;
+        }
+        const existing = await get(`
+          SELECT id FROM import_records
+          WHERE source_type=$1 AND spreadsheet_id=$2 AND gid=$3 AND source_row=$4
+        `, ['google_sheets', row.spreadsheet_id, row.gid || '0', +row.source_row], client);
+        if (existing) {
+          skippedRows += 1;
+          continue;
+        }
+        const key = `${row.date}||${row.marking_id}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(row);
+      }
+
+      const receiptIds = [];
+      let importedRows = 0;
+      for (const groupRows of groups.values()) {
+        if (!groupRows.length) continue;
+        const first = groupRows[0];
+        const receipt = await get(
+          'INSERT INTO receipts(date,supplier_id,client_id,marking_id) VALUES($1,$2,$3,$4) RETURNING id',
+          [first.date, +supplier_id, +first.client_id, +first.marking_id],
+          client
+        );
+        receiptIds.push(receipt.id);
+
+        for (const row of groupRows) {
+          const product = row.product_id
+            ? await get('SELECT id,name FROM products WHERE id=$1', [+row.product_id], client)
+            : await findOrCreateProductByName(row.product_name, client);
+          const productRow = product || await findOrCreateProductByName(row.product_name, client);
+          const cost = calculateImportCost({
+            productName: row.product_name,
+            classCode: row.class,
+            weightKg: row.weight_kg,
+            quantityPcs: row.quantity_pcs,
+            dxbRate: row.app_dxb_rate,
+            alaRate: row.app_ala_rate,
+            alaUnit: row.app_ala_unit,
+          });
+          const noteParts = [`Google Sheets row ${row.source_row}`];
+          if (row.class) noteParts.push(`CLASS ${row.class}`);
+          const note = noteParts.join(' · ');
+
+          await query(`
+            INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,ala_unit,total_cost,class_code,note)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          `, [receipt.id, +productRow.id, +row.weight_kg || 0, +row.quantity_pcs || 0, cost.alaRate, cost.dxbRate, cost.alaUnit, cost.totalCost, row.class || null, note], client);
+
+          await query(`
+            INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,ala_unit,class_code,total_cost,paid_amount,notes)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          `, [first.date, +first.client_id, +first.marking_id, +supplier_id, receipt.id, +productRow.id, +row.quantity_pcs || 0, +row.weight_kg || 0, +row.box || 0, cost.alaRate, cost.dxbRate, cost.dxbRate, cost.alaUnit, row.class || null, cost.totalCost, 0, note], client);
+
+          await query(`
+            INSERT INTO import_records(source_type,spreadsheet_id,gid,source_row,source_date,source_marking,receipt_id)
+            VALUES($1,$2,$3,$4,$5,$6,$7)
+            ON CONFLICT(source_type, spreadsheet_id, gid, source_row) DO NOTHING
+          `, ['google_sheets', row.spreadsheet_id, row.gid || '0', +row.source_row, row.date, row.marking, receipt.id], client);
+          importedRows += 1;
+        }
+      }
+
+      return { created_receipts: receiptIds.length, receipt_ids: receiptIds, imported_rows: importedRows, skipped_rows: skippedRows };
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // Receipts
 app.get('/api/receipts', async (req, res) => {
   res.json(await all(`
@@ -1218,6 +1771,7 @@ app.post('/api/receipts', async (req, res) => {
       const purchaseIds = [];
       for (const item of items) {
         if (!item.product_id) throw new Error('Выберите товар в каждой строке');
+        const product = await get('SELECT name FROM products WHERE id=$1', [+item.product_id], client);
         const weight = +(item.weight ?? item.weight_kg) || 0;
         const quantity = +(item.quantity ?? item.quantity_pcs) || 0;
         if (!(weight > 0) && !(quantity > 0)) throw new Error('Укажите вес или количество в каждой строке');
@@ -1225,25 +1779,29 @@ app.post('/api/receipts', async (req, res) => {
 
         const costAlmaty = +item.cost_almaty || 0;
         const costDubai = +item.cost_dubai || 0;
-        const { costPerKg, totalCost } = calculatePurchaseCost({
+        const classCode = item.class_code || item.class || null;
+        const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
           weight_kg: weight,
           quantity_pcs: quantity,
           cost_almaty: costAlmaty,
           cost_dubai: costDubai,
+          product_name: product?.name,
+          class_code: classCode,
+          ala_unit: item.ala_unit,
         });
         const note = item.note || item.notes || null;
 
         await query(
-          'INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES($1,$2,$3,$4,$5,$6,$7)',
-          [receipt.id, +item.product_id, weight, quantity, costAlmaty, costDubai, note],
+          'INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,ala_unit,total_cost,class_code,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [receipt.id, +item.product_id, weight, quantity, costAlmaty, costDubai, alaUnit, totalCost, classCode, note],
           client
         );
 
         const purchase = await get(`
-          INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,ala_unit,class_code,total_cost,paid_amount,notes)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
           RETURNING id
-        `, [body.date, cid, mid, +body.supplier_id, receipt.id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, totalCost, 0, note], client);
+        `, [body.date, cid, mid, +body.supplier_id, receipt.id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, 0, note], client);
         purchaseIds.push(purchase.id);
       }
 
@@ -1283,6 +1841,7 @@ app.put('/api/receipts/:id', async (req, res) => {
       const ids = [];
       for (const item of items) {
         if (!item.product_id) throw new Error('Выберите товар в каждой строке');
+        const product = await get('SELECT name FROM products WHERE id=$1', [+item.product_id], client);
         const weight = +(item.weight ?? item.weight_kg) || 0;
         const quantity = +(item.quantity ?? item.quantity_pcs) || 0;
         if (!(weight > 0) && !(quantity > 0)) throw new Error('Укажите вес или количество в каждой строке');
@@ -1290,20 +1849,24 @@ app.put('/api/receipts/:id', async (req, res) => {
 
         const costAlmaty = +item.cost_almaty || 0;
         const costDubai = +item.cost_dubai || 0;
-        const { costPerKg, totalCost } = calculatePurchaseCost({
+        const classCode = item.class_code || item.class || null;
+        const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
           weight_kg: weight,
           quantity_pcs: quantity,
           cost_almaty: costAlmaty,
           cost_dubai: costDubai,
+          product_name: product?.name,
+          class_code: classCode,
+          ala_unit: item.ala_unit,
         });
         const note = item.note || item.notes || null;
 
-        await query('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,note) VALUES($1,$2,$3,$4,$5,$6,$7)', [id, +item.product_id, weight, quantity, costAlmaty, costDubai, note], client);
+        await query('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,ala_unit,total_cost,class_code,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [id, +item.product_id, weight, quantity, costAlmaty, costDubai, alaUnit, totalCost, classCode, note], client);
         const purchase = await get(`
-          INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          INSERT INTO purchases(date,client_id,marking_id,supplier_id,receipt_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,ala_unit,class_code,total_cost,paid_amount,notes)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
           RETURNING id
-        `, [body.date, cid, mid, +body.supplier_id, id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, totalCost, 0, note], client);
+        `, [body.date, cid, mid, +body.supplier_id, id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, 0, note], client);
         ids.push(purchase.id);
       }
       return ids;
@@ -1442,19 +2005,24 @@ app.post('/api/purchases', async (req, res) => {
     const quantity = +body.quantity_pcs || 0;
     const costAlmaty = +body.cost_almaty || 0;
     const costDubai = +body.cost_dubai || 0;
-    const { costPerKg, totalCost } = calculatePurchaseCost({
+    const product = await get('SELECT name FROM products WHERE id=$1', [+body.product_id]);
+    const classCode = body.class_code || body.class || null;
+    const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
       weight_kg: weight,
       quantity_pcs: quantity,
       cost_almaty: costAlmaty,
       cost_dubai: costDubai,
+      product_name: product?.name,
+      class_code: classCode,
+      ala_unit: body.ala_unit,
     });
     const paidAmount = +body.paid_amount || 0;
     const row = await get(`
-      INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,total_cost,paid_amount,notes)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,ala_unit,class_code,total_cost,paid_amount,notes)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
       RETURNING id
-    `, [body.date, cid, mid, +body.supplier_id, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, totalCost, paidAmount, body.notes || null]);
-    res.json({ id: row.id, cost_per_kg: costPerKg, total_cost: totalCost, paid_amount: paidAmount, payable: totalCost - paidAmount });
+    `, [body.date, cid, mid, +body.supplier_id, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, paidAmount, body.notes || null]);
+    res.json({ id: row.id, cost_per_kg: costPerKg, ala_unit: alaUnit, total_cost: totalCost, paid_amount: paidAmount, payable: totalCost - paidAmount });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -1470,18 +2038,23 @@ app.put('/api/purchases/:id', async (req, res) => {
     const quantity = +body.quantity_pcs || 0;
     const costAlmaty = +body.cost_almaty || 0;
     const costDubai = +body.cost_dubai || 0;
-    const { costPerKg, totalCost } = calculatePurchaseCost({
+    const product = await get('SELECT name FROM products WHERE id=$1', [+body.product_id]);
+    const classCode = body.class_code || body.class || null;
+    const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
       weight_kg: weight,
       quantity_pcs: quantity,
       cost_almaty: costAlmaty,
       cost_dubai: costDubai,
+      product_name: product?.name,
+      class_code: classCode,
+      ala_unit: body.ala_unit,
     });
     await query(`
       UPDATE purchases
-      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,quantity_pcs=$5,weight_kg=$6,boxes_count=$7,cost_almaty=$8,cost_dubai=$9,cost_per_kg=$10,total_cost=$11,notes=$12
-      WHERE id=$13
-    `, [body.date, cid, mid, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, totalCost, body.notes || null, +req.params.id]);
-    res.json({ success: true, cost_per_kg: costPerKg, total_cost: totalCost });
+      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,quantity_pcs=$5,weight_kg=$6,boxes_count=$7,cost_almaty=$8,cost_dubai=$9,cost_per_kg=$10,ala_unit=$11,class_code=$12,total_cost=$13,notes=$14
+      WHERE id=$15
+    `, [body.date, cid, mid, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, body.notes || null, +req.params.id]);
+    res.json({ success: true, cost_per_kg: costPerKg, ala_unit: alaUnit, total_cost: totalCost });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

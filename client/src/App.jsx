@@ -5,6 +5,7 @@ import Clients from './pages/Clients'
 import Suppliers from './pages/Suppliers'
 import Markings from './pages/Markings'
 import Products from './pages/Products'
+import Tariffs from './pages/Tariffs'
 import Purchases from './pages/Purchases'
 import Receipts from './pages/Receipts'
 import Sales from './pages/Sales'
@@ -32,6 +33,7 @@ export default function App() {
           <Route path="suppliers" element={<Suppliers />} />
           <Route path="markings" element={<Markings />} />
           <Route path="products" element={<Products />} />
+          <Route path="tariffs" element={<Tariffs />} />
           <Route path="purchases" element={<Purchases />} />
           <Route path="receipts" element={<Receipts />} />
           <Route path="sales" element={<Sales />} />

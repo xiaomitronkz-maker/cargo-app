@@ -1,12 +1,28 @@
 import { useEffect, useState } from 'react'
 import Modal from '../components/Modal'
 import api from '../api'
-import { formatDate } from '../utils/data'
+import { formatDate, normalizeArray, toNumber } from '../utils/data'
 
 const fmtNum = (n, digits = 2) => (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 const fmtMoney = (n) => '$' + fmtNum(n, 2)
 const emptyItem = () => ({ product_id: '', weight: '', quantity: '', cost_almaty: '', cost_dubai: '', note: '' })
-const itemTotalCost = (item) => ((+item.weight || 0) * (+item.cost_dubai || 0)) + ((+item.quantity || 0) * (+item.cost_almaty || 0))
+const itemTotalCost = (item) => item.total_cost != null && +item.total_cost > 0
+  ? +item.total_cost
+  : ((+item.weight || 0) * (+item.cost_dubai || 0)) + ((+item.quantity || 0) * (+item.cost_almaty || 0))
+const today = () => new Date().toISOString().slice(0, 10)
+const IMPORT_EMPTY = { url: '', date_from: today(), date_to: today(), supplier_id: '', mode: 'receipt_only' }
+const STATUS_LABELS = {
+  ready: 'Готово',
+  marking_not_found: 'Маркировка не найдена',
+  already_imported: 'Уже импортировано',
+  partial: 'Частично',
+}
+const statusBadge = (status) => {
+  if (status === 'ready') return 'badge-success'
+  if (status === 'already_imported') return 'badge-neutral'
+  if (status === 'partial') return 'badge-warning'
+  return 'badge-danger'
+}
 
 export default function Receipts() {
   const [receipts, setReceipts] = useState([])
@@ -23,6 +39,13 @@ export default function Receipts() {
   const [detailsLoading, setDetailsLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [importOpen, setImportOpen] = useState(false)
+  const [importForm, setImportForm] = useState(IMPORT_EMPTY)
+  const [importPreview, setImportPreview] = useState(null)
+  const [importResult, setImportResult] = useState(null)
+  const [importError, setImportError] = useState('')
+  const [importLoading, setImportLoading] = useState(false)
+  const [importCommitting, setImportCommitting] = useState(false)
 
   const load = () => {
     setLoading(true)
@@ -33,10 +56,10 @@ export default function Receipts() {
     load()
     Promise.all([api.getSuppliers(), api.getClients(), api.getProducts(), api.getMarkings()])
       .then(([suppliersData, clientsData, productsData, markingsData]) => {
-        setSuppliers(suppliersData)
-        setClients(clientsData)
-        setProducts(productsData)
-        setMarkings(markingsData)
+        setSuppliers(normalizeArray(suppliersData))
+        setClients(normalizeArray(clientsData))
+        setProducts(normalizeArray(productsData))
+        setMarkings(normalizeArray(markingsData))
       })
   }, [])
 
@@ -87,6 +110,8 @@ export default function Receipts() {
         quantity: item.quantity || '',
         cost_almaty: item.cost_almaty || '',
         cost_dubai: item.cost_dubai || '',
+        ala_unit: item.ala_unit || '',
+        class_code: item.class_code || '',
         note: item.note || '',
       })))
     } finally {
@@ -134,6 +159,78 @@ export default function Receipts() {
     }
   }
 
+  const openImport = () => {
+    setImportForm(f => ({ ...IMPORT_EMPTY, supplier_id: f.supplier_id || '' }))
+    setImportPreview(null)
+    setImportResult(null)
+    setImportError('')
+    setImportOpen(true)
+  }
+
+  const loadImportPreview = async () => {
+    setImportLoading(true)
+    setImportError('')
+    setImportResult(null)
+    try {
+      const data = await api.previewGoogleSheetsImport({
+        url: importForm.url,
+        date_from: importForm.date_from,
+        date_to: importForm.date_to,
+      })
+      setImportPreview(data)
+    } catch (e) {
+      setImportPreview(null)
+      setImportError(e.message || 'Не удалось загрузить данные')
+    } finally {
+      setImportLoading(false)
+    }
+  }
+
+  const commitImport = async () => {
+    const rows = normalizeArray(importPreview?.rows)
+    if (!importForm.supplier_id) {
+      setImportError('Выберите поставщика')
+      return
+    }
+    if (rows.some(row => row.status === 'marking_not_found')) {
+      setImportError('Есть строки без найденной маркировки')
+      return
+    }
+    setImportCommitting(true)
+    setImportError('')
+    try {
+      const result = await api.commitGoogleSheetsImport({
+        supplier_id: importForm.supplier_id,
+        mode: importForm.mode,
+        rows,
+      })
+      setImportResult(result)
+      await load()
+    } catch (e) {
+      setImportError(e.message || 'Не удалось создать приходы')
+    } finally {
+      setImportCommitting(false)
+    }
+  }
+
+  const previewRows = normalizeArray(importPreview?.rows)
+  const previewGroups = normalizeArray(importPreview?.groups)
+  const hasMarkingProblems = previewRows.some(row => row.status === 'marking_not_found')
+  const hasReadyRows = previewRows.some(row => row.status === 'ready')
+  const formItemTotalCost = (item) => {
+    const product = products.find(p => String(p.id) === String(item.product_id))
+    const productName = String(product?.name || '').toLowerCase()
+    const isPhone = productName.includes('iphone') ||
+      productName.includes('айфон') ||
+      productName.includes('smartphone') ||
+      productName.includes('телефон') ||
+      /(^|[^a-z0-9])phone([^a-z0-9]|$)/i.test(productName)
+    const weight = toNumber(item.weight)
+    const quantity = toNumber(item.quantity)
+    const alaBase = isPhone ? quantity : weight
+    return (weight * toNumber(item.cost_dubai)) + (alaBase * toNumber(item.cost_almaty))
+  }
+
   return (
     <div className="page">
       <div className="page-header">
@@ -142,6 +239,7 @@ export default function Receipts() {
           <div className="page-subtitle">{receipts.length} документов</div>
         </div>
         <div className="td-actions">
+          <button className="btn btn-secondary" onClick={openImport}>Импорт из Google Sheets</button>
           <button className="btn btn-primary" onClick={openCreate}>+ Добавить приход</button>
           <button className="btn btn-secondary" onClick={load}>Обновить</button>
         </div>
@@ -230,7 +328,8 @@ export default function Receipts() {
                   <th>Количество</th>
                   <th>Вес</th>
                   <th>Дубай $/кг</th>
-                  <th>Алматы $/шт</th>
+                  <th>ALA тариф</th>
+                  <th>ALA ед.</th>
                   <th>Итого себест.</th>
                   <th>Заметка</th>
                 </tr>
@@ -243,6 +342,7 @@ export default function Receipts() {
                     <td className="td-mono">{fmtNum(item.weight, 3)} кг</td>
                     <td className="td-mono">{fmtMoney(item.cost_dubai)}</td>
                     <td className="td-mono">{fmtMoney(item.cost_almaty)}</td>
+                    <td><span className="badge badge-neutral">{item.ala_unit === 'pcs' ? 'шт' : 'кг'}</span></td>
                     <td><span className="badge badge-warning">{fmtMoney(itemTotalCost(item))}</span></td>
                     <td className="td-muted">{item.note || '—'}</td>
                   </tr>
@@ -325,18 +425,18 @@ export default function Receipts() {
               </div>
               <div className="form-row">
                 <div className="form-group">
-                  <label className="form-label">Алматы $/шт</label>
+                  <label className="form-label">ALA тариф</label>
                   <input type="number" min="0" step="0.01" className="form-input" value={item.cost_almaty} onChange={e => setItemF(index, 'cost_almaty', e.target.value)} />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Дубай $/кг</label>
+                  <label className="form-label">DXB $/кг</label>
                   <input type="number" min="0" step="0.01" className="form-input" value={item.cost_dubai} onChange={e => setItemF(index, 'cost_dubai', e.target.value)} />
                 </div>
               </div>
               <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
                 <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Итого себестоимость</span>
                 <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--warning)', fontFamily: 'monospace', marginLeft: 8 }}>
-                  {fmtMoney(itemTotalCost(item))}
+                  {fmtMoney(formItemTotalCost(item))}
                 </span>
               </div>
               <div className="form-group">
@@ -346,6 +446,175 @@ export default function Receipts() {
             </div>
           ))}
           <button type="button" className="btn btn-secondary" onClick={addItem}>+ Добавить товар</button>
+        </Modal>
+      )}
+
+      {importOpen && (
+        <Modal
+          wide
+          title="Импорт из Google Sheets"
+          onClose={() => setImportOpen(false)}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={() => setImportOpen(false)}>Закрыть</button>
+              <button
+                className="btn btn-primary"
+                onClick={commitImport}
+                disabled={importCommitting || hasMarkingProblems || !hasReadyRows}
+              >
+                {importCommitting ? 'Создание...' : 'Создать приходы'}
+              </button>
+            </>
+          }
+        >
+          {importError && <div className="alert alert-error">{importError}</div>}
+          {importResult && (
+            <div className="alert alert-success">
+              Создано приходов: {importResult.created_receipts || 0} · импортировано строк: {importResult.imported_rows || 0} · пропущено дублей: {importResult.skipped_rows || 0}
+            </div>
+          )}
+
+          <div className="form-group">
+            <label className="form-label">Ссылка на Google Sheet</label>
+            <input className="form-input" value={importForm.url} onChange={e => setImportForm(f => ({ ...f, url: e.target.value }))} placeholder="https://docs.google.com/spreadsheets/d/..." />
+          </div>
+          <div className="form-row">
+            <div className="form-group">
+              <label className="form-label">Дата с</label>
+              <input type="date" className="form-input" value={importForm.date_from} onChange={e => setImportForm(f => ({ ...f, date_from: e.target.value }))} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Дата по</label>
+              <input type="date" className="form-input" value={importForm.date_to} onChange={e => setImportForm(f => ({ ...f, date_to: e.target.value }))} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Поставщик</label>
+              <select className="form-select" value={importForm.supplier_id} onChange={e => setImportForm(f => ({ ...f, supplier_id: e.target.value }))}>
+                <option value="">— Выберите поставщика —</option>
+                {suppliers.map(supplier => <option key={supplier.id} value={String(supplier.id)}>{supplier.name}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Режим</label>
+              <select className="form-select" value={importForm.mode} onChange={e => setImportForm(f => ({ ...f, mode: e.target.value }))}>
+                <option value="receipt_only">Только приход</option>
+                <option value="receipt_and_sale" disabled>Приход + реализация — следующий этап</option>
+              </select>
+            </div>
+          </div>
+          <button className="btn btn-secondary" onClick={loadImportPreview} disabled={importLoading}>
+            {importLoading ? 'Загрузка...' : 'Загрузить данные'}
+          </button>
+
+          {importPreview && (
+            <>
+              <div className="stat-grid" style={{ marginTop: 16 }}>
+                <div className="stat-card">
+                  <div className="stat-label">Строк</div>
+                  <div className="stat-value">{importPreview.summary?.rows_count || 0}</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Готово</div>
+                  <div className="stat-value positive">{importPreview.summary?.ready_count || 0}</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Уже импортировано</div>
+                  <div className="stat-value">{importPreview.summary?.already_imported_count || 0}</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Проблемы</div>
+                  <div className={`stat-value ${hasMarkingProblems ? 'negative' : 'positive'}`}>{importPreview.summary?.marking_not_found_count || 0}</div>
+                </div>
+              </div>
+
+              <div style={{ fontWeight: 700, margin: '18px 0 10px' }}>Сводка будущих приходов</div>
+              <div className="table-wrapper">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Дата</th>
+                      <th>Маркировка</th>
+                      <th>Клиент</th>
+                      <th>Строк</th>
+                      <th>Вес</th>
+                      <th>Кол-во</th>
+                      <th>Себестоимость app</th>
+                      <th>Статус</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {previewGroups.map(group => (
+                      <tr key={`${group.date}-${group.marking}`}>
+                        <td className="td-date">{formatDate(group.date)}</td>
+                        <td>{group.marking}</td>
+                        <td>{group.client_name || '—'}</td>
+                        <td className="td-mono">{group.items_count}</td>
+                        <td className="td-mono">{fmtNum(group.total_weight, 3)} кг</td>
+                        <td className="td-mono">{fmtNum(group.total_quantity, 0)} шт</td>
+                        <td><span className="badge badge-warning">{fmtMoney(group.app_total)}</span></td>
+                        <td><span className={`badge ${statusBadge(group.status)}`}>{STATUS_LABELS[group.status] || group.status}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{ fontWeight: 700, margin: '18px 0 10px' }}>Строки из Google Sheets</div>
+              <div className="table-wrapper">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Дата</th>
+                      <th>Маркировка</th>
+                      <th>Клиент</th>
+                      <th>Товар</th>
+                      <th>PCS</th>
+                      <th>KG</th>
+                      <th>CLASS</th>
+                      <th>Тариф</th>
+                      <th>DXB $/кг</th>
+                      <th>ALA</th>
+                      <th>ALA ед.</th>
+                      <th>Себест. app</th>
+                      <th>TOTAL sheet</th>
+                      <th>Статус</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {previewRows.map(row => (
+                      <tr key={`${row.spreadsheet_id}-${row.gid}-${row.source_row}`}>
+                        <td className="td-date">{formatDate(row.date)}</td>
+                        <td>{row.marking}</td>
+                        <td>{row.client_name || '—'}</td>
+                        <td>{row.product_name}</td>
+                        <td className="td-mono">{fmtNum(row.quantity_pcs, 0)}</td>
+                        <td className="td-mono">{fmtNum(row.weight_kg, 3)}</td>
+                        <td>{row.class || '—'}</td>
+                        <td>{row.tariff_name}</td>
+                        <td className="td-mono">
+                          <div>{fmtMoney(row.app_dxb_rate)}</div>
+                          <div className="td-muted" style={{ fontSize: 11 }}>sheet: {fmtMoney(row.sheet_dxb_rate)}</div>
+                        </td>
+                        <td className="td-mono">
+                          <div>{fmtMoney(row.app_ala_rate)}</div>
+                          <div className="td-muted" style={{ fontSize: 11 }}>sheet: {fmtMoney(row.sheet_ala_rate)}</div>
+                        </td>
+                        <td><span className="badge badge-neutral">{row.app_ala_unit === 'pcs' ? 'шт' : 'кг'}</span></td>
+                        <td><span className="badge badge-warning">{fmtMoney(row.app_total)}</span></td>
+                        <td className="td-mono">{fmtMoney(row.sheet_total)}</td>
+                        <td>
+                          <span className={`badge ${statusBadge(row.status)}`}>{STATUS_LABELS[row.status] || row.status}</span>
+                          {normalizeArray(row.warnings).map(warning => (
+                            <div key={warning} className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>{warning}</div>
+                          ))}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
         </Modal>
       )}
     </div>

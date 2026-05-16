@@ -11,6 +11,7 @@ const NAV = [
     { path: '/suppliers', icon: '◌', label: 'Поставщики' },
     { path: '/markings', icon: '◈', label: 'Маркировки' },
     { path: '/products', icon: '▣', label: 'Товары' },
+    { path: '/tariffs', icon: '≋', label: 'Тарифы' },
   ]},
   { section: 'Учёт', items: [
     { path: '/receipts', icon: '📄', label: 'Приходы' },

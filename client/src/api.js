@@ -46,6 +46,12 @@ const api = {
   updateProduct: (id, data) => api.put(`/products/${id}`, data),
   deleteProduct: (id) => api.del(`/products/${id}`),
 
+  // Tariffs
+  getTariffs: () => api.get('/tariffs'),
+  createTariff: (data) => api.post('/tariffs', data),
+  updateTariff: (id, data) => api.put(`/tariffs/${id}`, data),
+  deleteTariff: (id) => api.del(`/tariffs/${id}`),
+
   // Purchases
   getPurchases: (filters = {}) => {
     const q = new URLSearchParams(filters).toString()
@@ -57,6 +63,8 @@ const api = {
   createReceipt: (data) => api.post('/receipts', data),
   updateReceipt: (id, data) => api.put(`/receipts/${id}`, data),
   deleteReceipt: (id) => api.del(`/receipts/${id}`),
+  previewGoogleSheetsImport: (data) => api.post('/import/google-sheets/preview', data),
+  commitGoogleSheetsImport: (data) => api.post('/import/google-sheets/commit', data),
   updatePurchase: (id, data) => api.put(`/purchases/${id}`, data),
   deletePurchase: (id) => api.del(`/purchases/${id}`),
 
