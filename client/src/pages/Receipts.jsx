@@ -9,6 +9,11 @@ const emptyItem = () => ({ product_id: '', weight: '', quantity: '', cost_almaty
 const itemTotalCost = (item) => item.total_cost != null && +item.total_cost > 0
   ? +item.total_cost
   : ((+item.weight || 0) * (+item.cost_dubai || 0)) + ((+item.quantity || 0) * (+item.cost_almaty || 0))
+const receiptTotalCost = (receipt) => {
+  const apiTotal = toNumber(receipt?.total_cost ?? receipt?.total_amount ?? receipt?.total_sum)
+  if (apiTotal) return apiTotal
+  return normalizeArray(receipt?.items).reduce((sum, item) => sum + itemTotalCost(item), 0)
+}
 const today = () => new Date().toISOString().slice(0, 10)
 const IMPORT_EMPTY = { url: '', date_from: today(), date_to: today(), supplier_id: '', mode: 'receipt_only' }
 const STATUS_LABELS = {
@@ -255,12 +260,13 @@ export default function Receipts() {
                 <th>Клиент</th>
                 <th>Товаров</th>
                 <th>Вес</th>
+                <th>Сумма</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
               {receipts.length === 0 && (
-                <tr><td colSpan={6}>
+                <tr><td colSpan={7}>
                   <div className="empty-state"><p>Документов прихода нет</p></div>
                 </td></tr>
               )}
@@ -271,6 +277,7 @@ export default function Receipts() {
                   <td>{receipt.client_name || '—'}</td>
                   <td className="td-mono">{receipt.items_count || 0}</td>
                   <td className="td-mono">{fmtNum(receipt.total_weight, 3)} кг</td>
+                  <td><span className="badge badge-warning">{fmtMoney(receiptTotalCost(receipt))}</span></td>
                   <td>
                     <div className="td-actions">
                       <button className="btn btn-primary btn-sm" onClick={() => openReceipt(receipt)} disabled={detailsLoading}>
@@ -349,6 +356,12 @@ export default function Receipts() {
                 ))}
               </tbody>
             </table>
+          </div>
+          <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px', marginTop: 14 }}>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Итого приход</span>
+            <span style={{ fontSize: 16, fontWeight: 800, color: 'var(--warning)', fontFamily: 'monospace', marginLeft: 8 }}>
+              {fmtMoney(receiptTotalCost(selected))}
+            </span>
           </div>
         </Modal>
       )}

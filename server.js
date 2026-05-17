@@ -1713,7 +1713,7 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
 
 // Receipts
 app.get('/api/receipts', async (req, res) => {
-  res.json(await all(`
+  const receipts = await all(`
     SELECT
       r.id,
       r.date,
@@ -1721,20 +1721,41 @@ app.get('/api/receipts', async (req, res) => {
       c.name AS client_name,
       COUNT(ri.id)::int AS items_count,
       COALESCE(SUM(ri.weight::numeric),0) AS total_weight,
-      COALESCE(SUM(ri.quantity::numeric),0) AS total_quantity
+      COALESCE(SUM(ri.quantity::numeric),0) AS total_quantity,
+      COALESCE(
+        NULLIF((SELECT COALESCE(SUM(p.total_cost::numeric),0) FROM purchases p WHERE p.receipt_id = r.id),0),
+        (SELECT COALESCE(SUM(ri2.total_cost::numeric),0) FROM receipt_items ri2 WHERE ri2.receipt_id = r.id),
+        0
+      ) AS total_cost
     FROM receipts r
     LEFT JOIN suppliers s ON s.id = r.supplier_id
     LEFT JOIN clients c ON c.id = r.client_id
     LEFT JOIN receipt_items ri ON ri.receipt_id = r.id
     GROUP BY r.id, r.date, s.name, c.name, r.created_at
     ORDER BY r.date DESC, r.created_at DESC
-  `));
+  `);
+  res.json(receipts.map((receipt) => ({
+    ...receipt,
+    items_count: +receipt.items_count || 0,
+    total_weight: +receipt.total_weight || 0,
+    total_quantity: +receipt.total_quantity || 0,
+    total_cost: +receipt.total_cost || 0,
+  })));
 });
 
 app.get('/api/receipts/:id', async (req, res) => {
   const id = +req.params.id;
   const receipt = await get(`
-    SELECT r.*, s.name AS supplier_name, c.name AS client_name, m.marking
+    SELECT
+      r.*,
+      s.name AS supplier_name,
+      c.name AS client_name,
+      m.marking,
+      COALESCE(
+        NULLIF((SELECT COALESCE(SUM(p.total_cost::numeric),0) FROM purchases p WHERE p.receipt_id = r.id),0),
+        (SELECT COALESCE(SUM(ri.total_cost::numeric),0) FROM receipt_items ri WHERE ri.receipt_id = r.id),
+        0
+      ) AS total_cost
     FROM receipts r
     LEFT JOIN suppliers s ON s.id = r.supplier_id
     LEFT JOIN clients c ON c.id = r.client_id
@@ -1743,13 +1764,37 @@ app.get('/api/receipts/:id', async (req, res) => {
   `, [id]);
   if (!receipt) return res.status(404).json({ error: 'Приход не найден' });
   const items = await all(`
-    SELECT ri.*, p.name AS product_name
+    SELECT
+      ri.*,
+      p.name AS product_name,
+      COALESCE(
+        NULLIF(ri.total_cost::numeric,0),
+        (COALESCE(ri.weight::numeric,0) * COALESCE(ri.cost_dubai::numeric,0))
+          + (
+            CASE WHEN ri.ala_unit = 'pcs'
+              THEN COALESCE(ri.quantity::numeric,0)
+              ELSE COALESCE(ri.weight::numeric,0)
+            END * COALESCE(ri.cost_almaty::numeric,0)
+          ),
+        0
+      ) AS total_cost
     FROM receipt_items ri
     LEFT JOIN products p ON p.id = ri.product_id
     WHERE ri.receipt_id=$1
     ORDER BY ri.id
   `, [id]);
-  res.json({ ...receipt, items });
+  res.json({
+    ...receipt,
+    total_cost: +receipt.total_cost || 0,
+    items: items.map((item) => ({
+      ...item,
+      weight: +item.weight || 0,
+      quantity: +item.quantity || 0,
+      cost_almaty: +item.cost_almaty || 0,
+      cost_dubai: +item.cost_dubai || 0,
+      total_cost: +item.total_cost || 0,
+    })),
+  });
 });
 
 app.post('/api/receipts', async (req, res) => {
