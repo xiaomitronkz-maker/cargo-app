@@ -330,6 +330,8 @@ async function initDb() {
         ('Телефоны', 'phone,iphone,айфон,телефон,smartphone', NULL, 5.5, 3, 'pcs', FALSE, TRUE)
     `);
   }
+
+  await cleanupOrphanImportRecords();
 }
 
 async function resolveClientMarking(clientId, markingId, client = pool) {
@@ -606,6 +608,17 @@ async function findOrCreateProductByName(productName, client = pool) {
   const existing = await get('SELECT id,name FROM products WHERE lower(name)=lower($1) LIMIT 1', [name], client);
   if (existing) return existing;
   return get('INSERT INTO products(name,is_active) VALUES($1,TRUE) RETURNING id,name', [name], client);
+}
+
+async function cleanupOrphanImportRecords(client = pool) {
+  return all(`
+    DELETE FROM import_records ir
+    WHERE ir.receipt_id IS NULL
+       OR NOT EXISTS (
+         SELECT 1 FROM receipts r WHERE r.id = ir.receipt_id
+       )
+    RETURNING spreadsheet_id,gid,source_row
+  `, [], client);
 }
 
 async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
@@ -1483,6 +1496,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     const csv = await response.text();
     if (/^\s*</.test(csv)) throw new Error('Google Sheet не отдал CSV. Проверьте, что файл доступен по ссылке.');
 
+    const cleanedImportRecords = await cleanupOrphanImportRecords();
     const tariffs = await all('SELECT * FROM tariffs WHERE is_active=TRUE ORDER BY is_default DESC, name');
     const markings = await all(`
       SELECT m.id,m.marking,m.client_id,c.name AS client_name
@@ -1491,11 +1505,21 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     `);
     const products = await all('SELECT id,name FROM products');
     const imported = await all(
-      'SELECT source_row FROM import_records WHERE source_type=$1 AND spreadsheet_id=$2 AND gid=$3',
+      `
+        SELECT ir.source_row
+        FROM import_records ir
+        JOIN receipts r ON r.id = ir.receipt_id
+        WHERE ir.source_type=$1
+          AND ir.spreadsheet_id=$2
+          AND ir.gid=$3
+      `,
       ['google_sheets', spreadsheetId, gid]
     );
     const sourceRowOffset = sheetRangeStartRow(range) - 1;
     const importedRows = new Set(imported.map((row) => +row.source_row));
+    const deletedReceiptRows = new Set(cleanedImportRecords
+      .filter((row) => row.spreadsheet_id === spreadsheetId && String(row.gid || '0') === String(gid || '0'))
+      .map((row) => +row.source_row));
     const markingByName = new Map(markings.map((marking) => [normalizeText(marking.marking), marking]));
     const productByName = new Map(products.map((product) => [normalizeText(product.name), product]));
 
@@ -1537,12 +1561,13 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       const sheetCreditAla = parseSheetNumber(sheetRow[headerMap.creditAla]);
       const sheetTotal = parseSheetNumber(sheetRow[headerMap.total]);
       const warnings = [];
+      const sourceRow = sourceRowOffset + rowIndex + 1;
       if (!product) warnings.push('Товар будет создан при импорте');
+      if (deletedReceiptRows.has(sourceRow)) warnings.push('Ранее импортировалось, но приход был удалён');
       if (sheetTotal && Math.abs(sheetTotal - cost.totalCost) > 0.01) warnings.push('TOTAL в таблице отличается от расчёта приложения');
 
       let status = 'ready';
       if (!marking) status = 'marking_not_found';
-      const sourceRow = sourceRowOffset + rowIndex + 1;
       if (importedRows.has(sourceRow)) status = 'already_imported';
 
       rows.push({
@@ -1634,16 +1659,18 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
 
   try {
     const result = await withTx(async (client) => {
+      await cleanupOrphanImportRecords(client);
       const groups = new Map();
       let skippedRows = 0;
       for (const row of rows) {
-        if (row.status === 'already_imported') {
-          skippedRows += 1;
-          continue;
-        }
         const existing = await get(`
-          SELECT id FROM import_records
-          WHERE source_type=$1 AND spreadsheet_id=$2 AND gid=$3 AND source_row=$4
+          SELECT ir.id
+          FROM import_records ir
+          JOIN receipts r ON r.id = ir.receipt_id
+          WHERE ir.source_type=$1
+            AND ir.spreadsheet_id=$2
+            AND ir.gid=$3
+            AND ir.source_row=$4
         `, ['google_sheets', row.spreadsheet_id, row.gid || '0', +row.source_row], client);
         if (existing) {
           skippedRows += 1;
@@ -1963,6 +1990,7 @@ app.delete('/api/receipts/:id', async (req, res) => {
            OR transaction_id = ANY($2::int[])
       `, [purchaseIds, transactionIds], client);
       await query('DELETE FROM transactions WHERE id = ANY($1::int[])', [transactionIds], client);
+      await query('DELETE FROM import_records WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM purchases WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM receipt_items WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM receipts WHERE id=$1', [id], client);
