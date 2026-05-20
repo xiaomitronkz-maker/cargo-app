@@ -25,13 +25,13 @@ function verifyGitHubSignature(rawBody, signature) {
   if (!WEBHOOK_SECRET) return false;
   if (!signature || !signature.startsWith('sha256=')) return false;
 
-  const expected = `sha256=${crypto
+  const expected = 'sha256=' + crypto
     .createHmac('sha256', WEBHOOK_SECRET)
     .update(rawBody)
-    .digest('hex')}`;
+    .digest('hex');
 
-  const signatureBuffer = Buffer.from(signature, 'utf8');
   const expectedBuffer = Buffer.from(expected, 'utf8');
+  const signatureBuffer = Buffer.from(signature, 'utf8');
 
   return signatureBuffer.length === expectedBuffer.length
     && crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
@@ -107,7 +107,7 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'cargo-deploy-webhook' });
 });
 
-app.post('/github-webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+app.post('/github-webhook', express.raw({ type: 'application/json', limit: '1mb' }), (req, res) => {
   log('webhook received', {
     event: req.get('x-github-event') || null,
     delivery: req.get('x-github-delivery') || null,
@@ -126,9 +126,21 @@ app.post('/github-webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, re
     return res.status(401).json({ ok: false, error: 'Invalid signature' });
   }
 
+  let payload;
+  try {
+    payload = JSON.parse(req.body.toString('utf8'));
+  } catch (error) {
+    console.error('[deploy-webhook] invalid JSON payload:', error.message);
+    return res.status(400).json({ ok: false, error: 'Invalid JSON payload' });
+  }
+
   const event = req.get('x-github-event');
   if (event && event !== 'push') {
     return res.status(202).json({ ok: true, message: `ignored ${event}` });
+  }
+
+  if (!payload || !payload.repository) {
+    return res.status(202).json({ ok: true, message: 'ignored empty payload' });
   }
 
   if (deployRunning) {
