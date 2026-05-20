@@ -3313,11 +3313,12 @@ app.post('/api/ai/command', async (req, res) => {
   });
 });
 
-const dist = process.env.CLIENT_DIST || path.join(__dirname, 'client', 'dist');
+const dist = path.join(__dirname, 'client', 'dist');
+console.log('Serving frontend from:', dist);
 
 app.use(express.static(dist));
 
-app.get('*', (req, res, next) => {
+app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   res.sendFile(path.join(dist, 'index.html'));
 });
