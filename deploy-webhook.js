@@ -1,32 +1,47 @@
 'use strict';
 
+require('dotenv').config();
+
+const crypto = require('crypto');
 const express = require('express');
-const path = require('path');
 const { spawn } = require('child_process');
 
 const app = express();
-const PORT = process.env.WEBHOOK_PORT || 9001;
-const DEPLOY_PATH = process.env.DEPLOY_PATH || '/root/cargo-app';
-const CLIENT_PATH = path.join(DEPLOY_PATH, 'client');
-const PM2_APP_NAME = process.env.PM2_APP_NAME || 'cargo';
+const PORT = process.env.WEBHOOK_PORT || 9000;
+const APP_DIR = process.env.APP_DIR || __dirname;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
-let deploying = false;
-
-app.use(express.json({ limit: '1mb' }));
+let deployRunning = false;
 
 function log(message, details) {
   if (details) {
-    console.log(`[deploy] ${message}`, details);
+    console.log(`[deploy-webhook] ${message}`, details);
     return;
   }
-  console.log(`[deploy] ${message}`);
+  console.log(`[deploy-webhook] ${message}`);
 }
 
-function runStep(label, command, args, cwd) {
+function verifyGitHubSignature(rawBody, signature) {
+  if (!WEBHOOK_SECRET) return false;
+  if (!signature || !signature.startsWith('sha256=')) return false;
+
+  const expected = `sha256=${crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest('hex')}`;
+
+  const signatureBuffer = Buffer.from(signature, 'utf8');
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+
+  return signatureBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+function runStep(label, command, args) {
   return new Promise((resolve, reject) => {
     log(`${label} started`);
 
-    const child = spawn(command, args, { cwd });
+    const child = spawn(command, args, { cwd: APP_DIR });
     let stdout = '';
     let stderr = '';
 
@@ -39,16 +54,16 @@ function runStep(label, command, args, cwd) {
     });
 
     child.on('error', (error) => {
-      console.error(`[deploy] ${label} failed to start`, error);
+      console.error(`[deploy-webhook] ${label} failed to start:`, error);
       reject(error);
     });
 
     child.on('close', (code) => {
       if (code !== 0) {
-        console.error(`[deploy] ${label} failed`, {
+        console.error(`[deploy-webhook] ${label} failed`, {
           code,
-          stderr: stderr.trim(),
           stdout: stdout.trim(),
+          stderr: stderr.trim(),
         });
         reject(new Error(`${label} failed with code ${code}`));
         return;
@@ -63,61 +78,71 @@ function runStep(label, command, args, cwd) {
 }
 
 async function deploy() {
-  log('deploy started');
-  await runStep('git pull', 'git', ['pull', '--ff-only'], DEPLOY_PATH);
-  await runStep('backend npm install', 'npm', ['install'], DEPLOY_PATH);
-  await runStep('client npm install', 'npm', ['install'], CLIENT_PATH);
-  await runStep('client build', 'npm', ['run', 'build'], CLIENT_PATH);
-  await runStep('pm2 restart', 'pm2', ['restart', PM2_APP_NAME, '--update-env'], DEPLOY_PATH);
+  log('deploy started', { appDir: APP_DIR });
+  await runStep('git pull', 'git', ['pull', '--ff-only']);
+  await runStep('npm install', 'npm', ['install']);
+  await runStep('client build', 'npm', ['run', 'build', '--prefix', 'client']);
+  await runStep('pm2 restart', 'pm2', ['restart', 'cargo', '--update-env']);
   log('deploy finished');
 }
 
 function startDeployInBackground() {
-  deploying = true;
-  deploy()
-    .catch((error) => {
-      console.error('[deploy] deploy failed', error);
-    })
-    .finally(() => {
-      deploying = false;
-    });
+  if (deployRunning) return false;
+
+  deployRunning = true;
+  setImmediate(() => {
+    deploy()
+      .catch((error) => {
+        console.error('[deploy-webhook] deploy failed:', error);
+      })
+      .finally(() => {
+        deployRunning = false;
+      });
+  });
+
+  return true;
 }
 
-async function webhookHandler(req, res) {
+app.get('/health', (req, res) => {
+  res.json({ ok: true, service: 'cargo-deploy-webhook' });
+});
+
+app.post('/github-webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
   log('webhook received', {
-    event: req.get('x-github-event') || 'manual',
+    event: req.get('x-github-event') || null,
     delivery: req.get('x-github-delivery') || null,
   });
 
-  const event = req.get('x-github-event');
-  if (event === 'ping') {
-    return res.json({ ok: true, message: 'pong' });
-  }
-  if (event && event !== 'push') {
-    return res.json({ ok: true, message: `ignored ${event}` });
+  if (!WEBHOOK_SECRET) {
+    console.error('[deploy-webhook] WEBHOOK_SECRET is not set');
+    return res.status(500).json({ ok: false, error: 'WEBHOOK_SECRET is not configured' });
   }
 
-  if (deploying) {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+  const signature = req.get('x-hub-signature-256') || '';
+
+  if (!verifyGitHubSignature(rawBody, signature)) {
+    console.error('[deploy-webhook] invalid GitHub signature');
+    return res.status(401).json({ ok: false, error: 'Invalid signature' });
+  }
+
+  const event = req.get('x-github-event');
+  if (event && event !== 'push') {
+    return res.status(202).json({ ok: true, message: `ignored ${event}` });
+  }
+
+  if (deployRunning) {
     return res.status(202).json({ ok: true, message: 'deploy already running' });
   }
 
   startDeployInBackground();
   return res.status(202).json({ ok: true, message: 'deploy started' });
-}
-
-app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'cargo-app deploy webhook' });
 });
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'deploy-webhook' });
-});
-
-app.post('/webhook', webhookHandler);
-app.post('/github-webhook', webhookHandler);
 
 app.listen(PORT, '0.0.0.0', () => {
-  log(`webhook server listening on http://0.0.0.0:${PORT}`);
-  log(`deploy path: ${DEPLOY_PATH}`);
-  log(`pm2 app: ${PM2_APP_NAME}`);
+  log(`webhook started on http://0.0.0.0:${PORT}`);
+  log('configuration', {
+    appDir: APP_DIR,
+    hasSecret: Boolean(WEBHOOK_SECRET),
+  });
 });
