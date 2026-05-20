@@ -12,7 +12,6 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
-const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -3314,16 +3313,14 @@ app.post('/api/ai/command', async (req, res) => {
   });
 });
 
-const dist = process.env.CLIENT_DIST || '/root/cargo-app/client/dist';
+const dist = process.env.CLIENT_DIST || path.join(__dirname, 'client', 'dist');
 
-if (fs.existsSync(dist)) {
-  app.use(express.static(dist));
+app.use(express.static(dist));
 
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api/')) return next();
-    res.sendFile(path.join(dist, 'index.html'));
-  });
-}
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api/')) return next();
+  res.sendFile(path.join(dist, 'index.html'));
+});
 
 async function connectDatabaseSafely() {
   if (!pool) {
