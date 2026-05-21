@@ -1,20 +1,36 @@
 import { useState, useEffect } from 'react'
 import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
-import { formatDate } from '../utils/data'
+import { formatDate, normalizeArray } from '../utils/data'
 
 const EMPTY = { name: '', phone: '', notes: '' }
+const IMPORT_STATUS_LABELS = {
+  new: 'Новый',
+  already_exists_client: 'Уже есть клиент',
+  already_exists_supplier: 'Уже есть поставщик',
+}
+const IMPORT_TYPE_LABELS = {
+  client: 'Клиент',
+  supplier: 'Поставщик',
+  skip: 'Пропустить',
+}
 
 export default function Clients() {
   const [clients, setClients] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
-  const [modal, setModal] = useState(null) // null | 'create' | 'edit' | 'markings' | 'delete'
+  const [modal, setModal] = useState(null) // null | 'create' | 'edit' | 'markings' | 'delete' | 'import'
   const [selected, setSelected] = useState(null)
   const [form, setForm] = useState(EMPTY)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const [clientDetail, setClientDetail] = useState(null)
+  const [importFile, setImportFile] = useState(null)
+  const [importItems, setImportItems] = useState([])
+  const [importSummary, setImportSummary] = useState(null)
+  const [importResult, setImportResult] = useState(null)
+  const [importLoading, setImportLoading] = useState(false)
+  const [importError, setImportError] = useState('')
 
   const load = () => api.getClients().then(setClients).finally(() => setLoading(false))
   useEffect(() => { load() }, [])
@@ -22,6 +38,14 @@ export default function Clients() {
   const openCreate = () => { setForm(EMPTY); setError(''); setModal('create') }
   const openEdit = (c) => { setSelected(c); setForm({ name: c.name, phone: c.phone || '', notes: c.notes || '' }); setError(''); setModal('edit') }
   const openDelete = (c) => { setSelected(c); setModal('delete') }
+  const openImport = () => {
+    setImportFile(null)
+    setImportItems([])
+    setImportSummary(null)
+    setImportResult(null)
+    setImportError('')
+    setModal('import')
+  }
   const openMarkings = (c) => {
     setSelected(c)
     api.getClient(c.id).then(setClientDetail)
@@ -43,6 +67,50 @@ export default function Clients() {
     catch (e) { setError(e.message) }
   }
 
+  const previewImport = async () => {
+    if (!importFile) {
+      setImportError('Выберите файл .mxl')
+      return
+    }
+    setImportLoading(true)
+    setImportError('')
+    setImportResult(null)
+    try {
+      const data = await api.previewCounterpartiesImport(importFile)
+      setImportSummary(data.summary || null)
+      setImportItems(normalizeArray(data.items).map(item => ({
+        ...item,
+        type: item.exists_as_client || item.exists_as_supplier ? 'skip' : item.suggested_type || 'client',
+      })))
+    } catch (e) {
+      setImportError(e.message || 'Не удалось прочитать файл')
+      setImportItems([])
+      setImportSummary(null)
+    } finally {
+      setImportLoading(false)
+    }
+  }
+
+  const commitImport = async () => {
+    setImportLoading(true)
+    setImportError('')
+    try {
+      const result = await api.commitCounterpartiesImport({
+        items: importItems.map(item => ({ name: item.name, type: item.type })),
+      })
+      setImportResult(result)
+      await load()
+    } catch (e) {
+      setImportError(e.message || 'Не удалось импортировать контрагентов')
+    } finally {
+      setImportLoading(false)
+    }
+  }
+
+  const setImportType = (index, type) => {
+    setImportItems(items => items.map((item, i) => i === index ? { ...item, type } : item))
+  }
+
   const filtered = clients.filter(c => c.name.toLowerCase().includes(search.toLowerCase()) || (c.phone || '').includes(search))
 
   return (
@@ -52,7 +120,10 @@ export default function Clients() {
           <div className="page-title">Клиенты</div>
           <div className="page-subtitle">{clients.length} клиентов в базе</div>
         </div>
-        <button className="btn btn-primary" onClick={openCreate}>+ Добавить клиента</button>
+        <div className="td-actions">
+          <button className="btn btn-secondary" onClick={openImport}>Импорт контрагентов</button>
+          <button className="btn btn-primary" onClick={openCreate}>+ Добавить клиента</button>
+        </div>
       </div>
 
       <div className="filters-bar">
@@ -147,6 +218,102 @@ export default function Clients() {
               {clientDetail.markings.map(m => (
                 <span key={m.id} className="badge badge-primary" style={{ fontSize: 13, padding: '5px 12px' }}>{m.marking}</span>
               ))}
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {modal === 'import' && (
+        <Modal
+          wide
+          title="Импорт контрагентов из 1C MXL"
+          onClose={() => setModal(null)}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={() => setModal(null)}>Закрыть</button>
+              <button className="btn btn-primary" onClick={commitImport} disabled={importLoading || importItems.length === 0}>
+                {importLoading ? 'Импорт...' : 'Импортировать'}
+              </button>
+            </>
+          }
+        >
+          {importError && <div className="alert alert-error">{importError}</div>}
+          {importResult && (
+            <div className="alert alert-success">
+              Создано клиентов: {importResult.created_clients || 0}, поставщиков: {importResult.created_suppliers || 0}, пропущено: {importResult.skipped || 0}
+            </div>
+          )}
+
+          <div className="form-group">
+            <label className="form-label">Файл 1C MXL</label>
+            <input
+              type="file"
+              className="form-input"
+              accept=".mxl,.MXL"
+              onChange={e => {
+                setImportFile(e.target.files?.[0] || null)
+                setImportItems([])
+                setImportSummary(null)
+                setImportResult(null)
+                setImportError('')
+              }}
+            />
+          </div>
+          <button className="btn btn-secondary" onClick={previewImport} disabled={importLoading}>
+            {importLoading ? 'Проверка...' : 'Загрузить и проверить'}
+          </button>
+
+          {importSummary && (
+            <div className="stat-grid" style={{ marginTop: 16 }}>
+              <div className="stat-card">
+                <div className="stat-label">Найдено</div>
+                <div className="stat-value">{importSummary.total || 0}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Новые</div>
+                <div className="stat-value positive">{importSummary.new || 0}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Дубли</div>
+                <div className="stat-value">{importSummary.duplicates || 0}</div>
+              </div>
+            </div>
+          )}
+
+          {importItems.length > 0 && (
+            <div className="table-wrapper" style={{ marginTop: 16 }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Название</th>
+                    <th>Есть в клиентах</th>
+                    <th>Есть в поставщиках</th>
+                    <th>Тип импорта</th>
+                    <th>Статус</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {importItems.map((item, index) => (
+                    <tr key={`${item.name}-${index}`}>
+                      <td style={{ fontWeight: 600 }}>{item.name}</td>
+                      <td>{item.exists_as_client ? <span className="badge badge-success">Да</span> : <span className="badge badge-neutral">Нет</span>}</td>
+                      <td>{item.exists_as_supplier ? <span className="badge badge-success">Да</span> : <span className="badge badge-neutral">Нет</span>}</td>
+                      <td>
+                        <select className="form-select" value={item.type} onChange={e => setImportType(index, e.target.value)}>
+                          <option value="client">{IMPORT_TYPE_LABELS.client}</option>
+                          <option value="supplier">{IMPORT_TYPE_LABELS.supplier}</option>
+                          <option value="skip">{IMPORT_TYPE_LABELS.skip}</option>
+                        </select>
+                      </td>
+                      <td>
+                        <span className={`badge ${item.status === 'new' ? 'badge-primary' : 'badge-neutral'}`}>
+                          {IMPORT_STATUS_LABELS[item.status] || item.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </Modal>

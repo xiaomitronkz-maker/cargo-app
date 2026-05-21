@@ -12,6 +12,16 @@ async function request(method, path, body) {
   return data
 }
 
+async function upload(path, formData) {
+  const res = await fetch(`/api${path}`, {
+    method: 'POST',
+    body: formData,
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`)
+  return data
+}
+
 const api = {
   get: (path, options) => {
     const q = options?.params ? new URLSearchParams(options.params).toString() : ''
@@ -27,6 +37,12 @@ const api = {
   createClient: (data) => api.post('/clients', data),
   updateClient: (id, data) => api.put(`/clients/${id}`, data),
   deleteClient: (id) => api.del(`/clients/${id}`),
+  previewCounterpartiesImport: (file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return upload('/import/counterparties/preview', formData)
+  },
+  commitCounterpartiesImport: (data) => api.post('/import/counterparties/commit', data),
 
   // Suppliers
   getSuppliers: () => api.get('/suppliers'),

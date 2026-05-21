@@ -609,6 +609,142 @@ async function findOrCreateProductByName(productName, client = pool) {
   return get('INSERT INTO products(name,is_active) VALUES($1,TRUE) RETURNING id,name', [name], client);
 }
 
+function normalizeCounterpartyName(value) {
+  return String(value || '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/[{}[\]"'<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function counterpartyKey(value) {
+  return normalizeCounterpartyName(value).toLowerCase();
+}
+
+function decodeWindows1251(buffer) {
+  const map = [
+    '\u0402', '\u0403', '\u201A', '\u0453', '\u201E', '\u2026', '\u2020', '\u2021',
+    '\u20AC', '\u2030', '\u0409', '\u2039', '\u040A', '\u040C', '\u040B', '\u040F',
+    '\u0452', '\u2018', '\u2019', '\u201C', '\u201D', '\u2022', '\u2013', '\u2014',
+    '\u0098', '\u2122', '\u0459', '\u203A', '\u045A', '\u045C', '\u045B', '\u045F',
+    '\u00A0', '\u040E', '\u045E', '\u0408', '\u00A4', '\u0490', '\u00A6', '\u00A7',
+    '\u0401', '\u00A9', '\u0404', '\u00AB', '\u00AC', '\u00AD', '\u00AE', '\u0407',
+    '\u00B0', '\u00B1', '\u0406', '\u0456', '\u0491', '\u00B5', '\u00B6', '\u00B7',
+    '\u0451', '\u2116', '\u0454', '\u00BB', '\u0458', '\u0405', '\u0455', '\u0457',
+  ];
+
+  let text = '';
+  for (const byte of buffer) {
+    if (byte < 0x80) text += String.fromCharCode(byte);
+    else if (byte >= 0xC0) text += String.fromCharCode(0x0410 + byte - 0xC0);
+    else text += map[byte - 0x80] || ' ';
+  }
+  return text;
+}
+
+function extractMultipartFileBuffer(req) {
+  const contentType = req.get('content-type') || '';
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+
+  if (!contentType.includes('multipart/form-data')) return body;
+
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  if (!boundaryMatch) throw new Error('Не удалось прочитать multipart boundary');
+  const boundary = Buffer.from(`--${boundaryMatch[1] || boundaryMatch[2]}`);
+  const parts = [];
+  let start = body.indexOf(boundary);
+
+  while (start !== -1) {
+    start += boundary.length;
+    if (body.slice(start, start + 2).toString() === '--') break;
+    if (body.slice(start, start + 2).toString() === '\r\n') start += 2;
+
+    const next = body.indexOf(boundary, start);
+    if (next === -1) break;
+    let part = body.slice(start, next);
+    if (part.slice(-2).toString() === '\r\n') part = part.slice(0, -2);
+    parts.push(part);
+    start = next;
+  }
+
+  for (const part of parts) {
+    const separator = part.indexOf(Buffer.from('\r\n\r\n'));
+    if (separator === -1) continue;
+    const headers = part.slice(0, separator).toString('utf8');
+    if (!/name="file"/i.test(headers) && !/filename=/i.test(headers)) continue;
+    return part.slice(separator + 4);
+  }
+
+  throw new Error('Файл не найден в запросе');
+}
+
+function isTechnicalCounterpartyValue(value) {
+  const name = normalizeCounterpartyName(value);
+  const key = name.toLowerCase();
+  const upper = name.toUpperCase();
+  const technical = new Set([
+    '#',
+    'N',
+    '№',
+    'DATE',
+    'MARKING',
+    'BREAND',
+    'BRAND',
+    'PCS',
+    'BOX',
+    'KG',
+    'CLASS',
+    'TARIF DXB',
+    'TARIF ALA',
+    'CREDIT DXB',
+    'CREDIT ALA',
+    'TOTAL',
+    'DEFAULT LANGUAGE',
+    'MOXCEL',
+    'ЛИСТ',
+    'СТРАНИЦА',
+    'КОНТРАГЕНТЫ',
+    'КОНТРАГЕНТ',
+    'НАИМЕНОВАНИЕ',
+    'НАЗВАНИЕ',
+  ]);
+
+  if (!name || name.length < 2) return true;
+  if (technical.has(upper)) return true;
+  if (/^\d+([.,]\d+)?$/.test(key)) return true;
+  if (/^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$/.test(key)) return true;
+  if (!/[a-zа-яё]/i.test(name)) return true;
+  if (/^moxel/i.test(key)) return true;
+  return false;
+}
+
+function extractCounterpartyNamesFromMxl(buffer) {
+  const variants = [
+    buffer.toString('utf8'),
+    buffer.toString('utf16le'),
+    decodeWindows1251(buffer),
+  ];
+  const names = new Map();
+
+  for (const text of variants) {
+    const quoted = text.matchAll(/"([^"\r\n]{2,160})"/g);
+    for (const match of quoted) {
+      const name = normalizeCounterpartyName(match[1]);
+      if (!isTechnicalCounterpartyValue(name)) names.set(counterpartyKey(name), name);
+    }
+
+    text
+      .split(/\r?\n/)
+      .map(normalizeCounterpartyName)
+      .filter((line) => line.length >= 2 && line.length <= 160)
+      .forEach((line) => {
+        if (!isTechnicalCounterpartyValue(line)) names.set(counterpartyKey(line), line);
+      });
+  }
+
+  return Array.from(names.values()).sort((a, b) => a.localeCompare(b, 'ru'));
+}
+
 async function cleanupOrphanImportRecords(client = pool) {
   return all(`
     DELETE FROM import_records ir
@@ -618,6 +754,49 @@ async function cleanupOrphanImportRecords(client = pool) {
        )
     RETURNING spreadsheet_id,gid,source_row
   `, [], client);
+}
+
+async function buildCounterpartyPreview(names, client = pool) {
+  const [clientsRows, suppliersRows] = await Promise.all([
+    all('SELECT id,name FROM clients', [], client),
+    all('SELECT id,name FROM suppliers', [], client),
+  ]);
+  const clientsByKey = new Map(clientsRows.map((row) => [counterpartyKey(row.name), row]));
+  const suppliersByKey = new Map(suppliersRows.map((row) => [counterpartyKey(row.name), row]));
+
+  const items = names.map((name) => {
+    const key = counterpartyKey(name);
+    const existsAsClient = clientsByKey.has(key);
+    const existsAsSupplier = suppliersByKey.has(key);
+    let status = 'new';
+    let suggestedType = 'client';
+
+    if (existsAsClient) {
+      status = 'already_exists_client';
+      suggestedType = 'client';
+    } else if (existsAsSupplier) {
+      status = 'already_exists_supplier';
+      suggestedType = 'supplier';
+    }
+
+    return {
+      name,
+      exists_as_client: existsAsClient,
+      exists_as_supplier: existsAsSupplier,
+      suggested_type: suggestedType,
+      status,
+    };
+  });
+
+  return {
+    ok: true,
+    items,
+    summary: {
+      total: items.length,
+      new: items.filter((item) => item.status === 'new').length,
+      duplicates: items.filter((item) => item.status !== 'new').length,
+    },
+  };
 }
 
 async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
@@ -1326,6 +1505,65 @@ app.put('/api/clients/:id', async (req, res) => {
 app.delete('/api/clients/:id', async (req, res) => {
   await query('DELETE FROM clients WHERE id=$1', [+req.params.id]);
   res.json({ success: true });
+});
+
+// Counterparties import
+app.post('/api/import/counterparties/preview', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
+  try {
+    const fileBuffer = extractMultipartFileBuffer(req);
+    if (!fileBuffer.length) return res.status(400).json({ error: 'Файл пустой' });
+    const names = extractCounterpartyNamesFromMxl(fileBuffer);
+    res.json(await buildCounterpartyPreview(names));
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Не удалось прочитать файл' });
+  }
+});
+
+app.post('/api/import/counterparties/commit', async (req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ error: 'Нет строк для импорта' });
+
+  try {
+    const result = await withTx(async (client) => {
+      let createdClients = 0;
+      let createdSuppliers = 0;
+      let skipped = 0;
+
+      for (const item of items) {
+        const name = normalizeCounterpartyName(item.name);
+        const type = item.type;
+        if (!name || type === 'skip') {
+          skipped += 1;
+          continue;
+        }
+        if (!['client', 'supplier'].includes(type)) {
+          skipped += 1;
+          continue;
+        }
+
+        const table = type === 'client' ? 'clients' : 'suppliers';
+        const existing = await get(`SELECT id FROM ${table} WHERE lower(regexp_replace(trim(name), '[[:space:]]+', ' ', 'g')) = lower($1) LIMIT 1`, [name], client);
+        if (existing) {
+          skipped += 1;
+          continue;
+        }
+
+        await query(`INSERT INTO ${table}(name) VALUES($1)`, [name], client);
+        if (type === 'client') createdClients += 1;
+        else createdSuppliers += 1;
+      }
+
+      return {
+        created_clients: createdClients,
+        created_suppliers: createdSuppliers,
+        skipped,
+      };
+    });
+
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Не удалось импортировать контрагентов' });
+  }
 });
 
 // Suppliers
