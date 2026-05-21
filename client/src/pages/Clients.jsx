@@ -226,7 +226,7 @@ export default function Clients() {
       {modal === 'import' && (
         <Modal
           wide
-          title="Импорт контрагентов из 1C MXL"
+          title="Импорт контрагентов"
           onClose={() => setModal(null)}
           footer={
             <>
@@ -245,11 +245,12 @@ export default function Clients() {
           )}
 
           <div className="form-group">
-            <label className="form-label">Файл 1C MXL</label>
+            <label className="form-label">Файл</label>
+            <div className="td-muted" style={{ fontSize: 12, marginBottom: 8 }}>Поддерживаются: 1C MXL, Excel, CSV, TXT</div>
             <input
               type="file"
               className="form-input"
-              accept=".mxl,.MXL"
+              accept=".mxl,.MXL,.xlsx,.XLSX,.xls,.XLS,.csv,.CSV,.txt,.TXT"
               onChange={e => {
                 setImportFile(e.target.files?.[0] || null)
                 setImportItems([])

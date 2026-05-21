@@ -12,6 +12,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
+const XLSX = require('xlsx');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -613,6 +614,7 @@ function normalizeCounterpartyName(value) {
   return String(value || '')
     .replace(/[\u0000-\u001F\u007F]/g, ' ')
     .replace(/[{}[\]"'<>]/g, ' ')
+    .replace(/^[\s.,;:|/\\\-–—№#*()]+|[\s.,;:|/\\\-–—№#*()]+$/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -646,7 +648,13 @@ function extractMultipartFileBuffer(req) {
   const contentType = req.get('content-type') || '';
   const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
 
-  if (!contentType.includes('multipart/form-data')) return body;
+  if (!contentType.includes('multipart/form-data')) {
+    return {
+      buffer: body,
+      originalName: '',
+      mimeType: contentType,
+    };
+  }
 
   const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
   if (!boundaryMatch) throw new Error('Не удалось прочитать multipart boundary');
@@ -672,7 +680,13 @@ function extractMultipartFileBuffer(req) {
     if (separator === -1) continue;
     const headers = part.slice(0, separator).toString('utf8');
     if (!/name="file"/i.test(headers) && !/filename=/i.test(headers)) continue;
-    return part.slice(separator + 4);
+    const filenameMatch = headers.match(/filename="([^"]*)"/i);
+    const contentTypeMatch = headers.match(/content-type:\s*([^\r\n]+)/i);
+    return {
+      buffer: part.slice(separator + 4),
+      originalName: filenameMatch?.[1] || '',
+      mimeType: contentTypeMatch?.[1]?.trim() || '',
+    };
   }
 
   throw new Error('Файл не найден в запросе');
@@ -701,6 +715,12 @@ function isTechnicalCounterpartyValue(value) {
     'TOTAL',
     'DEFAULT LANGUAGE',
     'MOXCEL',
+    'SHEET',
+    'PAGE',
+    'ИТОГО',
+    'ВСЕГО',
+    'TOTAL',
+    'GRAND TOTAL',
     'ЛИСТ',
     'СТРАНИЦА',
     'КОНТРАГЕНТЫ',
@@ -743,6 +763,159 @@ function extractCounterpartyNamesFromMxl(buffer) {
   }
 
   return Array.from(names.values()).sort((a, b) => a.localeCompare(b, 'ru'));
+}
+
+function decodeTextBuffer(buffer) {
+  const utf16 = buffer.toString('utf16le');
+  if ((utf16.match(/[а-яёa-z]/gi) || []).length > 3 && !utf16.includes('\uFFFD')) return utf16;
+
+  const utf8 = buffer.toString('utf8').replace(/^\uFEFF/, '');
+  if (!utf8.includes('\uFFFD')) return utf8;
+
+  return decodeWindows1251(buffer);
+}
+
+function splitDelimitedLine(line, delimiter) {
+  const cells = [];
+  let current = '';
+  let quoted = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (char === '"') {
+      if (quoted && next === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === delimiter && !quoted) {
+      cells.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  cells.push(current);
+  return cells;
+}
+
+function detectDelimiter(lines) {
+  const delimiters = [';', ',', '\t'];
+  let best = ';';
+  let bestScore = -1;
+
+  for (const delimiter of delimiters) {
+    const score = lines.slice(0, 10).reduce((sum, line) => sum + splitDelimitedLine(line, delimiter).length, 0);
+    if (score > bestScore) {
+      best = delimiter;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+function addCounterpartyName(names, value) {
+  const name = normalizeCounterpartyName(value);
+  if (!isTechnicalCounterpartyValue(name)) names.set(counterpartyKey(name), name);
+}
+
+function findCounterpartyColumnIndex(headerRow) {
+  const candidates = new Set([
+    'название',
+    'контрагент',
+    'контрагенты',
+    'наименование',
+    'name',
+    'client',
+    'supplier',
+  ]);
+  return headerRow.findIndex((cell) => candidates.has(counterpartyKey(cell)));
+}
+
+function extractCounterpartyNamesFromRows(rows) {
+  const normalizedRows = rows
+    .map((row) => row.map((cell) => normalizeCounterpartyName(cell)))
+    .filter((row) => row.some(Boolean));
+  const names = new Map();
+  let headerIndex = -1;
+  let headerRowIndex = -1;
+
+  normalizedRows.some((row, index) => {
+    const found = findCounterpartyColumnIndex(row);
+    if (found !== -1) {
+      headerIndex = found;
+      headerRowIndex = index;
+      return true;
+    }
+    return false;
+  });
+
+  if (headerIndex !== -1) {
+    normalizedRows.slice(headerRowIndex + 1).forEach((row) => addCounterpartyName(names, row[headerIndex]));
+  } else {
+    normalizedRows.forEach((row) => {
+      row.slice(0, 3).some((cell) => {
+        const before = names.size;
+        addCounterpartyName(names, cell);
+        return names.size > before;
+      });
+    });
+  }
+
+  return Array.from(names.values()).sort((a, b) => a.localeCompare(b, 'ru'));
+}
+
+function extractCounterpartyNamesFromExcel(buffer) {
+  const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: false });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) return [];
+  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '' });
+  return extractCounterpartyNamesFromRows(rows);
+}
+
+function extractCounterpartyNamesFromCsv(buffer) {
+  const text = decodeTextBuffer(buffer);
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  const delimiter = detectDelimiter(lines);
+  const rows = lines.map((line) => splitDelimitedLine(line, delimiter));
+  return extractCounterpartyNamesFromRows(rows);
+}
+
+function extractCounterpartyNamesFromTxt(buffer) {
+  const text = decodeTextBuffer(buffer);
+  const rows = text
+    .split(/\r?\n/)
+    .flatMap((line) => line.includes(';') || line.includes(',') ? line.split(/[;,]/) : [line])
+    .map((value) => [value]);
+  return extractCounterpartyNamesFromRows(rows);
+}
+
+function getCounterpartyImportFileType({ originalName = '', mimeType = '' }) {
+  const ext = path.extname(originalName).toLowerCase();
+  const mime = String(mimeType || '').toLowerCase();
+
+  if (ext === '.mxl') return 'mxl';
+  if (ext === '.xlsx' || mime.includes('spreadsheetml')) return 'xlsx';
+  if (ext === '.xls' || mime.includes('ms-excel')) return 'xls';
+  if (ext === '.csv' || mime.includes('csv')) return 'csv';
+  if (ext === '.txt' || mime.startsWith('text/plain')) return 'txt';
+  return '';
+}
+
+function extractCounterpartyNamesFromFile(file) {
+  const type = getCounterpartyImportFileType(file);
+  if (!type) throw new Error('Поддерживаются файлы MXL, Excel, CSV и TXT');
+
+  if (type === 'mxl') return extractCounterpartyNamesFromMxl(file.buffer);
+  if (type === 'xlsx' || type === 'xls') return extractCounterpartyNamesFromExcel(file.buffer);
+  if (type === 'csv') return extractCounterpartyNamesFromCsv(file.buffer);
+  if (type === 'txt') return extractCounterpartyNamesFromTxt(file.buffer);
+
+  throw new Error('Поддерживаются файлы MXL, Excel, CSV и TXT');
 }
 
 async function cleanupOrphanImportRecords(client = pool) {
@@ -1510,9 +1683,12 @@ app.delete('/api/clients/:id', async (req, res) => {
 // Counterparties import
 app.post('/api/import/counterparties/preview', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
   try {
-    const fileBuffer = extractMultipartFileBuffer(req);
-    if (!fileBuffer.length) return res.status(400).json({ error: 'Файл пустой' });
-    const names = extractCounterpartyNamesFromMxl(fileBuffer);
+    const file = extractMultipartFileBuffer(req);
+    if (!file.buffer.length) return res.status(400).json({ error: 'Файл пустой' });
+    const names = extractCounterpartyNamesFromFile(file);
+    if (!names.length) {
+      return res.status(400).json({ error: 'Не удалось найти контрагентов в файле. Проверьте, что в файле есть колонка Название/Контрагент или список имён.' });
+    }
     res.json(await buildCounterpartyPreview(names));
   } catch (e) {
     res.status(400).json({ error: e.message || 'Не удалось прочитать файл' });
