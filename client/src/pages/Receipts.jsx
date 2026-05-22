@@ -31,6 +31,7 @@ const compareReceiptDateKeysDesc = (a, b) => {
 const receiptDateLabel = (key) => key === 'no-date' ? 'Без даты' : formatDate(key)
 const receiptClientKey = (receipt) => receipt.client_id ? `id:${receipt.client_id}` : `name:${String(receipt.client_name || '').trim().toLowerCase()}`
 const IMPORT_EMPTY = { url: '', date_from: '', date_to: '', supplier_id: '', mode: 'receipt_only' }
+const SALE_BULK_EMPTY = { sale_unit: 'kg', sale_price: '' }
 const STATUS_LABELS = {
   ready: 'Готово',
   marking_not_found: 'Маркировка не найдена',
@@ -43,6 +44,26 @@ const statusBadge = (status) => {
   if (status === 'partial') return 'badge-warning'
   return 'badge-danger'
 }
+const isPhoneProductName = (name) => {
+  const text = String(name || '').toLowerCase()
+  return text.includes('iphone') ||
+    text.includes('айфон') ||
+    text.includes('smartphone') ||
+    text.includes('телефон') ||
+    text.includes('android phone') ||
+    text.includes('samsung phone') ||
+    /(^|[^a-z0-9])phone([^a-z0-9]|$)/i.test(text)
+}
+const defaultSaleUnit = (row) => row.sale_unit || (isPhoneProductName(row.product_name) ? 'pcs' : 'kg')
+const prepareImportRowsForSale = (rows) => normalizeArray(rows).map(row => ({
+  ...row,
+  sale_unit: defaultSaleUnit(row),
+  sale_price: row.sale_price ?? '',
+}))
+const importSaleBase = (row) => row.sale_unit === 'pcs' ? toNumber(row.quantity_pcs) : toNumber(row.weight_kg)
+const importSaleTotal = (row) => Math.round(importSaleBase(row) * toNumber(row.sale_price) * 100) / 100
+const importRowWillImport = (row) => row.status !== 'already_imported' && row.status !== 'marking_not_found'
+const importSaleReady = (row) => !importRowWillImport(row) || (toNumber(row.sale_price) > 0 && importSaleBase(row) > 0)
 
 export default function Receipts() {
   const [receipts, setReceipts] = useState([])
@@ -66,6 +87,7 @@ export default function Receipts() {
   const [importError, setImportError] = useState('')
   const [importLoading, setImportLoading] = useState(false)
   const [importCommitting, setImportCommitting] = useState(false)
+  const [saleBulk, setSaleBulk] = useState(SALE_BULK_EMPTY)
   const [viewMode, setViewMode] = useState('dates')
   const [expandedDate, setExpandedDate] = useState(null)
 
@@ -186,6 +208,7 @@ export default function Receipts() {
     setImportPreview(null)
     setImportResult(null)
     setImportError('')
+    setSaleBulk(SALE_BULK_EMPTY)
     setImportOpen(true)
   }
 
@@ -199,7 +222,7 @@ export default function Receipts() {
         date_from: importForm.date_from,
         date_to: importForm.date_to,
       })
-      setImportPreview(data)
+      setImportPreview({ ...data, rows: prepareImportRowsForSale(data.rows) })
     } catch (e) {
       setImportPreview(null)
       setImportError(e.message || 'Не удалось загрузить данные')
@@ -210,12 +233,17 @@ export default function Receipts() {
 
   const commitImport = async () => {
     const rows = normalizeArray(importPreview?.rows)
+    const importWithSale = importForm.mode === 'receipt_and_sale'
     if (!importForm.supplier_id) {
       setImportError('Выберите поставщика')
       return
     }
     if (rows.some(row => row.status === 'marking_not_found')) {
       setImportError('Есть строки без найденной маркировки')
+      return
+    }
+    if (importWithSale && rows.some(row => !importSaleReady(row))) {
+      setImportError('Заполните цену реализации для всех строк')
       return
     }
     setImportCommitting(true)
@@ -235,11 +263,51 @@ export default function Receipts() {
     }
   }
 
+  const setImportRowSale = (index, key, value) => {
+    setImportPreview(prev => ({
+      ...prev,
+      rows: normalizeArray(prev?.rows).map((row, rowIndex) => rowIndex === index ? { ...row, [key]: value } : row),
+    }))
+  }
+
+  const applySalePriceToAll = () => {
+    if (!(toNumber(saleBulk.sale_price) > 0)) {
+      setImportError('Укажите цену реализации')
+      return
+    }
+    setImportError('')
+    setImportPreview(prev => ({
+      ...prev,
+      rows: normalizeArray(prev?.rows).map(row => importRowWillImport(row)
+        ? { ...row, sale_unit: saleBulk.sale_unit, sale_price: saleBulk.sale_price }
+        : row),
+    }))
+  }
+
   const previewRows = normalizeArray(importPreview?.rows)
   const previewGroups = normalizeArray(importPreview?.groups)
   const debugSummary = importPreview?.debug_summary || null
+  const importWithSale = importForm.mode === 'receipt_and_sale'
   const hasMarkingProblems = previewRows.some(row => row.status === 'marking_not_found')
   const hasReadyRows = previewRows.some(row => row.status === 'ready')
+  const hasSaleProblems = importWithSale && previewRows.some(row => !importSaleReady(row))
+  const previewGroupsWithSales = useMemo(() => {
+    const saleTotalsByGroup = new Map()
+    previewRows.forEach(row => {
+      if (!importRowWillImport(row)) return
+      const key = `${row.date}||${row.marking}`
+      saleTotalsByGroup.set(key, toNumber(saleTotalsByGroup.get(key)) + importSaleTotal(row))
+    })
+    return previewGroups.map(group => {
+      const key = `${group.date}||${group.marking}`
+      const saleTotal = toNumber(saleTotalsByGroup.get(key))
+      return {
+        ...group,
+        sale_total: saleTotal,
+        gross_profit: saleTotal - toNumber(group.app_total),
+      }
+    })
+  }, [previewGroups, previewRows])
   const sortedReceipts = useMemo(() => normalizeArray(receipts)
     .slice()
     .sort((a, b) => compareReceiptDateKeysDesc(receiptDateKey(a.date), receiptDateKey(b.date)) || toNumber(b.id) - toNumber(a.id)), [receipts])
@@ -595,9 +663,11 @@ export default function Receipts() {
               <button
                 className="btn btn-primary"
                 onClick={commitImport}
-                disabled={importCommitting || hasMarkingProblems || !hasReadyRows}
+                disabled={importCommitting || hasMarkingProblems || !hasReadyRows || hasSaleProblems}
               >
-                {importCommitting ? 'Создание...' : 'Создать приходы'}
+                {importCommitting
+                  ? 'Создание...'
+                  : importWithSale ? 'Создать приходы и реализации' : 'Создать приходы'}
               </button>
             </>
           }
@@ -605,7 +675,9 @@ export default function Receipts() {
           {importError && <div className="alert alert-error">{importError}</div>}
           {importResult && (
             <div className="alert alert-success">
-              Создано приходов: {importResult.created_receipts || 0} · импортировано строк: {importResult.imported_rows || 0} · пропущено дублей: {importResult.skipped_rows || 0}
+              Создано приходов: {importResult.created_receipts || 0}
+              {importResult.created_sales_documents ? ` · реализаций: ${importResult.created_sales_documents}` : ''}
+              {' '}· импортировано строк: {importResult.imported_rows || 0} · пропущено дублей: {importResult.skipped_rows || 0}
             </div>
           )}
 
@@ -636,7 +708,7 @@ export default function Receipts() {
               <label className="form-label">Режим</label>
               <select className="form-select" value={importForm.mode} onChange={e => setImportForm(f => ({ ...f, mode: e.target.value }))}>
                 <option value="receipt_only">Только приход</option>
-                <option value="receipt_and_sale" disabled>Приход + реализация — следующий этап</option>
+                <option value="receipt_and_sale">Приход + реализация</option>
               </select>
             </div>
           </div>
@@ -686,6 +758,32 @@ export default function Receipts() {
                 </div>
               </div>
 
+              {importWithSale && (
+                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginTop: 16 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 10 }}>Цена реализации</div>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label className="form-label">Ед. реализации</label>
+                      <select className="form-select" value={saleBulk.sale_unit} onChange={e => setSaleBulk(f => ({ ...f, sale_unit: e.target.value }))}>
+                        <option value="kg">кг</option>
+                        <option value="pcs">шт</option>
+                      </select>
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Цена реализации</label>
+                      <input type="number" min="0" step="0.01" className="form-input" value={saleBulk.sale_price} onChange={e => setSaleBulk(f => ({ ...f, sale_price: e.target.value }))} />
+                    </div>
+                    <div className="form-group" style={{ justifyContent: 'flex-end' }}>
+                      <label className="form-label">&nbsp;</label>
+                      <button className="btn btn-secondary" type="button" onClick={applySalePriceToAll}>Применить ко всем</button>
+                    </div>
+                  </div>
+                  {hasSaleProblems && (
+                    <div className="alert alert-error" style={{ marginTop: 10 }}>Заполните цену реализации для всех строк</div>
+                  )}
+                </div>
+              )}
+
               <div style={{ fontWeight: 700, margin: '18px 0 10px' }}>Сводка будущих приходов</div>
               <div className="table-wrapper">
                 <table>
@@ -698,11 +796,13 @@ export default function Receipts() {
                       <th>Вес</th>
                       <th>Кол-во</th>
                       <th>Себестоимость app</th>
+                      {importWithSale && <th>Реализация</th>}
+                      {importWithSale && <th>Валовая прибыль</th>}
                       <th>Статус</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {previewGroups.map(group => (
+                    {previewGroupsWithSales.map(group => (
                       <tr key={`${group.date}-${group.marking}`}>
                         <td className="td-date">{formatDate(group.date)}</td>
                         <td>{group.marking}</td>
@@ -711,6 +811,14 @@ export default function Receipts() {
                         <td className="td-mono">{fmtNum(group.total_weight, 3)} кг</td>
                         <td className="td-mono">{fmtNum(group.total_quantity, 0)} шт</td>
                         <td><span className="badge badge-warning">{fmtMoney(group.app_total)}</span></td>
+                        {importWithSale && <td><span className="badge badge-success">{fmtMoney(group.sale_total)}</span></td>}
+                        {importWithSale && (
+                          <td>
+                            <span className={`badge ${group.gross_profit >= 0 ? 'badge-success' : 'badge-danger'}`}>
+                              {fmtMoney(group.gross_profit)}
+                            </span>
+                          </td>
+                        )}
                         <td><span className={`badge ${statusBadge(group.status)}`}>{STATUS_LABELS[group.status] || group.status}</span></td>
                       </tr>
                     ))}
@@ -736,11 +844,14 @@ export default function Receipts() {
                       <th>ALA ед.</th>
                       <th>Себест. app</th>
                       <th>TOTAL sheet</th>
+                      {importWithSale && <th>Ед. реал.</th>}
+                      {importWithSale && <th>Цена реал.</th>}
+                      {importWithSale && <th>Итого реал.</th>}
                       <th>Статус</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {previewRows.map(row => (
+                    {previewRows.map((row, rowIndex) => (
                       <tr key={`${row.spreadsheet_id}-${row.gid}-${row.source_row}`}>
                         <td className="td-date">{formatDate(row.date)}</td>
                         <td>{row.marking}</td>
@@ -761,6 +872,37 @@ export default function Receipts() {
                         <td><span className="badge badge-neutral">{row.app_ala_unit === 'pcs' ? 'шт' : 'кг'}</span></td>
                         <td><span className="badge badge-warning">{fmtMoney(row.app_total)}</span></td>
                         <td className="td-mono">{fmtMoney(row.sheet_total)}</td>
+                        {importWithSale && (
+                          <td>
+                            <select
+                              className="form-select"
+                              value={row.sale_unit || defaultSaleUnit(row)}
+                              onChange={e => setImportRowSale(rowIndex, 'sale_unit', e.target.value)}
+                              disabled={!importRowWillImport(row)}
+                              style={{ minWidth: 78 }}
+                            >
+                              <option value="kg">кг</option>
+                              <option value="pcs">шт</option>
+                            </select>
+                          </td>
+                        )}
+                        {importWithSale && (
+                          <td>
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              className="form-input"
+                              value={row.sale_price ?? ''}
+                              onChange={e => setImportRowSale(rowIndex, 'sale_price', e.target.value)}
+                              disabled={!importRowWillImport(row)}
+                              style={{ minWidth: 110 }}
+                            />
+                          </td>
+                        )}
+                        {importWithSale && (
+                          <td><span className="badge badge-success">{fmtMoney(importSaleTotal(row))}</span></td>
+                        )}
                         <td>
                           <span className={`badge ${statusBadge(row.status)}`}>{STATUS_LABELS[row.status] || row.status}</span>
                           {normalizeArray(row.warnings).map(warning => (

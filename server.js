@@ -2255,11 +2255,11 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
 app.post('/api/import/google-sheets/commit', async (req, res) => {
   const { supplier_id, mode = 'receipt_only' } = req.body;
   const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
-  if (mode === 'receipt_and_sale') return res.status(400).json({ error: 'Создание реализации из импорта будет добавлено следующим этапом' });
-  if (mode !== 'receipt_only') return res.status(400).json({ error: 'Неизвестный режим импорта' });
+  const createSales = mode === 'receipt_and_sale';
+  if (!['receipt_only', 'receipt_and_sale'].includes(mode)) return res.status(400).json({ error: 'Неизвестный режим импорта' });
   if (!supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
   if (!rows.length) return res.status(400).json({ error: 'Нет строк для импорта' });
-  if (rows.some((row) => row.status === 'marking_not_found' || !row.marking_id || !row.client_id)) {
+  if (rows.some((row) => row.status !== 'already_imported' && (row.status === 'marking_not_found' || !row.marking_id || !row.client_id))) {
     return res.status(400).json({ error: 'Есть строки без найденной маркировки' });
   }
 
@@ -2282,12 +2282,27 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
           skippedRows += 1;
           continue;
         }
+        if (!row.product_name?.trim()) throw new Error('В каждой строке должен быть товар');
+        if (createSales && !row.date) throw new Error('Дата обязательна для реализации');
+        if (createSales) {
+          const saleUnit = row.sale_unit;
+          const salePrice = +row.sale_price;
+          if (!['kg', 'pcs'].includes(saleUnit)) throw new Error('Единица реализации должна быть кг или шт');
+          if (!(salePrice > 0)) throw new Error('Укажите цену реализации для всех строк');
+          const saleBase = saleUnit === 'pcs' ? +row.quantity_pcs || 0 : +row.weight_kg || 0;
+          if (!(saleBase > 0)) {
+            throw new Error(saleUnit === 'pcs'
+              ? 'Для реализации по штукам количество должно быть больше 0'
+              : 'Для реализации по кг вес должен быть больше 0');
+          }
+        }
         const key = `${row.date}||${row.marking_id}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(row);
       }
 
       const receiptIds = [];
+      const salesDocumentIds = [];
       let importedRows = 0;
       for (const groupRows of groups.values()) {
         if (!groupRows.length) continue;
@@ -2298,6 +2313,17 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
           client
         );
         receiptIds.push(receipt.id);
+
+        let salesDocument = null;
+        const saleItems = [];
+        if (createSales) {
+          salesDocument = await get(
+            'INSERT INTO sales_documents(date,client_id,marking_id) VALUES($1,$2,$3) RETURNING id',
+            [first.date, +first.client_id, +first.marking_id],
+            client
+          );
+          salesDocumentIds.push(salesDocument.id);
+        }
 
         for (const row of groupRows) {
           const product = row.product_id
@@ -2332,11 +2358,48 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
             VALUES($1,$2,$3,$4,$5,$6,$7)
             ON CONFLICT(source_type, spreadsheet_id, gid, source_row) DO NOTHING
           `, ['google_sheets', row.spreadsheet_id, row.gid || '0', +row.source_row, row.date, row.marking, receipt.id], client);
+
+          if (createSales) {
+            const saleUnit = row.sale_unit;
+            const salePrice = +row.sale_price;
+            const saleQuantity = saleUnit === 'pcs' ? +row.quantity_pcs || 0 : +row.weight_kg || 0;
+            const saleNote = `${note} · Реализация из Google Sheets import`;
+            await query(
+              'INSERT INTO sales_items(sales_document_id,product_id,sale_unit,quantity,price_per_unit,note) VALUES($1,$2,$3,$4,$5,$6)',
+              [salesDocument.id, +productRow.id, saleUnit, saleQuantity, salePrice, saleNote],
+              client
+            );
+            saleItems.push({
+              product_id: +productRow.id,
+              sale_unit: saleUnit,
+              quantity: saleQuantity,
+              price_per_unit: salePrice,
+              note: saleNote,
+            });
+          }
+
           importedRows += 1;
+        }
+
+        if (createSales) {
+          await createLegacySalesForDocument({
+            date: first.date,
+            clientId: +first.client_id,
+            markingId: +first.marking_id,
+            items: saleItems,
+            salesDocumentId: salesDocument.id,
+          }, client);
         }
       }
 
-      return { created_receipts: receiptIds.length, receipt_ids: receiptIds, imported_rows: importedRows, skipped_rows: skippedRows };
+      return {
+        created_receipts: receiptIds.length,
+        receipt_ids: receiptIds,
+        created_sales_documents: salesDocumentIds.length,
+        sales_document_ids: salesDocumentIds,
+        imported_rows: importedRows,
+        skipped_rows: skippedRows,
+      };
     });
     res.json(result);
   } catch (e) {
