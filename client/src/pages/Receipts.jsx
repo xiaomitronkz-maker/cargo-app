@@ -14,8 +14,7 @@ const receiptTotalCost = (receipt) => {
   if (apiTotal) return apiTotal
   return normalizeArray(receipt?.items).reduce((sum, item) => sum + itemTotalCost(item), 0)
 }
-const today = () => new Date().toISOString().slice(0, 10)
-const IMPORT_EMPTY = { url: '', date_from: today(), date_to: today(), supplier_id: '', mode: 'receipt_only' }
+const IMPORT_EMPTY = { url: '', date_from: '', date_to: '', supplier_id: '', mode: 'receipt_only' }
 const STATUS_LABELS = {
   ready: 'Готово',
   marking_not_found: 'Маркировка не найдена',
@@ -220,6 +219,7 @@ export default function Receipts() {
 
   const previewRows = normalizeArray(importPreview?.rows)
   const previewGroups = normalizeArray(importPreview?.groups)
+  const debugSummary = importPreview?.debug_summary || null
   const hasMarkingProblems = previewRows.some(row => row.status === 'marking_not_found')
   const hasReadyRows = previewRows.some(row => row.status === 'ready')
   const formItemTotalCost = (item) => {
@@ -490,6 +490,9 @@ export default function Receipts() {
           <div className="form-group">
             <label className="form-label">Ссылка на Google Sheet</label>
             <input className="form-input" value={importForm.url} onChange={e => setImportForm(f => ({ ...f, url: e.target.value }))} placeholder="https://docs.google.com/spreadsheets/d/..." />
+            <div className="td-muted" style={{ fontSize: 12, marginTop: 8 }}>
+              Можно вставить ссылку на выделенный диапазон Google Sheets. Если даты не указаны, будут загружены все строки из выбранного диапазона.
+            </div>
           </div>
           <div className="form-row">
             <div className="form-group">
@@ -521,6 +524,27 @@ export default function Receipts() {
 
           {importPreview && (
             <>
+              {debugSummary && (
+                <div className="alert alert-info" style={{ marginTop: 16 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>Диагностика импорта</div>
+                  <div>Режим чтения: {debugSummary.read_mode || '—'}</div>
+                  <div>Диапазон: {debugSummary.range || 'A:L'}</div>
+                  <div>Строк прочитано: {debugSummary.rows_read || 0}</div>
+                  <div>Найденные даты: {normalizeArray(debugSummary.dates_found).join(', ') || '—'}</div>
+                  <div>Строк после фильтра: {debugSummary.rows_after_date_filter || 0}</div>
+                  {normalizeArray(debugSummary.warnings).map(warning => (
+                    <div key={warning} style={{ marginTop: 4 }}>{warning}</div>
+                  ))}
+                </div>
+              )}
+
+              {previewRows.length === 0 && (
+                <div className="alert alert-info" style={{ marginTop: 16 }}>
+                  Строк для импорта не найдено. Диапазон: {debugSummary?.range || '—'}, прочитано строк: {debugSummary?.rows_read || 0}, найденные даты: {normalizeArray(debugSummary?.dates_found).join(', ') || '—'}.
+                  Проверьте дату или оставьте даты пустыми, если хотите импортировать весь выделенный диапазон.
+                </div>
+              )}
+
               <div className="stat-grid" style={{ marginTop: 16 }}>
                 <div className="stat-card">
                   <div className="stat-label">Строк</div>

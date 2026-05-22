@@ -13,6 +13,7 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
 const XLSX = require('xlsx');
+const { google } = require('googleapis');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -495,18 +496,126 @@ function parseGoogleSheetUrl(url) {
   let range = null;
   try {
     const parsed = new URL(value);
-    gid = parsed.searchParams.get('gid') || (parsed.hash.match(/gid=([0-9]+)/)?.[1]) || '0';
-    range = parsed.searchParams.get('range') || parsed.hash.match(/range=([^&]+)/)?.[1] || null;
+    const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+    gid = parsed.searchParams.get('gid') || hashParams.get('gid') || '0';
+    range = parsed.searchParams.get('range') || hashParams.get('range') || null;
   } catch (_) {
     gid = value.match(/gid=([0-9]+)/)?.[1] || '0';
     range = value.match(/range=([^&]+)/)?.[1] || null;
   }
-  return { spreadsheetId: spreadsheetMatch[1], gid, range: range ? decodeURIComponent(range) : null };
+  let decodedRange = range || '';
+  try {
+    decodedRange = decodedRange ? decodeURIComponent(decodedRange) : '';
+  } catch (_) {
+    decodedRange = range || '';
+  }
+  const cleanRange = decodedRange ? decodedRange.replace(/^range=/i, '').trim() : null;
+  return { spreadsheetId: spreadsheetMatch[1], gid, range: cleanRange || null, rawUrl: value };
 }
 
 function sheetRangeStartRow(range) {
   const match = String(range || '').match(/[A-Z]+(\d+)/i);
   return match ? Math.max(+match[1], 1) : 1;
+}
+
+function stripSheetNameFromRange(range) {
+  const value = String(range || '');
+  return value.includes('!') ? value.split('!').pop() : value;
+}
+
+function quoteSheetName(sheetName) {
+  return `'${String(sheetName || '').replace(/'/g, "''")}'`;
+}
+
+function buildSheetA1Range(sheetName, range) {
+  const cleanRange = range ? String(range).trim() : 'A:L';
+  if (cleanRange.includes('!')) return cleanRange;
+  return `${quoteSheetName(sheetName)}!${cleanRange || 'A:L'}`;
+}
+
+function getGoogleServiceAccountCredentials() {
+  const encoded = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64;
+  if (!encoded) return null;
+  try {
+    return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+  } catch (error) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 содержит некорректный JSON');
+  }
+}
+
+function getGoogleSheetsAuth() {
+  const scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
+  const credentials = getGoogleServiceAccountCredentials();
+  if (credentials) return new google.auth.GoogleAuth({ credentials, scopes });
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return new google.auth.GoogleAuth({ keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS, scopes });
+  }
+  return null;
+}
+
+async function readGoogleSheetValuesViaApi({ spreadsheetId, gid, range }) {
+  const auth = getGoogleSheetsAuth();
+  if (!auth) {
+    return {
+      rows: null,
+      mode: null,
+      warnings: ['Google Sheets API credentials не настроены, используется fallback CSV'],
+    };
+  }
+
+  const sheets = google.sheets({ version: 'v4', auth });
+  const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets.properties(sheetId,title)' });
+  const sheet = (metadata.data.sheets || [])
+    .map((item) => item.properties)
+    .find((properties) => String(properties.sheetId) === String(gid)) || metadata.data.sheets?.[0]?.properties;
+  if (!sheet?.title) throw new Error('Не удалось определить лист Google Sheets по gid');
+
+  const a1Range = buildSheetA1Range(sheet.title, range);
+  const values = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: a1Range,
+    valueRenderOption: 'FORMATTED_VALUE',
+    dateTimeRenderOption: 'FORMATTED_STRING',
+  });
+
+  return {
+    rows: values.data.values || [],
+    mode: 'google_api',
+    warnings: [],
+    effectiveRange: stripSheetNameFromRange(range || 'A:L'),
+  };
+}
+
+async function fetchCsvRows(url, mode) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error('Не удалось скачать Google Sheet. Проверьте доступ по ссылке.');
+  const csv = await response.text();
+  if (/^\s*</.test(csv)) throw new Error('Google Sheet не отдал CSV. Проверьте, что файл доступен по ссылке.');
+  return { rows: parseCsv(csv), mode };
+}
+
+async function getGoogleSheetsValues({ spreadsheetId, gid, range }) {
+  const warnings = [];
+  try {
+    const apiResult = await readGoogleSheetValuesViaApi({ spreadsheetId, gid, range });
+    warnings.push(...(apiResult.warnings || []));
+    if (apiResult.rows) return { ...apiResult, warnings, range: apiResult.effectiveRange || range || 'A:L' };
+  } catch (error) {
+    warnings.push(`Google Sheets API недоступен: ${error.message}`);
+  }
+
+  const cleanRange = stripSheetNameFromRange(range || 'A:L');
+  const gvizUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}${cleanRange ? `&range=${encodeURIComponent(cleanRange)}` : ''}`;
+  try {
+    const result = await fetchCsvRows(gvizUrl, 'gviz_csv');
+    return { ...result, warnings, range: cleanRange };
+  } catch (error) {
+    warnings.push(`GViz CSV недоступен: ${error.message}`);
+  }
+
+  const exportUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${encodeURIComponent(gid)}${cleanRange ? `&range=${encodeURIComponent(cleanRange)}` : ''}`;
+  const result = await fetchCsvRows(exportUrl, 'export_csv');
+  return { ...result, warnings, range: cleanRange };
 }
 
 function parseCsv(csv) {
@@ -564,7 +673,24 @@ function buildSheetHeaderMap(row) {
     if (header === 'CREDITALA') map.creditAla = index;
     if (header === 'TOTAL' || header === 'ИТОГО') map.total = index;
   });
-  return map.date != null && map.marking != null && map.pcs != null && map.kg != null ? map : null;
+  return map.date != null && map.marking != null && map.brand != null && map.pcs != null && map.kg != null ? map : null;
+}
+
+function defaultSheetHeaderMap() {
+  return {
+    date: 0,
+    marking: 1,
+    brand: 2,
+    pcs: 3,
+    box: 4,
+    kg: 5,
+    class: 6,
+    tarifDxb: 7,
+    tarifAla: 8,
+    creditDxb: 9,
+    creditAla: 10,
+    total: 11,
+  };
 }
 
 function parseSheetNumber(value) {
@@ -581,9 +707,22 @@ function parseSheetNumber(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
-function normalizeSheetDate(value) {
+function excelSerialDateToIso(value) {
+  const serial = Number(value);
+  if (!Number.isFinite(serial) || serial < 1) return null;
+  const millis = Math.round((serial - 25569) * 86400 * 1000);
+  const date = new Date(millis);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+function parseSheetDate(value, fallbackYear) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  if (typeof value === 'number') return excelSerialDateToIso(value);
+
   const raw = String(value || '').trim();
   if (!raw) return null;
+  if (/^\d+([.,]\d+)?$/.test(raw)) return excelSerialDateToIso(raw.replace(',', '.'));
   const iso = raw.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
   if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, '0')}-${String(iso[3]).padStart(2, '0')}`;
   const local = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
@@ -591,15 +730,43 @@ function normalizeSheetDate(value) {
     const year = local[3].length === 2 ? `20${local[3]}` : local[3];
     return `${year}-${String(local[2]).padStart(2, '0')}-${String(local[1]).padStart(2, '0')}`;
   }
+  const noYear = raw.match(/^(\d{1,2})[./-](\d{1,2})$/);
+  if (noYear && fallbackYear) {
+    return `${fallbackYear}-${String(noYear[2]).padStart(2, '0')}-${String(noYear[1]).padStart(2, '0')}`;
+  }
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+}
+
+function normalizeSheetDate(value) {
+  return parseSheetDate(value);
 }
 
 function isTotalOrEmptySheetRow(row) {
   const joined = row.map((cell) => String(cell || '').trim()).filter(Boolean).join(' ').toLowerCase();
   if (!joined) return true;
   return /^(итого|total|grand total)\b/.test(joined) || /\b(итого|grand total)\b/.test(joined);
+}
+
+function isRepeatedSheetHeader(row) {
+  return Boolean(buildSheetHeaderMap(row));
+}
+
+function isTotalSheetDataRow(row, headerMap) {
+  if (isTotalOrEmptySheetRow(row)) return true;
+  const dateValue = String(row[headerMap.date] || '').trim();
+  const markingValue = String(row[headerMap.marking] || '').trim();
+  const productValue = String(row[headerMap.brand] || '').trim();
+  const totalValue = String(row[headerMap.total] || '').trim();
+  if (normalizeHeader(dateValue) === 'DATE' || normalizeHeader(markingValue) === 'MARKING') return true;
+  if (/^(итого|total|grand total)$/i.test(markingValue)) return true;
+  if (!productValue && totalValue && !markingValue) return true;
+  return false;
+}
+
+function sheetFallbackYear(dateFrom, dateTo) {
+  return String(dateFrom || dateTo || '').match(/^(\d{4})/)?.[1] || String(new Date().getFullYear());
 }
 
 async function findOrCreateProductByName(productName, client = pool) {
@@ -1903,11 +2070,8 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     if (!url?.trim()) return res.status(400).json({ error: 'Ссылка на Google Sheet обязательна' });
 
     const { spreadsheetId, gid, range } = parseGoogleSheetUrl(url);
-    const csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${encodeURIComponent(gid)}${range ? `&range=${encodeURIComponent(range)}` : ''}`;
-    const response = await fetch(csvUrl);
-    if (!response.ok) throw new Error('Не удалось скачать Google Sheet. Проверьте доступ по ссылке.');
-    const csv = await response.text();
-    if (/^\s*</.test(csv)) throw new Error('Google Sheet не отдал CSV. Проверьте, что файл доступен по ссылке.');
+    const sheetRead = await getGoogleSheetsValues({ spreadsheetId, gid, range });
+    const sheetRows = Array.isArray(sheetRead.rows) ? sheetRead.rows : [];
 
     const cleanedImportRecords = await cleanupOrphanImportRecords();
     const tariffs = await all('SELECT * FROM tariffs WHERE is_active=TRUE ORDER BY is_default DESC, name');
@@ -1937,25 +2101,41 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     const productByName = new Map(products.map((product) => [normalizeText(product.name), product]));
 
     let headerMap = null;
+    const fallbackHeaderMap = defaultSheetHeaderMap();
+    let lastSeenDate = null;
+    const fallbackYear = sheetFallbackYear(date_from, date_to);
     const rows = [];
-    parseCsv(csv).forEach((sheetRow, rowIndex) => {
+    const datesFound = new Set();
+    let rowsAfterCleanup = 0;
+    let rowsAfterDateFilter = 0;
+
+    sheetRows.forEach((sheetRow, rowIndex) => {
+      const row = Array.from({ length: 12 }, (_, index) => sheetRow[index] ?? '');
       const maybeHeader = buildSheetHeaderMap(sheetRow);
       if (maybeHeader) {
         headerMap = maybeHeader;
         return;
       }
-      if (!headerMap || isTotalOrEmptySheetRow(sheetRow)) return;
+      const activeHeaderMap = headerMap || fallbackHeaderMap;
+      if (isRepeatedSheetHeader(row) || isTotalSheetDataRow(row, activeHeaderMap)) return;
 
-      const date = normalizeSheetDate(sheetRow[headerMap.date]);
-      const markingName = String(sheetRow[headerMap.marking] || '').trim();
-      const productName = String(sheetRow[headerMap.brand] || '').trim();
-      const quantityPcs = parseSheetNumber(sheetRow[headerMap.pcs]);
-      const weightKg = parseSheetNumber(sheetRow[headerMap.kg]);
+      const parsedDate = parseSheetDate(row[activeHeaderMap.date], fallbackYear);
+      if (parsedDate) lastSeenDate = parsedDate;
+      const markingName = String(row[activeHeaderMap.marking] || '').trim();
+      const productName = String(row[activeHeaderMap.brand] || '').trim();
+      const quantityPcs = parseSheetNumber(row[activeHeaderMap.pcs]);
+      const weightKg = parseSheetNumber(row[activeHeaderMap.kg]);
+      const hasImportData = Boolean(markingName || productName || quantityPcs > 0 || weightKg > 0);
+      const date = parsedDate || (hasImportData ? lastSeenDate : null);
       if (!date || !markingName || !productName || (!(quantityPcs > 0) && !(weightKg > 0))) return;
+
+      rowsAfterCleanup += 1;
+      datesFound.add(date);
       if (date_from && date < date_from) return;
       if (date_to && date > date_to) return;
+      rowsAfterDateFilter += 1;
 
-      const classCode = String(sheetRow[headerMap.class] || '').trim() || null;
+      const classCode = String(row[activeHeaderMap.class] || '').trim() || null;
       const marking = markingByName.get(normalizeText(markingName));
       const product = productByName.get(normalizeText(productName));
       const tariff = matchTariff(productName, classCode, tariffs);
@@ -1968,11 +2148,11 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         alaRate: tariff.ala_rate,
         alaUnit: tariff.ala_unit,
       });
-      const sheetDxbRate = parseSheetNumber(sheetRow[headerMap.tarifDxb]);
-      const sheetAlaRate = parseSheetNumber(sheetRow[headerMap.tarifAla]);
-      const sheetCreditDxb = parseSheetNumber(sheetRow[headerMap.creditDxb]);
-      const sheetCreditAla = parseSheetNumber(sheetRow[headerMap.creditAla]);
-      const sheetTotal = parseSheetNumber(sheetRow[headerMap.total]);
+      const sheetDxbRate = parseSheetNumber(row[activeHeaderMap.tarifDxb]);
+      const sheetAlaRate = parseSheetNumber(row[activeHeaderMap.tarifAla]);
+      const sheetCreditDxb = parseSheetNumber(row[activeHeaderMap.creditDxb]);
+      const sheetCreditAla = parseSheetNumber(row[activeHeaderMap.creditAla]);
+      const sheetTotal = parseSheetNumber(row[activeHeaderMap.total]);
       const warnings = [];
       const sourceRow = sourceRowOffset + rowIndex + 1;
       if (!product) warnings.push('Товар будет создан при импорте');
@@ -1995,7 +2175,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         product_id: product?.id || null,
         product_name: productName,
         quantity_pcs: quantityPcs,
-        box: parseSheetNumber(sheetRow[headerMap.box]),
+        box: parseSheetNumber(row[activeHeaderMap.box]),
         weight_kg: weightKg,
         class: classCode,
         sheet_dxb_rate: sheetDxbRate,
@@ -2052,6 +2232,19 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         ready_count: rows.filter((row) => row.status === 'ready').length,
         already_imported_count: rows.filter((row) => row.status === 'already_imported').length,
         marking_not_found_count: rows.filter((row) => row.status === 'marking_not_found').length,
+      },
+      debug_summary: {
+        read_mode: sheetRead.mode,
+        spreadsheet_id: spreadsheetId,
+        gid,
+        range: sheetRead.range || range || 'A:L',
+        rows_read: sheetRows.length,
+        rows_after_cleanup: rowsAfterCleanup,
+        dates_found: Array.from(datesFound).sort(),
+        filtered_date_from: date_from || null,
+        filtered_date_to: date_to || null,
+        rows_after_date_filter: rowsAfterDateFilter,
+        warnings: sheetRead.warnings || [],
       },
     });
   } catch (e) {
