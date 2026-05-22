@@ -57,8 +57,8 @@ const isPhoneProductName = (name) => {
 const defaultSaleUnit = (row) => row.sale_unit || (isPhoneProductName(row.product_name) ? 'pcs' : 'kg')
 const prepareImportRowsForSale = (rows) => normalizeArray(rows).map(row => ({
   ...row,
-  sale_unit: defaultSaleUnit(row),
-  sale_price: row.sale_price ?? '',
+  sale_unit: row.sale_unit || row.suggested_sale_unit || defaultSaleUnit(row),
+  sale_price: row.sale_price ?? row.suggested_sale_price ?? '',
 }))
 const importSaleBase = (row) => row.sale_unit === 'pcs' ? toNumber(row.quantity_pcs) : toNumber(row.weight_kg)
 const importSaleTotal = (row) => Math.round(importSaleBase(row) * toNumber(row.sale_price) * 100) / 100
@@ -844,6 +844,7 @@ export default function Receipts() {
                       <th>ALA ед.</th>
                       <th>Себест. app</th>
                       <th>TOTAL sheet</th>
+                      {importWithSale && <th>Тариф реализации</th>}
                       {importWithSale && <th>Ед. реал.</th>}
                       {importWithSale && <th>Цена реал.</th>}
                       {importWithSale && <th>Итого реал.</th>}
@@ -872,6 +873,16 @@ export default function Receipts() {
                         <td><span className="badge badge-neutral">{row.app_ala_unit === 'pcs' ? 'шт' : 'кг'}</span></td>
                         <td><span className="badge badge-warning">{fmtMoney(row.app_total)}</span></td>
                         <td className="td-mono">{fmtMoney(row.sheet_total)}</td>
+                        {importWithSale && (
+                          <td>
+                            <div>{row.sale_tariff_name || '—'}</div>
+                            {toNumber(row.suggested_sale_price) > 0 && (
+                              <div className="td-muted" style={{ fontSize: 11 }}>
+                                {fmtMoney(row.suggested_sale_price)} / {row.suggested_sale_unit === 'pcs' ? 'шт' : 'кг'}
+                              </div>
+                            )}
+                          </td>
+                        )}
                         {importWithSale && (
                           <td>
                             <select

@@ -266,11 +266,14 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS tariffs (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
+      tariff_type TEXT DEFAULT 'purchase',
       product_pattern TEXT,
       class_code TEXT,
       dxb_rate NUMERIC DEFAULT 5.5,
       ala_rate NUMERIC DEFAULT 0,
       ala_unit TEXT CHECK(ala_unit IN ('kg','pcs')) DEFAULT 'kg',
+      sale_rate NUMERIC DEFAULT 0,
+      sale_unit TEXT DEFAULT 'kg',
       is_default BOOLEAN DEFAULT FALSE,
       is_active BOOLEAN DEFAULT TRUE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -303,6 +306,9 @@ async function initDb() {
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS ala_unit TEXT DEFAULT 'kg';
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS total_cost NUMERIC DEFAULT 0;
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS class_code TEXT;
+    ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS tariff_type TEXT DEFAULT 'purchase';
+    ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_rate NUMERIC DEFAULT 0;
+    ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_unit TEXT DEFAULT 'kg';
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE SET NULL;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
@@ -322,6 +328,13 @@ async function initDb() {
       AND t.related_id = p.id;
   `);
 
+  await query(`
+    UPDATE tariffs
+    SET tariff_type='purchase'
+    WHERE tariff_type IS NULL OR tariff_type NOT IN ('purchase','sale');
+    UPDATE tariffs SET sale_unit='kg' WHERE sale_unit IS NULL OR sale_unit NOT IN ('kg','pcs');
+  `);
+
   const tariffCount = await get('SELECT COUNT(*)::int AS count FROM tariffs');
   if (!tariffCount?.count) {
     await query(`
@@ -329,6 +342,19 @@ async function initDb() {
       VALUES
         ('Базовый тариф', NULL, NULL, 5.5, 3, 'kg', TRUE, TRUE),
         ('Телефоны', 'phone,iphone,айфон,телефон,smartphone', NULL, 5.5, 3, 'pcs', FALSE, TRUE)
+    `);
+  }
+
+  const saleTariffCount = await get("SELECT COUNT(*)::int AS count FROM tariffs WHERE tariff_type='sale' AND is_active=TRUE");
+  if (!saleTariffCount?.count) {
+    await query(`
+      INSERT INTO tariffs(name,tariff_type,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,sale_rate,sale_unit,is_default,is_active)
+      VALUES
+        ('Реализация класс A', 'sale', NULL, 'A', 0, 0, 'kg', 0, 'kg', FALSE, TRUE),
+        ('Реализация класс B', 'sale', NULL, 'B', 0, 0, 'kg', 0, 'kg', FALSE, TRUE),
+        ('Реализация класс C', 'sale', NULL, 'C', 0, 0, 'kg', 0, 'kg', FALSE, TRUE),
+        ('Реализация класс D', 'sale', NULL, 'D', 0, 0, 'kg', 0, 'kg', FALSE, TRUE),
+        ('Реализация класс E', 'sale', NULL, 'E', 0, 0, 'kg', 0, 'kg', FALSE, TRUE)
     `);
   }
 
@@ -397,7 +423,7 @@ function tariffClassMatches(tariff, classCode) {
 }
 
 function matchTariff(productName, classCode, tariffs = []) {
-  const active = tariffs.filter((tariff) => tariff && tariff.is_active !== false);
+  const active = tariffs.filter((tariff) => tariff && tariff.is_active !== false && normalizeText(tariff.tariff_type || 'purchase') === 'purchase');
   const productAndClass = active.find((tariff) => tariffProductMatches(tariff, productName) && tariffClassMatches(tariff, classCode));
   if (productAndClass) return productAndClass;
 
@@ -416,6 +442,29 @@ function matchTariff(productName, classCode, tariffs = []) {
     dxb_rate: 5.5,
     ala_rate: 0,
     ala_unit: isPhoneProduct(productName) ? 'pcs' : 'kg',
+  };
+}
+
+function matchSaleTariff(productName, classCode, tariffs = []) {
+  const active = tariffs.filter((tariff) => tariff && tariff.is_active !== false && normalizeText(tariff.tariff_type) === 'sale');
+  const productAndClass = active.find((tariff) => tariffProductMatches(tariff, productName) && tariffClassMatches(tariff, classCode));
+  if (productAndClass) return productAndClass;
+
+  const productOnly = active.find((tariff) => tariffProductMatches(tariff, productName) && !normalizeText(tariff.class_code));
+  if (productOnly) return productOnly;
+
+  const classOnly = active.find((tariff) => !splitPattern(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
+  if (classOnly) return classOnly;
+
+  const defaultTariff = active.find((tariff) => tariff.is_default);
+  if (defaultTariff) return defaultTariff;
+
+  return {
+    id: null,
+    name: 'Не найден',
+    sale_rate: 0,
+    sale_unit: isPhoneProduct(productName) ? 'pcs' : 'kg',
+    missing: true,
   };
 }
 
@@ -2017,19 +2066,25 @@ app.get('/api/tariffs', async (req, res) => {
 
 app.post('/api/tariffs', async (req, res) => {
   const body = req.body;
+  const tariffType = body.tariff_type || 'purchase';
   if (!body.name?.trim()) return res.status(400).json({ error: 'Название обязательно' });
-  if (!['kg', 'pcs'].includes(body.ala_unit)) return res.status(400).json({ error: 'ALA единица обязательна' });
+  if (!['purchase', 'sale'].includes(tariffType)) return res.status(400).json({ error: 'Тип тарифа обязателен' });
+  if (!['kg', 'pcs'].includes(body.ala_unit || 'kg')) return res.status(400).json({ error: 'ALA единица обязательна' });
+  if (!['kg', 'pcs'].includes(body.sale_unit || 'kg')) return res.status(400).json({ error: 'Единица реализации обязательна' });
   const row = await get(`
-    INSERT INTO tariffs(name,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,is_default,is_active)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    INSERT INTO tariffs(name,tariff_type,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,sale_rate,sale_unit,is_default,is_active)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     RETURNING id
   `, [
     body.name.trim(),
+    tariffType,
     body.product_pattern?.trim() || null,
     body.class_code?.trim() || null,
     +body.dxb_rate || 0,
     +body.ala_rate || 0,
-    body.ala_unit,
+    body.ala_unit || 'kg',
+    +body.sale_rate || 0,
+    body.sale_unit || 'kg',
     Boolean(body.is_default),
     body.is_active !== false,
   ]);
@@ -2038,19 +2093,25 @@ app.post('/api/tariffs', async (req, res) => {
 
 app.put('/api/tariffs/:id', async (req, res) => {
   const body = req.body;
+  const tariffType = body.tariff_type || 'purchase';
   if (!body.name?.trim()) return res.status(400).json({ error: 'Название обязательно' });
-  if (!['kg', 'pcs'].includes(body.ala_unit)) return res.status(400).json({ error: 'ALA единица обязательна' });
+  if (!['purchase', 'sale'].includes(tariffType)) return res.status(400).json({ error: 'Тип тарифа обязателен' });
+  if (!['kg', 'pcs'].includes(body.ala_unit || 'kg')) return res.status(400).json({ error: 'ALA единица обязательна' });
+  if (!['kg', 'pcs'].includes(body.sale_unit || 'kg')) return res.status(400).json({ error: 'Единица реализации обязательна' });
   await query(`
     UPDATE tariffs
-    SET name=$1,product_pattern=$2,class_code=$3,dxb_rate=$4,ala_rate=$5,ala_unit=$6,is_default=$7,is_active=$8
-    WHERE id=$9
+    SET name=$1,tariff_type=$2,product_pattern=$3,class_code=$4,dxb_rate=$5,ala_rate=$6,ala_unit=$7,sale_rate=$8,sale_unit=$9,is_default=$10,is_active=$11
+    WHERE id=$12
   `, [
     body.name.trim(),
+    tariffType,
     body.product_pattern?.trim() || null,
     body.class_code?.trim() || null,
     +body.dxb_rate || 0,
     +body.ala_rate || 0,
-    body.ala_unit,
+    body.ala_unit || 'kg',
+    +body.sale_rate || 0,
+    body.sale_unit || 'kg',
     Boolean(body.is_default),
     body.is_active !== false,
     +req.params.id,
@@ -2139,6 +2200,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       const marking = markingByName.get(normalizeText(markingName));
       const product = productByName.get(normalizeText(productName));
       const tariff = matchTariff(productName, classCode, tariffs);
+      const saleTariff = matchSaleTariff(productName, classCode, tariffs);
       const cost = calculateImportCost({
         productName,
         classCode,
@@ -2154,8 +2216,13 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       const sheetCreditAla = parseSheetNumber(row[activeHeaderMap.creditAla]);
       const sheetTotal = parseSheetNumber(row[activeHeaderMap.total]);
       const warnings = [];
+      const suggestedSaleUnit = ['kg', 'pcs'].includes(saleTariff.sale_unit) ? saleTariff.sale_unit : (isPhoneProduct(productName) ? 'pcs' : 'kg');
+      const suggestedSalePrice = +saleTariff.sale_rate || 0;
+      const suggestedSaleBase = suggestedSaleUnit === 'pcs' ? quantityPcs : weightKg;
+      const suggestedSaleTotal = suggestedSaleBase * suggestedSalePrice;
       const sourceRow = sourceRowOffset + rowIndex + 1;
       if (!product) warnings.push('Товар будет создан при импорте');
+      if (saleTariff.missing) warnings.push('Тариф реализации не найден');
       if (deletedReceiptRows.has(sourceRow)) warnings.push('Ранее импортировалось, но приход был удалён');
       if (sheetTotal && Math.abs(sheetTotal - cost.totalCost) > 0.01) warnings.push('TOTAL в таблице отличается от расчёта приложения');
 
@@ -2191,6 +2258,11 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         app_dxb_cost: cost.dxbCost,
         app_ala_cost: cost.alaCost,
         app_total: cost.totalCost,
+        sale_tariff_id: saleTariff.id || null,
+        sale_tariff_name: saleTariff.name || 'Не найден',
+        suggested_sale_unit: suggestedSaleUnit,
+        suggested_sale_price: suggestedSalePrice,
+        suggested_sale_total: suggestedSaleTotal,
         status,
         warnings,
       });
