@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import Modal from '../components/Modal'
 import api from '../api'
 import { formatDate, normalizeArray, toNumber } from '../utils/data'
@@ -14,6 +14,22 @@ const receiptTotalCost = (receipt) => {
   if (apiTotal) return apiTotal
   return normalizeArray(receipt?.items).reduce((sum, item) => sum + itemTotalCost(item), 0)
 }
+const receiptDateKey = (value) => {
+  if (!value) return 'no-date'
+  const raw = String(value).trim()
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`
+  const parsed = new Date(raw)
+  return Number.isNaN(parsed.getTime()) ? 'no-date' : parsed.toISOString().slice(0, 10)
+}
+const compareReceiptDateKeysDesc = (a, b) => {
+  if (a === b) return 0
+  if (a === 'no-date') return 1
+  if (b === 'no-date') return -1
+  return b.localeCompare(a)
+}
+const receiptDateLabel = (key) => key === 'no-date' ? 'Без даты' : formatDate(key)
+const receiptClientKey = (receipt) => receipt.client_id ? `id:${receipt.client_id}` : `name:${String(receipt.client_name || '').trim().toLowerCase()}`
 const IMPORT_EMPTY = { url: '', date_from: '', date_to: '', supplier_id: '', mode: 'receipt_only' }
 const STATUS_LABELS = {
   ready: 'Готово',
@@ -50,6 +66,8 @@ export default function Receipts() {
   const [importError, setImportError] = useState('')
   const [importLoading, setImportLoading] = useState(false)
   const [importCommitting, setImportCommitting] = useState(false)
+  const [viewMode, setViewMode] = useState('dates')
+  const [expandedDate, setExpandedDate] = useState(null)
 
   const load = () => {
     setLoading(true)
@@ -222,6 +240,44 @@ export default function Receipts() {
   const debugSummary = importPreview?.debug_summary || null
   const hasMarkingProblems = previewRows.some(row => row.status === 'marking_not_found')
   const hasReadyRows = previewRows.some(row => row.status === 'ready')
+  const sortedReceipts = useMemo(() => normalizeArray(receipts)
+    .slice()
+    .sort((a, b) => compareReceiptDateKeysDesc(receiptDateKey(a.date), receiptDateKey(b.date)) || toNumber(b.id) - toNumber(a.id)), [receipts])
+  const dateGroups = useMemo(() => {
+    const groups = new Map()
+    sortedReceipts.forEach(receipt => {
+      const key = receiptDateKey(receipt.date)
+      if (!groups.has(key)) {
+        groups.set(key, {
+          date_key: key,
+          documents_count: 0,
+          clients: new Set(),
+          items_count: 0,
+          total_weight: 0,
+          total_quantity: 0,
+          total_cost: 0,
+          receipts: [],
+        })
+      }
+      const group = groups.get(key)
+      group.documents_count += 1
+      if (receiptClientKey(receipt) !== 'name:') group.clients.add(receiptClientKey(receipt))
+      group.items_count += toNumber(receipt.items_count)
+      group.total_weight += toNumber(receipt.total_weight)
+      group.total_quantity += toNumber(receipt.total_quantity)
+      group.total_cost += receiptTotalCost(receipt)
+      group.receipts.push(receipt)
+    })
+    return Array.from(groups.values())
+      .map(group => ({ ...group, clients_count: group.clients.size }))
+      .sort((a, b) => compareReceiptDateKeysDesc(a.date_key, b.date_key))
+  }, [sortedReceipts])
+  const pageSummary = useMemo(() => ({
+    documents: sortedReceipts.length,
+    days: dateGroups.length,
+    total_weight: dateGroups.reduce((sum, group) => sum + group.total_weight, 0),
+    total_cost: dateGroups.reduce((sum, group) => sum + group.total_cost, 0),
+  }), [sortedReceipts.length, dateGroups])
   const formItemTotalCost = (item) => {
     const product = products.find(p => String(p.id) === String(item.product_id))
     const productName = String(product?.name || '').toLowerCase()
@@ -236,12 +292,64 @@ export default function Receipts() {
     return (weight * toNumber(item.cost_dubai)) + (alaBase * toNumber(item.cost_almaty))
   }
 
+  const renderReceiptsTable = (rows, { showDate = true, showQuantity = false } = {}) => (
+    <div className="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            {showDate && <th>Дата</th>}
+            <th>Поставщик</th>
+            <th>Клиент</th>
+            <th>Товаров</th>
+            <th>Вес</th>
+            {showQuantity && <th>Количество</th>}
+            <th>Сумма</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr><td colSpan={6 + (showDate ? 1 : 0) + (showQuantity ? 1 : 0)}>
+              <div className="empty-state"><p>Документов прихода нет</p></div>
+            </td></tr>
+          )}
+          {rows.map(receipt => (
+            <tr key={receipt.id}>
+              {showDate && <td className="td-muted td-date">{formatDate(receipt.date)}</td>}
+              <td>{receipt.supplier_name || '—'}</td>
+              <td>{receipt.client_name || '—'}</td>
+              <td className="td-mono">{receipt.items_count || 0}</td>
+              <td className="td-mono">{fmtNum(receipt.total_weight, 3)} кг</td>
+              {showQuantity && <td className="td-mono">{fmtNum(receipt.total_quantity, 0)} шт</td>}
+              <td><span className="badge badge-warning">{fmtMoney(receiptTotalCost(receipt))}</span></td>
+              <td>
+                <div className="td-actions">
+                  <button className="btn btn-primary btn-sm" onClick={() => openReceipt(receipt)} disabled={detailsLoading}>
+                    Открыть
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => openEdit(receipt)} disabled={detailsLoading}>
+                    ✏️ Редактировать
+                  </button>
+                  <button className="btn btn-danger btn-sm" onClick={() => deleteReceipt(receipt)}>
+                    🗑 Удалить
+                  </button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+
   return (
     <div className="page">
       <div className="page-header">
         <div>
           <div className="page-title">Приходы</div>
-          <div className="page-subtitle">{receipts.length} документов</div>
+          <div className="page-subtitle">
+            {pageSummary.documents} документов · {pageSummary.days} дней · {fmtNum(pageSummary.total_weight, 3)} кг · {fmtMoney(pageSummary.total_cost)}
+          </div>
         </div>
         <div className="td-actions">
           <button className="btn btn-secondary" onClick={openImport}>Импорт из Google Sheets</button>
@@ -250,52 +358,66 @@ export default function Receipts() {
         </div>
       </div>
 
+      <div className="tabs">
+        <button className={`tab${viewMode === 'dates' ? ' active' : ''}`} onClick={() => setViewMode('dates')}>По датам</button>
+        <button className={`tab${viewMode === 'list' ? ' active' : ''}`} onClick={() => setViewMode('list')}>Списком</button>
+      </div>
+
       {loading ? <div className="loading">Загрузка...</div> : (
-        <div className="table-wrapper">
-          <table>
-            <thead>
-              <tr>
-                <th>Дата</th>
-                <th>Поставщик</th>
-                <th>Клиент</th>
-                <th>Товаров</th>
-                <th>Вес</th>
-                <th>Сумма</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {receipts.length === 0 && (
-                <tr><td colSpan={7}>
-                  <div className="empty-state"><p>Документов прихода нет</p></div>
-                </td></tr>
-              )}
-              {receipts.map(receipt => (
-                <tr key={receipt.id}>
-                  <td className="td-muted td-date">{formatDate(receipt.date)}</td>
-                  <td>{receipt.supplier_name || '—'}</td>
-                  <td>{receipt.client_name || '—'}</td>
-                  <td className="td-mono">{receipt.items_count || 0}</td>
-                  <td className="td-mono">{fmtNum(receipt.total_weight, 3)} кг</td>
-                  <td><span className="badge badge-warning">{fmtMoney(receiptTotalCost(receipt))}</span></td>
-                  <td>
-                    <div className="td-actions">
-                      <button className="btn btn-primary btn-sm" onClick={() => openReceipt(receipt)} disabled={detailsLoading}>
-                        Открыть
-                      </button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => openEdit(receipt)} disabled={detailsLoading}>
-                        ✏️ Редактировать
-                      </button>
-                      <button className="btn btn-danger btn-sm" onClick={() => deleteReceipt(receipt)}>
-                        🗑 Удалить
-                      </button>
-                    </div>
-                  </td>
+        viewMode === 'list' ? renderReceiptsTable(sortedReceipts) : (
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Дата</th>
+                  <th>Документов</th>
+                  <th>Клиентов</th>
+                  <th>Товаров</th>
+                  <th>Общий вес</th>
+                  <th>Общее количество</th>
+                  <th>Общая сумма</th>
+                  <th>Действие</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {dateGroups.length === 0 && (
+                  <tr><td colSpan={8}>
+                    <div className="empty-state"><p>Документов прихода нет</p></div>
+                  </td></tr>
+                )}
+                {dateGroups.map(group => (
+                  <Fragment key={group.date_key}>
+                    <tr key={group.date_key}>
+                      <td className="td-date">{receiptDateLabel(group.date_key)}</td>
+                      <td className="td-mono">{group.documents_count}</td>
+                      <td className="td-mono">{group.clients_count}</td>
+                      <td className="td-mono">{group.items_count}</td>
+                      <td className="td-mono">{fmtNum(group.total_weight, 3)} кг</td>
+                      <td className="td-mono">{fmtNum(group.total_quantity, 0)} шт</td>
+                      <td><span className="badge badge-warning">{fmtMoney(group.total_cost)}</span></td>
+                      <td>
+                        <button
+                          className="btn btn-primary btn-sm"
+                          onClick={() => setExpandedDate(expandedDate === group.date_key ? null : group.date_key)}
+                        >
+                          {expandedDate === group.date_key ? 'Скрыть' : 'Открыть'}
+                        </button>
+                      </td>
+                    </tr>
+                    {expandedDate === group.date_key && (
+                      <tr key={`${group.date_key}-details`}>
+                        <td colSpan={8}>
+                          <div style={{ fontWeight: 700, marginBottom: 10 }}>Приходы за {receiptDateLabel(group.date_key)}</div>
+                          {renderReceiptsTable(group.receipts, { showDate: false, showQuantity: true })}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
       )}
 
       {selected && (
