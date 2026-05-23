@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
 import { formatDate, formatType, normalizeArray, toNumber } from '../utils/data'
@@ -8,6 +8,23 @@ const EMPTY_FORM = { date: today(), client_id: '', marking_id: '' }
 const EMPTY_ITEM = { product_id: '', sale_unit: '', quantity: '', price_per_unit: '', notes: '' }
 const UNIT_LABELS = { kg: 'кг', pcs: 'шт' }
 const fmt = (n) => n != null ? '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'
+const fmtNum = (n, digits = 2) => toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+const saleDateKey = (value) => {
+  if (!value) return 'no-date'
+  const raw = String(value).trim()
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`
+  const parsed = new Date(raw)
+  return Number.isNaN(parsed.getTime()) ? 'no-date' : parsed.toISOString().slice(0, 10)
+}
+const compareSaleDateKeysDesc = (a, b) => {
+  if (a === b) return 0
+  if (a === 'no-date') return 1
+  if (b === 'no-date') return -1
+  return b.localeCompare(a)
+}
+const saleDateLabel = (key) => key === 'no-date' ? 'Без даты' : formatDate(key)
+const saleClientKey = (sale) => sale.client_id ? `id:${sale.client_id}` : `name:${String(sale.client_name || '').trim().toLowerCase()}`
 
 export default function Sales() {
   const [sales, setSales] = useState([])
@@ -22,6 +39,8 @@ export default function Sales() {
   const [items, setItems] = useState([EMPTY_ITEM])
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
+  const [viewMode, setViewMode] = useState('dates')
+  const [expandedDate, setExpandedDate] = useState(null)
 
   const loadRef = () => Promise.all([api.getClients(), api.getProducts(), api.getMarkings()])
     .then(([c, p, m]) => {
@@ -57,10 +76,59 @@ export default function Sales() {
   }
 
   const previewTotal = items.reduce((sum, item) => sum + (toNumber(item.quantity) * toNumber(item.price_per_unit)), 0)
-  const totalAmount = normalizeArray(sales).reduce((sum, row) => sum + toNumber(row.total_amount), 0)
   const saleItems = (sale) => normalizeArray(sale.items)
   const itemCount = (sale) => toNumber(sale.items_count) || saleItems(sale).length
   const itemQty = (item) => `${toNumber(item.quantity).toLocaleString('ru-RU', { maximumFractionDigits: 3 })} ${UNIT_LABELS[item.sale_unit] || item.sale_unit || ''}`.trim()
+  const saleTotalWeight = (sale) => saleItems(sale).reduce((sum, item) => sum + (item.sale_unit === 'kg' ? toNumber(item.quantity) : 0), 0)
+  const saleTotalQuantity = (sale) => saleItems(sale).reduce((sum, item) => sum + (item.sale_unit === 'pcs' ? toNumber(item.quantity) : 0), 0)
+  const sortedSales = useMemo(() => normalizeArray(sales)
+    .slice()
+    .sort((a, b) => compareSaleDateKeysDesc(saleDateKey(a.date), saleDateKey(b.date)) || toNumber(b.sales_document_id || b.id) - toNumber(a.sales_document_id || a.id)), [sales])
+  const dateGroups = useMemo(() => {
+    const groups = new Map()
+    sortedSales.forEach((sale) => {
+      const key = saleDateKey(sale.date)
+      if (!groups.has(key)) {
+        groups.set(key, {
+          date_key: key,
+          documents_count: 0,
+          clients: new Set(),
+          items_count: 0,
+          total_weight: 0,
+          total_quantity: 0,
+          total_amount: 0,
+          paid_amount: 0,
+          debt: 0,
+          sales: [],
+        })
+      }
+      const group = groups.get(key)
+      group.documents_count += 1
+      if (saleClientKey(sale) !== 'name:') group.clients.add(saleClientKey(sale))
+      group.items_count += itemCount(sale)
+      group.total_weight += saleTotalWeight(sale)
+      group.total_quantity += saleTotalQuantity(sale)
+      group.total_amount += toNumber(sale.total_amount)
+      group.paid_amount += toNumber(sale.paid_amount)
+      group.debt += toNumber(sale.debt)
+      group.sales.push(sale)
+    })
+    return Array.from(groups.values())
+      .map(group => ({ ...group, clients_count: group.clients.size }))
+      .sort((a, b) => compareSaleDateKeysDesc(a.date_key, b.date_key))
+  }, [sortedSales])
+  const pageSummary = useMemo(() => ({
+    documents: sortedSales.length,
+    days: dateGroups.length,
+    total_amount: dateGroups.reduce((sum, group) => sum + group.total_amount, 0),
+    paid_amount: dateGroups.reduce((sum, group) => sum + group.paid_amount, 0),
+    debt: dateGroups.reduce((sum, group) => sum + group.debt, 0),
+  }), [sortedSales.length, dateGroups])
+
+  const openView = (sale) => {
+    setSelected(sale)
+    setModal('view')
+  }
 
   const openCreate = () => {
     setSelected(null)
@@ -132,12 +200,74 @@ export default function Sales() {
     }
   }
 
+  const renderSalesTable = (rows, { showDate = true } = {}) => (
+    <div className="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            {showDate && <th>Дата</th>}
+            <th>Клиент</th>
+            <th>Маркировка</th>
+            <th>Товары</th>
+            <th>Итого</th>
+            <th>Оплачено</th>
+            <th>Долг</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr><td colSpan={7 + (showDate ? 1 : 0)}>
+              <div className="empty-state"><div className="empty-icon">📤</div><p>Продаж нет</p></div>
+            </td></tr>
+          )}
+          {rows.map((sale) => {
+            const saleRows = saleItems(sale)
+            return (
+              <tr key={sale.sales_document_id ? `doc-${sale.sales_document_id}` : `sale-${sale.id}`}>
+                {showDate && <td className="td-muted td-date">{formatDate(sale.date)}</td>}
+                <td>{sale.client_name || '—'}</td>
+                <td>{sale.marking ? <span className="badge badge-primary">{sale.marking}</span> : '—'}</td>
+                <td>
+                  <div style={{ display: 'grid', gap: 6 }}>
+                    <span className="badge badge-primary" style={{ width: 'fit-content' }}>{itemCount(sale)} тов.</span>
+                    <div style={{ display: 'grid', gap: 4 }}>
+                      {saleRows.map((item) => (
+                        <div key={item.id} className="td-muted" style={{ fontSize: 12 }}>
+                          <strong style={{ color: 'var(--text-primary)' }}>{item.product_name || 'Товар'}</strong>
+                          {' — '}{itemQty(item)} × {fmt(item.price_per_unit)} = {fmt(item.total_amount)}
+                          {item.notes ? <span> · {item.notes}</span> : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </td>
+                <td><span className="badge badge-success">{fmt(sale.total_amount)}</span></td>
+                <td className="td-mono td-muted">{fmt(sale.paid_amount)}</td>
+                <td><span className={`badge ${toNumber(sale.debt) > 0 ? 'badge-warning' : 'badge-success'}`}>{fmt(sale.debt)}</span></td>
+                <td>
+                  <div className="td-actions">
+                    <button className="btn btn-primary btn-sm" onClick={() => openView(sale)}>Открыть</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => openEdit(sale)}>Изм.</button>
+                    <button className="btn btn-danger btn-sm" onClick={() => openDelete(sale)}>✕</button>
+                  </div>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+
   return (
     <div className="page">
       <div className="page-header">
         <div>
           <div className="page-title">Реализация</div>
-          <div className="page-subtitle">{normalizeArray(sales).length} реализаций · итого {fmt(totalAmount)}</div>
+          <div className="page-subtitle">
+            {pageSummary.documents} документов · {pageSummary.days} дней · реализация {fmt(pageSummary.total_amount)} · оплачено {fmt(pageSummary.paid_amount)} · долг {fmt(pageSummary.debt)}
+          </div>
         </div>
         <button className="btn btn-primary" onClick={openCreate}>+ Добавить продажу</button>
       </div>
@@ -160,68 +290,127 @@ export default function Sales() {
         )}
       </div>
 
+      <div className="tabs">
+        <button className={`tab${viewMode === 'dates' ? ' active' : ''}`} onClick={() => setViewMode('dates')}>По датам</button>
+        <button className={`tab${viewMode === 'list' ? ' active' : ''}`} onClick={() => setViewMode('list')}>Списком</button>
+      </div>
+
       {loading ? <div className="loading">Загрузка...</div> : (
-        <div className="table-wrapper">
-          <table>
-            <thead>
-              <tr>
-                <th>Дата</th>
-                <th>Клиент</th>
-                <th>Маркировка</th>
-                <th>Товары</th>
-                <th>Итого</th>
-                <th>Оплачено</th>
-                <th>Долг</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {normalizeArray(sales).length === 0 && (
-                <tr><td colSpan={8}>
-                  <div className="empty-state"><div className="empty-icon">📤</div><p>Продаж нет</p></div>
-                </td></tr>
-              )}
-              {normalizeArray(sales).map((sale) => {
-                const rows = saleItems(sale)
-                return (
-                  <tr key={sale.sales_document_id ? `doc-${sale.sales_document_id}` : `sale-${sale.id}`}>
-                    <td className="td-muted td-date">{formatDate(sale.date)}</td>
-                    <td>{sale.client_name || '—'}</td>
-                    <td>{sale.marking ? <span className="badge badge-primary">{sale.marking}</span> : '—'}</td>
-                    <td>
-                      <div style={{ display: 'grid', gap: 6 }}>
-                        <span className="badge badge-primary" style={{ width: 'fit-content' }}>{itemCount(sale)} тов.</span>
-                        <div style={{ display: 'grid', gap: 4 }}>
-                          {rows.map((item) => (
-                            <div key={item.id} className="td-muted" style={{ fontSize: 12 }}>
-                              <strong style={{ color: 'var(--text-primary)' }}>{item.product_name || 'Товар'}</strong>
-                              {' — '}{itemQty(item)} × {fmt(item.price_per_unit)} = {fmt(item.total_amount)}
-                              {item.notes ? <span> · {item.notes}</span> : null}
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </td>
-                    <td><span className="badge badge-success">{fmt(sale.total_amount)}</span></td>
-                    <td className="td-mono td-muted">{fmt(sale.paid_amount)}</td>
-                    <td><span className={`badge ${toNumber(sale.debt) > 0 ? 'badge-warning' : 'badge-success'}`}>{fmt(sale.debt)}</span></td>
-                    <td>
-                      <div className="td-actions">
+        viewMode === 'list' ? renderSalesTable(sortedSales) : (
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Дата</th>
+                  <th>Документов</th>
+                  <th>Клиентов</th>
+                  <th>Товаров</th>
+                  <th>Общий вес</th>
+                  <th>Общее количество</th>
+                  <th>Сумма реализации</th>
+                  <th>Оплачено</th>
+                  <th>Долг</th>
+                  <th>Действие</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dateGroups.length === 0 && (
+                  <tr><td colSpan={10}>
+                    <div className="empty-state"><div className="empty-icon">📤</div><p>Продаж нет</p></div>
+                  </td></tr>
+                )}
+                {dateGroups.map(group => (
+                  <Fragment key={group.date_key}>
+                    <tr>
+                      <td className="td-date">{saleDateLabel(group.date_key)}</td>
+                      <td className="td-mono">{group.documents_count}</td>
+                      <td className="td-mono">{group.clients_count}</td>
+                      <td className="td-mono">{group.items_count}</td>
+                      <td className="td-mono">{fmtNum(group.total_weight, 3)} кг</td>
+                      <td className="td-mono">{fmtNum(group.total_quantity, 0)} шт</td>
+                      <td><span className="badge badge-success">{fmt(group.total_amount)}</span></td>
+                      <td className="td-mono td-muted">{fmt(group.paid_amount)}</td>
+                      <td><span className={`badge ${group.debt > 0 ? 'badge-warning' : 'badge-success'}`}>{fmt(group.debt)}</span></td>
+                      <td>
                         <button
-                          className="btn btn-ghost btn-sm"
-                          onClick={() => openEdit(sale)}
+                          className="btn btn-primary btn-sm"
+                          onClick={() => setExpandedDate(expandedDate === group.date_key ? null : group.date_key)}
                         >
-                          Изм.
+                          {expandedDate === group.date_key ? 'Скрыть' : 'Открыть'}
                         </button>
-                        <button className="btn btn-danger btn-sm" onClick={() => openDelete(sale)}>✕</button>
-                      </div>
-                    </td>
+                      </td>
+                    </tr>
+                    {expandedDate === group.date_key && (
+                      <tr>
+                        <td colSpan={10}>
+                          <div style={{ fontWeight: 700, marginBottom: 10 }}>Реализации за {saleDateLabel(group.date_key)}</div>
+                          {renderSalesTable(group.sales, { showDate: false })}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+
+      {modal === 'view' && selected && (
+        <Modal
+          wide
+          title={`Реализация №${selected.sales_document_id || selected.id}`}
+          onClose={() => setModal(null)}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={() => setModal(null)}>Закрыть</button>
+              <button className="btn btn-ghost" onClick={() => openEdit(selected)}>Изм.</button>
+            </>
+          }
+        >
+          <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 14 }}>
+            <div className="record-meta" style={{ marginBottom: 6 }}>
+              <span>Дата</span>
+              <strong>{formatDate(selected.date)}</strong>
+            </div>
+            <div className="record-meta" style={{ marginBottom: 6 }}>
+              <span>Клиент</span>
+              <strong>{selected.client_name || '—'}</strong>
+            </div>
+            <div className="record-meta" style={{ marginBottom: 6 }}>
+              <span>Маркировка</span>
+              <strong>{selected.marking || '—'}</strong>
+            </div>
+            <div className="record-meta" style={{ marginBottom: 0 }}>
+              <span>Итого</span>
+              <strong>{fmt(selected.total_amount)} · оплачено {fmt(selected.paid_amount)} · долг {fmt(selected.debt)}</strong>
+            </div>
+          </div>
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Товар</th>
+                  <th>Количество</th>
+                  <th>Цена</th>
+                  <th>Итого</th>
+                  <th>Заметка</th>
+                </tr>
+              </thead>
+              <tbody>
+                {saleItems(selected).map(item => (
+                  <tr key={item.id}>
+                    <td>{item.product_name || 'Товар'}</td>
+                    <td className="td-mono">{itemQty(item)}</td>
+                    <td className="td-mono">{fmt(item.price_per_unit)}</td>
+                    <td><span className="badge badge-success">{fmt(item.total_amount)}</span></td>
+                    <td className="td-muted">{item.notes || '—'}</td>
                   </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
       )}
 
       {(modal === 'create' || modal === 'edit') && (

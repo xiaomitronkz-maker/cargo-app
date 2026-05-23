@@ -1823,7 +1823,20 @@ async function reconciliationActData({ type, id, date_from, date_to }, client = 
   };
 }
 
-async function profitSummaryData(client = pool) {
+async function profitSummaryData(filters = {}, client = pool) {
+  const dateFrom = filters.date_from || null;
+  const dateTo = filters.date_to || null;
+  const params = [];
+  const where = [];
+  if (dateFrom) {
+    params.push(dateFrom);
+    where.push(`COALESCE(sd.date, s.date) >= $${params.length}::date`);
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    where.push(`COALESCE(sd.date, s.date) <= $${params.length}::date`);
+  }
+
   const row = await get(`
     WITH purchase_costs AS (
       SELECT
@@ -1836,12 +1849,16 @@ async function profitSummaryData(client = pool) {
     ),
     sales_base AS (
       SELECT DISTINCT
-        id,
-        product_id,
-        sale_unit,
-        quantity::numeric AS quantity,
-        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
+        s.id,
+        s.sales_document_id,
+        COALESCE(sd.date, s.date) AS date,
+        s.product_id,
+        s.sale_unit,
+        s.quantity::numeric AS quantity,
+        COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     )
     SELECT
       COALESCE(SUM(sb.revenue),0) AS revenue,
@@ -1852,13 +1869,23 @@ async function profitSummaryData(client = pool) {
           THEN sb.quantity * pc.total_cost / pc.total_quantity
         ELSE 0
       END),0) AS cost
+      ,COUNT(DISTINCT COALESCE(sb.sales_document_id, -sb.id))::int AS sales_count
+      ,COUNT(sb.id)::int AS items_count
     FROM sales_base sb
     LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
-  `, [], client);
+  `, params, client);
 
   const revenue = +(row?.revenue || 0);
   const cost = +(row?.cost || 0);
-  return { revenue, cost, profit: revenue - cost };
+  return {
+    revenue,
+    cost,
+    profit: revenue - cost,
+    sales_count: +(row?.sales_count || 0),
+    items_count: +(row?.items_count || 0),
+    date_from: dateFrom,
+    date_to: dateTo,
+  };
 }
 
 function periodStartDate(period) {
@@ -1884,11 +1911,24 @@ function periodStartDate(period) {
   return null;
 }
 
-async function analyticsProfitData(period = '') {
-  const startDate = periodStartDate(period);
-  const params = startDate ? [startDate] : [];
-  const salesWhere = startDate ? 'WHERE s.date >= $1::date' : '';
-  const purchasesWhere = startDate ? 'WHERE p.date >= $1::date' : '';
+async function analyticsProfitData(period = '', filters = {}) {
+  const startDate = filters.date_from || periodStartDate(period);
+  const endDate = filters.date_to || null;
+  const params = [];
+  const salesConditions = [];
+  const purchasesConditions = [];
+  if (startDate) {
+    params.push(startDate);
+    salesConditions.push(`COALESCE(sd.date, s.date) >= $${params.length}::date`);
+    purchasesConditions.push(`p.date >= $${params.length}::date`);
+  }
+  if (endDate) {
+    params.push(endDate);
+    salesConditions.push(`COALESCE(sd.date, s.date) <= $${params.length}::date`);
+    purchasesConditions.push(`p.date <= $${params.length}::date`);
+  }
+  const salesWhere = salesConditions.length ? `WHERE ${salesConditions.join(' AND ')}` : '';
+  const purchasesWhere = purchasesConditions.length ? `WHERE ${purchasesConditions.join(' AND ')}` : '';
 
   const baseCte = `
     WITH purchase_costs AS (
@@ -1903,13 +1943,14 @@ async function analyticsProfitData(period = '') {
     sales_base AS (
       SELECT DISTINCT
         s.id,
-        s.date,
+        COALESCE(sd.date, s.date) AS date,
         s.client_id,
         s.product_id,
         s.sale_unit,
         s.quantity::numeric AS quantity,
         COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue
       FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
       ${salesWhere}
     ),
     sales_costed AS (
@@ -2009,6 +2050,8 @@ async function analyticsProfitData(period = '') {
     totalSales: revenue,
     totalCosts: cost,
     profit: revenue - cost,
+    date_from: startDate || null,
+    date_to: endDate || null,
   };
 }
 
@@ -4066,7 +4109,10 @@ app.delete('/api/liabilities/:id', async (req, res) => {
 
 // Profit / analytics
 app.get('/api/profit/summary', async (req, res) => {
-  res.json(await profitSummaryData());
+  res.json(await profitSummaryData({
+    date_from: req.query.date_from || null,
+    date_to: req.query.date_to || null,
+  }));
 });
 
 app.get('/api/analytics/dashboard', async (req, res) => {
@@ -4166,7 +4212,10 @@ app.get('/api/analytics/dashboard', async (req, res) => {
 });
 
 app.get('/api/analytics/profit', async (req, res) => {
-  res.json(await analyticsProfitData(req.query.period));
+  res.json(await analyticsProfitData(req.query.period, {
+    date_from: req.query.date_from || null,
+    date_to: req.query.date_to || null,
+  }));
 });
 
 app.post('/api/ai/command', async (req, res) => {

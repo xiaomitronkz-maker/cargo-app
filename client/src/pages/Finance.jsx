@@ -19,6 +19,9 @@ export default function Finance() {
   const navigate = useNavigate()
   const [summary, setSummary] = useState(null)
   const [profitSummary, setProfitSummary] = useState(null)
+  const [periodProfit, setPeriodProfit] = useState(null)
+  const [periodFilters, setPeriodFilters] = useState({ date_from: '', date_to: '' })
+  const [periodLoading, setPeriodLoading] = useState(false)
   const [debts, setDebts] = useState([])
   const [suppliers, setSuppliers] = useState([])
   const [accounts, setAccounts] = useState([])
@@ -38,6 +41,7 @@ export default function Finance() {
         setSuppliers(normalizeArray(suppliersData))
         setAccounts(normalizeArray(accountsData))
         setProfitSummary(profitData && typeof profitData === 'object' ? profitData : {})
+        setPeriodProfit(profitData && typeof profitData === 'object' ? profitData : {})
         setDebts(normalizeArray(debtsData))
         setTransactions(normalizeArray(transactionsData))
       })
@@ -47,6 +51,7 @@ export default function Finance() {
         setSuppliers([])
         setAccounts([])
         setProfitSummary({})
+        setPeriodProfit({})
         setDebts([])
         setTransactions([])
       })
@@ -64,6 +69,27 @@ export default function Finance() {
       await load()
     } catch (e) { setError(e.message) }
     finally { setSaving(false) }
+  }
+
+  const loadPeriodProfit = async (filters = periodFilters) => {
+    setPeriodLoading(true)
+    setError('')
+    try {
+      const params = Object.fromEntries(Object.entries(filters).filter(([, value]) => value))
+      const result = await api.getProfitSummary(params)
+      setPeriodProfit(result && typeof result === 'object' ? result : {})
+    } catch (e) {
+      setError(e.message || 'Не удалось загрузить прибыль за период')
+      setPeriodProfit({})
+    } finally {
+      setPeriodLoading(false)
+    }
+  }
+
+  const resetPeriodProfit = async () => {
+    const empty = { date_from: '', date_to: '' }
+    setPeriodFilters(empty)
+    await loadPeriodProfit(empty)
   }
 
   if (loading) return <div className="loading">Загрузка...</div>
@@ -120,6 +146,39 @@ export default function Finance() {
             активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)} · вложения: {fmt(ownerContribution)} · снятия: {fmt(ownerWithdrawal)}
           </div>
         )}
+      </div>
+
+      <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 14, marginBottom: 20 }}>
+        <div style={{ fontWeight: 700, marginBottom: 12 }}>Прибыль за период</div>
+        {error && <div className="alert alert-error">{error}</div>}
+        <div className="form-row" style={{ marginBottom: 12 }}>
+          <div className="form-group">
+            <label className="form-label">Дата с</label>
+            <input type="date" className="form-input" value={periodFilters.date_from} onChange={e => setPeriodFilters(f => ({ ...f, date_from: e.target.value }))} />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Дата по</label>
+            <input type="date" className="form-input" value={periodFilters.date_to} onChange={e => setPeriodFilters(f => ({ ...f, date_to: e.target.value }))} />
+          </div>
+          <div className="form-group" style={{ justifyContent: 'flex-end' }}>
+            <label className="form-label">&nbsp;</label>
+            <div className="td-actions">
+              <button className="btn btn-primary" onClick={() => loadPeriodProfit()} disabled={periodLoading}>
+                {periodLoading ? 'Загрузка...' : 'Показать'}
+              </button>
+              <button className="btn btn-secondary" onClick={resetPeriodProfit} disabled={periodLoading}>Сбросить</button>
+            </div>
+          </div>
+        </div>
+        <div className="stat-grid">
+          <FinanceCard label="Реализация за период" value={toNumber(periodProfit?.revenue)} tone="positive" />
+          <FinanceCard label="Себестоимость за период" value={toNumber(periodProfit?.cost)} tone="negative" />
+          <FinanceCard label="Прибыль за период" value={toNumber(periodProfit?.profit)} tone={toNumber(periodProfit?.profit) >= 0 ? 'positive' : 'negative'} />
+          <div className="stat-card">
+            <div className="stat-label">Реализаций / строк</div>
+            <div className="stat-value">{toNumber(periodProfit?.sales_count)} / {toNumber(periodProfit?.items_count)}</div>
+          </div>
+        </div>
       </div>
 
       <div className="table-wrapper" style={{ marginBottom: 20 }}>

@@ -129,7 +129,7 @@ const api = {
   // Analytics
   getDashboard: () => api.get('/analytics/dashboard'),
   getProfit: (period) => api.get(`/analytics/profit${period ? `?period=${period}` : ''}`),
-  getProfitSummary: () => api.get('/profit/summary'),
+  getProfitSummary: (params) => api.get('/profit/summary', { params }),
 
   // AI
   sendCommand: (command) => api.post('/ai/command', { command }),
