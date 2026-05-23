@@ -100,6 +100,7 @@ async function initDb() {
       id SERIAL PRIMARY KEY,
       client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
       marking TEXT NOT NULL UNIQUE,
+      keywords TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -306,6 +307,7 @@ async function initDb() {
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS ala_unit TEXT DEFAULT 'kg';
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS total_cost NUMERIC DEFAULT 0;
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS class_code TEXT;
+    ALTER TABLE markings ADD COLUMN IF NOT EXISTS keywords TEXT;
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS tariff_type TEXT DEFAULT 'purchase';
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_rate NUMERIC DEFAULT 0;
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_unit TEXT DEFAULT 'kg';
@@ -333,6 +335,7 @@ async function initDb() {
     SET tariff_type='purchase'
     WHERE tariff_type IS NULL OR tariff_type NOT IN ('purchase','sale');
     UPDATE tariffs SET sale_unit='kg' WHERE sale_unit IS NULL OR sale_unit NOT IN ('kg','pcs');
+    UPDATE markings SET keywords=marking WHERE keywords IS NULL OR trim(keywords) = '';
   `);
 
   const tariffCount = await get('SELECT COUNT(*)::int AS count FROM tariffs');
@@ -386,6 +389,99 @@ function validatePurchaseNums({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0
 
 function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizeMarking(value) {
+  const normal = normalizeText(value)
+    .replace(/[.,;:|/\\\-–—_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return {
+    normal,
+    compact: normal.replace(/\s+/g, ''),
+  };
+}
+
+function splitMarkingKeywords(value) {
+  return String(value || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function markingCandidateTerms(marking) {
+  const terms = [marking.marking, ...splitMarkingKeywords(marking.keywords)];
+  return Array.from(new Set(terms.map((term) => String(term || '').trim()).filter(Boolean)));
+}
+
+function markingMatchScore(inputMarking, marking) {
+  const input = normalizeMarking(inputMarking);
+  if (!input.normal) return null;
+
+  let best = null;
+  for (const term of markingCandidateTerms(marking)) {
+    const normalizedTerm = normalizeMarking(term);
+    if (!normalizedTerm.normal) continue;
+
+    let score = 0;
+    let status = null;
+    if (input.normal === normalizedTerm.normal) {
+      score = 10000 + normalizedTerm.normal.length;
+      status = 'exact';
+    } else if (input.compact === normalizedTerm.compact) {
+      score = 9000 + normalizedTerm.compact.length;
+      status = 'compact';
+    } else if (
+      input.normal.includes(normalizedTerm.normal) ||
+      normalizedTerm.normal.includes(input.normal) ||
+      (normalizedTerm.compact && input.compact.includes(normalizedTerm.compact)) ||
+      (input.compact && normalizedTerm.compact.includes(input.compact))
+    ) {
+      score = 5000 + normalizedTerm.compact.length;
+      status = 'keyword';
+    }
+
+    if (score && (!best || score > best.score)) {
+      best = { score, status, matched_keyword: term };
+    }
+  }
+
+  return best;
+}
+
+function matchMarking(inputMarking, markings = []) {
+  const matches = markings
+    .map((marking) => {
+      const match = markingMatchScore(inputMarking, marking);
+      return match ? { ...marking, ...match } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  if (!matches.length) return { status: 'not_found', candidates: [] };
+
+  const topScore = matches[0].score;
+  const topMatches = matches.filter((match) => match.score === topScore);
+  if (topMatches.length > 1) {
+    return {
+      status: 'ambiguous',
+      candidates: topMatches.map((match) => ({
+        marking_id: match.id,
+        marking: match.marking,
+        client_id: match.client_id,
+        client_name: match.client_name,
+        matched_keyword: match.matched_keyword,
+      })),
+    };
+  }
+
+  const match = topMatches[0];
+  return {
+    status: match.status,
+    marking: match,
+    matched_keyword: match.matched_keyword,
+    candidates: [],
+  };
 }
 
 function isPhoneProduct(productName) {
@@ -868,7 +964,13 @@ async function findOrCreateProductByName(productName, client = pool) {
   if (!name) throw new Error('Название товара обязательно');
   const existing = await get('SELECT id,name FROM products WHERE lower(name)=lower($1) LIMIT 1', [name], client);
   if (existing) return existing;
-  return get('INSERT INTO products(name,is_active) VALUES($1,TRUE) RETURNING id,name', [name], client);
+  const product = await get('INSERT INTO products(name,is_active) VALUES($1,TRUE) RETURNING id,name', [name], client);
+  await query(`
+    INSERT INTO product_rules(product_id,sale_type)
+    VALUES($1,'both')
+    ON CONFLICT(product_id) DO NOTHING
+  `, [product.id], client);
+  return product;
 }
 
 function normalizeCounterpartyName(value) {
@@ -2043,10 +2145,14 @@ app.get('/api/markings', async (req, res) => {
 });
 
 app.post('/api/markings', async (req, res) => {
-  const { client_id, marking } = req.body;
+  const { client_id, marking, keywords } = req.body;
   if (!client_id || !marking?.trim()) return res.status(400).json({ error: 'client_id и маркировка обязательны' });
   try {
-    const row = await get('INSERT INTO markings(client_id,marking) VALUES($1,$2) RETURNING id', [+client_id, marking.trim().toUpperCase()]);
+    const normalizedMarking = marking.trim().toUpperCase();
+    const row = await get(
+      'INSERT INTO markings(client_id,marking,keywords) VALUES($1,$2,$3) RETURNING id',
+      [+client_id, normalizedMarking, keywords?.trim() || normalizedMarking]
+    );
     res.json({ id: row.id });
   } catch (e) {
     res.status(400).json({ error: e.message.includes('unique') ? 'Такая маркировка уже существует' : e.message });
@@ -2054,10 +2160,14 @@ app.post('/api/markings', async (req, res) => {
 });
 
 app.put('/api/markings/:id', async (req, res) => {
-  const { client_id, marking } = req.body;
+  const { client_id, marking, keywords } = req.body;
   if (!client_id || !marking?.trim()) return res.status(400).json({ error: 'client_id и маркировка обязательны' });
   try {
-    await query('UPDATE markings SET client_id=$1,marking=$2 WHERE id=$3', [+client_id, marking.trim().toUpperCase(), +req.params.id]);
+    const normalizedMarking = marking.trim().toUpperCase();
+    await query(
+      'UPDATE markings SET client_id=$1,marking=$2,keywords=$3 WHERE id=$4',
+      [+client_id, normalizedMarking, keywords?.trim() || normalizedMarking, +req.params.id]
+    );
     res.json({ success: true });
   } catch (e) {
     res.status(400).json({ error: e.message.includes('unique') ? 'Такая маркировка уже существует' : e.message });
@@ -2182,7 +2292,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     const cleanedImportRecords = await cleanupOrphanImportRecords();
     const tariffs = await all('SELECT * FROM tariffs WHERE is_active=TRUE ORDER BY is_default DESC, name');
     const markings = await all(`
-      SELECT m.id,m.marking,m.client_id,c.name AS client_name
+      SELECT m.id,m.marking,m.keywords,m.client_id,c.name AS client_name
       FROM markings m
       JOIN clients c ON c.id = m.client_id
     `);
@@ -2203,7 +2313,6 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     const deletedReceiptRows = new Set(cleanedImportRecords
       .filter((row) => row.spreadsheet_id === spreadsheetId && String(row.gid || '0') === String(gid || '0'))
       .map((row) => +row.source_row));
-    const markingByName = new Map(markings.map((marking) => [normalizeText(marking.marking), marking]));
     const productByName = new Map(products.map((product) => [normalizeText(product.name), product]));
 
     let headerMap = null;
@@ -2242,7 +2351,8 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       rowsAfterDateFilter += 1;
 
       const classCode = String(row[activeHeaderMap.class] || '').trim() || null;
-      const marking = markingByName.get(normalizeText(markingName));
+      const markingMatch = matchMarking(markingName, markings);
+      const marking = markingMatch.marking || null;
       const product = productByName.get(normalizeText(productName));
       const tariff = matchTariff(productName, classCode, tariffs);
       const saleTariff = matchSaleTariff(productName, classCode, tariffs);
@@ -2267,12 +2377,14 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       const suggestedSaleTotal = suggestedSaleBase * suggestedSalePrice;
       const sourceRow = sourceRowOffset + rowIndex + 1;
       if (!product) warnings.push('Товар будет создан при импорте');
+      if (['keyword', 'compact'].includes(markingMatch.status)) warnings.push(`Маркировка найдена по ключевому слову: ${markingMatch.matched_keyword}`);
       if (saleTariff.missing) warnings.push('Тариф реализации не найден');
       if (deletedReceiptRows.has(sourceRow)) warnings.push('Ранее импортировалось, но приход был удалён');
       if (sheetTotal && Math.abs(sheetTotal - cost.totalCost) > 0.01) warnings.push('TOTAL в таблице отличается от расчёта приложения');
 
       let status = 'ready';
-      if (!marking) status = 'marking_not_found';
+      if (markingMatch.status === 'not_found') status = 'marking_not_found';
+      if (markingMatch.status === 'ambiguous') status = 'marking_ambiguous';
       if (importedRows.has(sourceRow)) status = 'already_imported';
 
       rows.push({
@@ -2282,8 +2394,12 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         date,
         marking: markingName,
         marking_id: marking?.id || null,
+        matched_marking: marking?.marking || null,
         client_id: marking?.client_id || null,
         client_name: marking?.client_name || null,
+        marking_match_status: markingMatch.status,
+        matched_keyword: markingMatch.matched_keyword || null,
+        marking_candidates: markingMatch.candidates || [],
         product_id: product?.id || null,
         product_name: productName,
         quantity_pcs: quantityPcs,
@@ -2335,6 +2451,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       group.total_quantity += +row.quantity_pcs || 0;
       group.app_total += +row.app_total || 0;
       if (row.status === 'marking_not_found') group.status = 'marking_not_found';
+      if (row.status === 'marking_ambiguous' && group.status !== 'marking_not_found') group.status = 'marking_ambiguous';
       if (group.status === 'ready' && row.status === 'already_imported') group.status = 'already_imported';
       if (group.status === 'already_imported' && row.status === 'ready') group.status = 'partial';
     });
@@ -2349,6 +2466,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         ready_count: rows.filter((row) => row.status === 'ready').length,
         already_imported_count: rows.filter((row) => row.status === 'already_imported').length,
         marking_not_found_count: rows.filter((row) => row.status === 'marking_not_found').length,
+        marking_ambiguous_count: rows.filter((row) => row.status === 'marking_ambiguous').length,
       },
       debug_summary: {
         read_mode: sheetRead.mode,
@@ -2376,13 +2494,18 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
   if (!['receipt_only', 'receipt_and_sale'].includes(mode)) return res.status(400).json({ error: 'Неизвестный режим импорта' });
   if (!supplier_id) return res.status(400).json({ error: 'Поставщик обязателен' });
   if (!rows.length) return res.status(400).json({ error: 'Нет строк для импорта' });
-  if (rows.some((row) => row.status !== 'already_imported' && (row.status === 'marking_not_found' || !row.marking_id || !row.client_id))) {
+  if (rows.some((row) => row.status !== 'already_imported' && (!row.marking_id || !row.client_id))) {
     return res.status(400).json({ error: 'Есть строки без найденной маркировки' });
   }
 
   try {
     const result = await withTx(async (client) => {
       await cleanupOrphanImportRecords(client);
+      const importMarkings = await all(`
+        SELECT m.id,m.marking,m.keywords,m.client_id,c.name AS client_name
+        FROM markings m
+        JOIN clients c ON c.id = m.client_id
+      `, [], client);
       const groups = new Map();
       let skippedRows = 0;
       for (const row of rows) {
@@ -2399,6 +2522,34 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
           skippedRows += 1;
           continue;
         }
+
+        let resolvedMarking = null;
+        if (row.marking_id) {
+          resolvedMarking = await get(`
+            SELECT m.id,m.marking,m.keywords,m.client_id,c.name AS client_name
+            FROM markings m
+            JOIN clients c ON c.id = m.client_id
+            WHERE m.id=$1
+          `, [+row.marking_id], client);
+          if (!resolvedMarking) throw new Error('Выбранная маркировка не найдена');
+          if (row.client_id && +row.client_id !== +resolvedMarking.client_id) {
+            throw new Error('Выбранная маркировка не принадлежит выбранному клиенту');
+          }
+        } else {
+          const markingMatch = matchMarking(row.marking, importMarkings);
+          if (markingMatch.status === 'ambiguous') throw new Error('Маркировка найдена неоднозначно. Выберите маркировку вручную');
+          if (markingMatch.status === 'not_found') throw new Error('Есть строки без найденной маркировки');
+          resolvedMarking = markingMatch.marking;
+        }
+
+        const importRow = {
+          ...row,
+          marking_id: resolvedMarking.id,
+          matched_marking: resolvedMarking.marking,
+          client_id: resolvedMarking.client_id,
+          client_name: resolvedMarking.client_name,
+        };
+
         if (!row.product_name?.trim()) throw new Error('В каждой строке должен быть товар');
         if (createSales && !row.date) throw new Error('Дата обязательна для реализации');
         if (createSales) {
@@ -2413,9 +2564,9 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
               : 'Для реализации по кг вес должен быть больше 0');
           }
         }
-        const key = `${row.date}||${row.marking_id}`;
+        const key = `${importRow.date}||${importRow.marking_id}`;
         if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(row);
+        groups.get(key).push(importRow);
       }
 
       const receiptIds = [];

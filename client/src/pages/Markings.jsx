@@ -3,7 +3,7 @@ import Modal, { ConfirmModal } from '../components/Modal'
 import api from '../api'
 import { formatDate } from '../utils/data'
 
-const EMPTY = { client_id: '', marking: '' }
+const EMPTY = { client_id: '', marking: '', keywords: '' }
 
 export default function Markings() {
   const [markings, setMarkings] = useState([])
@@ -25,13 +25,19 @@ export default function Markings() {
   useEffect(() => { load() }, [])
 
   const openCreate = () => { setForm(EMPTY); setError(''); setModal('create') }
-  const openEdit = (m) => { setSelected(m); setForm({ client_id: String(m.client_id), marking: m.marking }); setError(''); setModal('edit') }
+  const openEdit = (m) => {
+    setSelected(m)
+    setForm({ client_id: String(m.client_id), marking: m.marking, keywords: m.keywords || m.marking })
+    setError('')
+    setModal('edit')
+  }
   const openDelete = (m) => { setSelected(m); setModal('delete') }
 
   const save = async () => {
     setSaving(true); setError('')
     try {
-      const payload = { ...form, marking: form.marking.toUpperCase() }
+      const marking = form.marking.toUpperCase()
+      const payload = { ...form, marking, keywords: form.keywords.trim() || marking }
       if (modal === 'create') await api.createMarking(payload)
       else await api.updateMarking(selected.id, payload)
       await load(); setModal(null)
@@ -45,7 +51,11 @@ export default function Markings() {
 
   const filtered = markings.filter(m => {
     const matchClient = !filterClient || String(m.client_id) === filterClient
-    const matchSearch = !search || m.marking.toLowerCase().includes(search.toLowerCase()) || m.client_name.toLowerCase().includes(search.toLowerCase())
+    const query = search.toLowerCase()
+    const matchSearch = !search ||
+      m.marking.toLowerCase().includes(query) ||
+      m.client_name.toLowerCase().includes(query) ||
+      String(m.keywords || '').toLowerCase().includes(query)
     return matchClient && matchSearch
   })
 
@@ -74,13 +84,14 @@ export default function Markings() {
               <tr>
                 <th>Маркировка</th>
                 <th>Клиент</th>
+                <th>Ключевые слова</th>
                 <th>Добавлена</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
               {filtered.length === 0 && (
-                <tr><td colSpan={4}>
+                <tr><td colSpan={5}>
                   <div className="empty-state"><div className="empty-icon">🏷</div><p>Маркировок нет</p></div>
                 </td></tr>
               )}
@@ -88,6 +99,7 @@ export default function Markings() {
                 <tr key={m.id}>
                   <td><span className="badge badge-primary td-mono" style={{ fontSize: 13 }}>{m.marking}</span></td>
                   <td style={{ fontWeight: 500 }}>{m.client_name}</td>
+                  <td className="td-muted">{m.keywords || m.marking}</td>
                   <td className="td-muted td-date">{formatDate(m.created_at)}</td>
                   <td>
                     <div className="td-actions">
@@ -133,6 +145,16 @@ export default function Markings() {
               style={{ textTransform: 'uppercase', letterSpacing: 1 }}
             />
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Маркировка будет сохранена в верхнем регистре. Должна быть уникальной.</span>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Ключевые слова</label>
+            <textarea
+              className="form-textarea"
+              value={form.keywords}
+              onChange={e => setForm(f => ({ ...f, keywords: e.target.value }))}
+              placeholder="AZD BQ, AZDBQ, AZD-BQ, BQ"
+            />
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Можно указать несколько вариантов через запятую: AZD BQ, AZDBQ, AZD-BQ, BQ</span>
           </div>
         </Modal>
       )}

@@ -35,8 +35,17 @@ const SALE_BULK_EMPTY = { sale_unit: 'kg', sale_price: '' }
 const STATUS_LABELS = {
   ready: 'Готово',
   marking_not_found: 'Маркировка не найдена',
+  marking_ambiguous: 'Нужно выбрать маркировку',
   already_imported: 'Уже импортировано',
   partial: 'Частично',
+}
+const MARKING_MATCH_LABELS = {
+  exact: 'Точно',
+  keyword: 'По ключевому слову',
+  compact: 'Без пробелов/знаков',
+  ambiguous: 'Несколько вариантов',
+  not_found: 'Не найдена',
+  selected: 'Выбрано вручную',
 }
 const statusBadge = (status) => {
   if (status === 'ready') return 'badge-success'
@@ -62,7 +71,7 @@ const prepareImportRowsForSale = (rows) => normalizeArray(rows).map(row => ({
 }))
 const importSaleBase = (row) => row.sale_unit === 'pcs' ? toNumber(row.quantity_pcs) : toNumber(row.weight_kg)
 const importSaleTotal = (row) => Math.round(importSaleBase(row) * toNumber(row.sale_price) * 100) / 100
-const importRowWillImport = (row) => row.status !== 'already_imported' && row.status !== 'marking_not_found'
+const importRowWillImport = (row) => row.status === 'ready'
 const importSaleReady = (row) => !importRowWillImport(row) || (toNumber(row.sale_price) > 0 && importSaleBase(row) > 0)
 
 export default function Receipts() {
@@ -238,8 +247,8 @@ export default function Receipts() {
       setImportError('Выберите поставщика')
       return
     }
-    if (rows.some(row => row.status === 'marking_not_found')) {
-      setImportError('Есть строки без найденной маркировки')
+    if (rows.some(row => ['marking_not_found', 'marking_ambiguous'].includes(row.status))) {
+      setImportError('Есть строки без найденной или неоднозначной маркировки')
       return
     }
     if (importWithSale && rows.some(row => !importSaleReady(row))) {
@@ -270,6 +279,27 @@ export default function Receipts() {
     }))
   }
 
+  const selectImportMarking = (index, candidateId) => {
+    setImportPreview(prev => ({
+      ...prev,
+      rows: normalizeArray(prev?.rows).map((row, rowIndex) => {
+        if (rowIndex !== index) return row
+        const candidate = normalizeArray(row.marking_candidates).find(item => String(item.marking_id) === String(candidateId))
+        if (!candidate) return row
+        return {
+          ...row,
+          marking_id: candidate.marking_id,
+          matched_marking: candidate.marking,
+          client_id: candidate.client_id,
+          client_name: candidate.client_name,
+          matched_keyword: candidate.matched_keyword,
+          marking_match_status: 'selected',
+          status: 'ready',
+        }
+      }),
+    }))
+  }
+
   const applySalePriceToAll = () => {
     if (!(toNumber(saleBulk.sale_price) > 0)) {
       setImportError('Укажите цену реализации')
@@ -288,21 +318,32 @@ export default function Receipts() {
   const previewGroups = normalizeArray(importPreview?.groups)
   const debugSummary = importPreview?.debug_summary || null
   const importWithSale = importForm.mode === 'receipt_and_sale'
-  const hasMarkingProblems = previewRows.some(row => row.status === 'marking_not_found')
+  const hasMarkingProblems = previewRows.some(row => ['marking_not_found', 'marking_ambiguous'].includes(row.status))
   const hasReadyRows = previewRows.some(row => row.status === 'ready')
   const hasSaleProblems = importWithSale && previewRows.some(row => !importSaleReady(row))
   const previewGroupsWithSales = useMemo(() => {
     const saleTotalsByGroup = new Map()
+    const rowsByGroup = new Map()
     previewRows.forEach(row => {
-      if (!importRowWillImport(row)) return
       const key = `${row.date}||${row.marking}`
+      if (!rowsByGroup.has(key)) rowsByGroup.set(key, [])
+      rowsByGroup.get(key).push(row)
+      if (!importRowWillImport(row)) return
       saleTotalsByGroup.set(key, toNumber(saleTotalsByGroup.get(key)) + importSaleTotal(row))
     })
     return previewGroups.map(group => {
       const key = `${group.date}||${group.marking}`
       const saleTotal = toNumber(saleTotalsByGroup.get(key))
+      const groupRows = normalizeArray(rowsByGroup.get(key))
+      let status = group.status
+      if (groupRows.some(row => row.status === 'marking_not_found')) status = 'marking_not_found'
+      else if (groupRows.some(row => row.status === 'marking_ambiguous')) status = 'marking_ambiguous'
+      else if (groupRows.some(row => row.status === 'ready') && groupRows.some(row => row.status === 'already_imported')) status = 'partial'
+      else if (groupRows.length && groupRows.every(row => row.status === 'already_imported')) status = 'already_imported'
+      else if (groupRows.length && groupRows.every(row => row.status === 'ready')) status = 'ready'
       return {
         ...group,
+        status,
         sale_total: saleTotal,
         gross_profit: saleTotal - toNumber(group.app_total),
       }
@@ -754,7 +795,9 @@ export default function Receipts() {
                 </div>
                 <div className="stat-card">
                   <div className="stat-label">Проблемы</div>
-                  <div className={`stat-value ${hasMarkingProblems ? 'negative' : 'positive'}`}>{importPreview.summary?.marking_not_found_count || 0}</div>
+                  <div className={`stat-value ${hasMarkingProblems ? 'negative' : 'positive'}`}>
+                    {previewRows.filter(row => ['marking_not_found', 'marking_ambiguous'].includes(row.status)).length}
+                  </div>
                 </div>
               </div>
 
@@ -832,8 +875,10 @@ export default function Receipts() {
                   <thead>
                     <tr>
                       <th>Дата</th>
-                      <th>Маркировка</th>
+                      <th>Маркировка из таблицы</th>
+                      <th>Найдена</th>
                       <th>Клиент</th>
+                      <th>Подбор</th>
                       <th>Товар</th>
                       <th>PCS</th>
                       <th>KG</th>
@@ -856,7 +901,39 @@ export default function Receipts() {
                       <tr key={`${row.spreadsheet_id}-${row.gid}-${row.source_row}`}>
                         <td className="td-date">{formatDate(row.date)}</td>
                         <td>{row.marking}</td>
+                        <td>
+                          {row.status === 'marking_ambiguous' ? (
+                            <select
+                              className="form-select"
+                              value=""
+                              onChange={e => selectImportMarking(rowIndex, e.target.value)}
+                              style={{ minWidth: 190 }}
+                            >
+                              <option value="">— Выберите маркировку —</option>
+                              {normalizeArray(row.marking_candidates).map(candidate => (
+                                <option key={candidate.marking_id} value={candidate.marking_id}>
+                                  {candidate.marking} · {candidate.client_name}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            row.matched_marking || '—'
+                          )}
+                          {row.status === 'marking_ambiguous' && normalizeArray(row.marking_candidates).map(candidate => (
+                            <div key={candidate.marking_id} className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                              {candidate.marking} · {candidate.client_name} · {candidate.matched_keyword}
+                            </div>
+                          ))}
+                        </td>
                         <td>{row.client_name || '—'}</td>
+                        <td>
+                          <span className={`badge ${row.marking_match_status === 'not_found' || row.marking_match_status === 'ambiguous' ? 'badge-danger' : 'badge-neutral'}`}>
+                            {MARKING_MATCH_LABELS[row.marking_match_status] || row.marking_match_status || '—'}
+                          </span>
+                          {row.matched_keyword && (
+                            <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>{row.matched_keyword}</div>
+                          )}
+                        </td>
                         <td>{row.product_name}</td>
                         <td className="td-mono">{fmtNum(row.quantity_pcs, 0)}</td>
                         <td className="td-mono">{fmtNum(row.weight_kg, 3)}</td>
