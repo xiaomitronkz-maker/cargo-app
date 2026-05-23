@@ -417,6 +417,45 @@ function tariffProductMatches(tariff, productName) {
   });
 }
 
+function normalizeProductPatternValue(value) {
+  return normalizeText(value)
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function productPatternKeywords(productPattern) {
+  return String(productPattern || '')
+    .split(',')
+    .map((part) => normalizeProductPatternValue(part))
+    .filter(Boolean);
+}
+
+function productPatternMatchScore(productPattern, productName) {
+  const product = normalizeProductPatternValue(productName);
+  const compactProduct = product.replace(/\s+/g, '');
+  return productPatternKeywords(productPattern).reduce((best, keyword) => {
+    const compactKeyword = keyword.replace(/\s+/g, '');
+    const matches = keyword === 'phone'
+      ? /(^|[^a-z0-9])phone([^a-z0-9]|$)/i.test(product)
+      : product.includes(keyword) || (compactKeyword && compactProduct.includes(compactKeyword));
+    return matches ? Math.max(best, keyword.length) : best;
+  }, 0);
+}
+
+function productPatternMatches(productPattern, productName) {
+  return productPatternMatchScore(productPattern, productName) > 0;
+}
+
+function bestProductPatternTariff(tariffs, productName) {
+  return tariffs.reduce((best, tariff) => {
+    const score = productPatternMatchScore(tariff.product_pattern, productName);
+    if (!score) return best;
+    if (!best || score > best.score) return { tariff, score };
+    return best;
+  }, null)?.tariff || null;
+}
+
 function tariffClassMatches(tariff, classCode) {
   const tariffClass = normalizeText(tariff.class_code);
   return Boolean(tariffClass) && tariffClass === normalizeText(classCode);
@@ -447,13 +486,19 @@ function matchTariff(productName, classCode, tariffs = []) {
 
 function matchSaleTariff(productName, classCode, tariffs = []) {
   const active = tariffs.filter((tariff) => tariff && tariff.is_active !== false && normalizeText(tariff.tariff_type) === 'sale');
-  const productAndClass = active.find((tariff) => tariffProductMatches(tariff, productName) && tariffClassMatches(tariff, classCode));
+  const productAndClass = bestProductPatternTariff(
+    active.filter((tariff) => tariffClassMatches(tariff, classCode)),
+    productName
+  );
   if (productAndClass) return productAndClass;
 
-  const productOnly = active.find((tariff) => tariffProductMatches(tariff, productName) && !normalizeText(tariff.class_code));
+  const productOnly = bestProductPatternTariff(
+    active.filter((tariff) => !normalizeText(tariff.class_code)),
+    productName
+  );
   if (productOnly) return productOnly;
 
-  const classOnly = active.find((tariff) => !splitPattern(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
+  const classOnly = active.find((tariff) => !productPatternKeywords(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
   if (classOnly) return classOnly;
 
   const defaultTariff = active.find((tariff) => tariff.is_default);

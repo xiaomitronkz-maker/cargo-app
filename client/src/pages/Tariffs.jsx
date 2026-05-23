@@ -126,7 +126,7 @@ export default function Tariffs() {
       <div className="alert" style={{ marginBottom: 16 }}>
         {activeTab === 'purchase'
           ? 'DXB считается по кг. ALA для телефонов обычно по шт, для остальных по кг.'
-          : 'Тариф реализации подставляется в импорт Google Sheets как цена продажи клиенту. Цену можно изменить перед созданием реализации.'}
+          : 'Приоритет подбора: товар + класс → товар → класс → общий тариф. Более точное совпадение товара важнее общего.'}
       </div>
 
       {error && <div className="alert alert-error">{error}</div>}
@@ -226,12 +226,22 @@ export default function Tariffs() {
           </div>
           <div className="form-group">
             <label className="form-label">Ключевые слова товара</label>
-            <input className="form-input" value={form.product_pattern} onChange={e => setForm(f => ({ ...f, product_pattern: e.target.value }))} placeholder="iphone, phone, айфон" />
+            <input className="form-input" value={form.product_pattern} onChange={e => setForm(f => ({ ...f, product_pattern: e.target.value }))} placeholder={form.tariff_type === 'sale' ? 'airpods, air pods, airpods max' : 'iphone, phone, айфон'} />
+            {form.tariff_type === 'sale' && (
+              <div className="td-muted" style={{ fontSize: 12, marginTop: 6 }}>
+                Можно указать несколько вариантов через запятую: airpods, air pods. Если оставить пустым — тариф будет по классу.
+              </div>
+            )}
           </div>
           <div className="form-row">
             <div className="form-group">
               <label className="form-label">Класс</label>
               <input className="form-input" value={form.class_code} onChange={e => setForm(f => ({ ...f, class_code: e.target.value }))} placeholder="A, B, C, D, E" />
+              {form.tariff_type === 'sale' && (
+                <div className="td-muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  Если указать товар и класс, тариф применится только к этому товару в этом классе. Если указать только класс — ко всем товарам класса.
+                </div>
+              )}
             </div>
             {form.tariff_type === 'purchase' ? (
               <div className="form-group">
