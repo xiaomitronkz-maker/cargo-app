@@ -55,6 +55,17 @@ function validationError(res, message, context = {}) {
   return res.status(400).json({ error: message });
 }
 
+function clampLimit(value, defaultValue = 100, maxValue = 500) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+  return Math.min(parsed, maxValue);
+}
+
+function safeOffset(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
 async function query(text, params = [], client = pool) {
   return client.query(text, params);
 }
@@ -81,6 +92,43 @@ async function withTx(fn) {
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function logOperation(clientOrOptions, maybeOptions) {
+  const hasClient = clientOrOptions && typeof clientOrOptions.query === 'function';
+  const client = hasClient ? clientOrOptions : pool;
+  const options = maybeOptions || clientOrOptions || {};
+  if (!client || !options.action) return;
+  const useSavepoint = hasClient && client !== pool;
+
+  try {
+    if (useSavepoint) await client.query('SAVEPOINT operation_log_sp');
+    await query(`
+      INSERT INTO operation_logs(actor,action,entity_type,entity_id,entity_label,amount,currency,description,meta)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+    `, [
+      options.actor || 'system',
+      options.action,
+      options.entity_type || null,
+      options.entity_id != null ? +options.entity_id : null,
+      options.entity_label || null,
+      options.amount != null && options.amount !== '' ? +options.amount : null,
+      options.currency || 'USD',
+      options.description || null,
+      JSON.stringify(options.meta || {}),
+    ], client);
+    if (useSavepoint) await client.query('RELEASE SAVEPOINT operation_log_sp');
+  } catch (error) {
+    if (useSavepoint) {
+      try {
+        await client.query('ROLLBACK TO SAVEPOINT operation_log_sp');
+        await client.query('RELEASE SAVEPOINT operation_log_sp');
+      } catch (rollbackError) {
+        console.error('Operation log rollback failed:', rollbackError.message);
+      }
+    }
+    console.error('Operation log failed:', error.message);
   }
 }
 
@@ -291,6 +339,20 @@ async function initDb() {
       receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(source_type, spreadsheet_id, gid, source_row)
+    );
+
+    CREATE TABLE IF NOT EXISTS operation_logs (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      actor TEXT DEFAULT 'system',
+      action TEXT NOT NULL,
+      entity_type TEXT,
+      entity_id INTEGER,
+      entity_label TEXT,
+      amount NUMERIC DEFAULT NULL,
+      currency TEXT DEFAULT 'USD',
+      description TEXT,
+      meta JSONB DEFAULT '{}'::jsonb
     );
   `);
 
@@ -970,6 +1032,14 @@ async function findOrCreateProductByName(productName, client = pool) {
     VALUES($1,'both')
     ON CONFLICT(product_id) DO NOTHING
   `, [product.id], client);
+  await logOperation(client, {
+    action: 'product_created',
+    entity_type: 'product',
+    entity_id: product.id,
+    entity_label: product.name,
+    description: 'Товар создан автоматически',
+    meta: { source: 'google_sheets_import', sale_type: 'both' },
+  });
   return product;
 }
 
@@ -1421,6 +1491,16 @@ async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId,
   `, ['income', amount, accountToId, anchorSaleId, date, comment, 'payment', payment.id], client);
   await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
   await rebalanceSalesDocumentPaidAmounts(+anchorSale.sales_document_id, client);
+  await logOperation(client, {
+    action: 'client_payment',
+    entity_type: 'sales_document',
+    entity_id: +anchorSale.sales_document_id,
+    entity_label: `Реализация №${anchorSale.sales_document_id}`,
+    amount,
+    currency: 'USD',
+    description: 'Оплата клиента',
+    meta: { anchor_sale_id: anchorSaleId, payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
+  });
 
   const newPaid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
   return {
@@ -2060,6 +2140,79 @@ app.get('/api/clients', async (req, res) => {
   res.json(await all('SELECT * FROM clients ORDER BY name'));
 });
 
+app.get('/api/operation-logs', async (req, res) => {
+  const {
+    date_from,
+    date_to,
+    action,
+    entity_type,
+    search,
+  } = req.query;
+  const limit = clampLimit(req.query.limit);
+  const offset = safeOffset(req.query.offset);
+  const params = [];
+  const where = ['1=1'];
+
+  if (date_from) {
+    params.push(date_from);
+    where.push(`created_at::date >= $${params.length}::date`);
+  }
+  if (date_to) {
+    params.push(date_to);
+    where.push(`created_at::date <= $${params.length}::date`);
+  }
+  if (action) {
+    params.push(action);
+    where.push(`action = $${params.length}`);
+  }
+  if (entity_type) {
+    params.push(entity_type);
+    where.push(`entity_type = $${params.length}`);
+  }
+  if (search?.trim()) {
+    params.push(`%${search.trim()}%`);
+    where.push(`(
+      action ILIKE $${params.length}
+      OR COALESCE(entity_label,'') ILIKE $${params.length}
+      OR COALESCE(description,'') ILIKE $${params.length}
+      OR COALESCE(amount::text,'') ILIKE $${params.length}
+    )`);
+  }
+
+  const whereSql = where.join(' AND ');
+  const totalRow = await get(`SELECT COUNT(*)::int AS total FROM operation_logs WHERE ${whereSql}`, params);
+  const items = await all(`
+    SELECT
+      id,
+      created_at,
+      actor,
+      action,
+      entity_type,
+      entity_id,
+      entity_label,
+      amount,
+      currency,
+      description,
+      meta
+    FROM operation_logs
+    WHERE ${whereSql}
+    ORDER BY created_at DESC, id DESC
+    LIMIT $${params.length + 1}
+    OFFSET $${params.length + 2}
+  `, [...params, limit, offset]);
+
+  res.json({
+    items: items.map((item) => ({
+      ...item,
+      amount: item.amount == null ? null : +item.amount,
+      meta: item.meta && typeof item.meta === 'object' ? item.meta : {},
+    })),
+    total: +(totalRow?.total || 0),
+    limit,
+    offset,
+  });
+});
+
 app.get('/api/clients/:id', async (req, res) => {
   const client = await get('SELECT * FROM clients WHERE id=$1', [+req.params.id]);
   if (!client) return res.status(404).json({ error: 'Клиент не найден' });
@@ -2071,6 +2224,13 @@ app.post('/api/clients', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя клиента обязательно' });
   const row = await get('INSERT INTO clients(name,phone,notes) VALUES($1,$2,$3) RETURNING id', [name.trim(), phone || null, notes || null]);
+  await logOperation({
+    action: 'client_created',
+    entity_type: 'client',
+    entity_id: row.id,
+    entity_label: name.trim(),
+    description: 'Создан клиент',
+  });
   res.json({ id: row.id });
 });
 
@@ -2078,11 +2238,26 @@ app.put('/api/clients/:id', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя клиента обязательно' });
   await query('UPDATE clients SET name=$1,phone=$2,notes=$3 WHERE id=$4', [name.trim(), phone || null, notes || null, +req.params.id]);
+  await logOperation({
+    action: 'client_updated',
+    entity_type: 'client',
+    entity_id: +req.params.id,
+    entity_label: name.trim(),
+    description: 'Изменён клиент',
+  });
   res.json({ success: true });
 });
 
 app.delete('/api/clients/:id', async (req, res) => {
+  const client = await get('SELECT name FROM clients WHERE id=$1', [+req.params.id]);
   await query('DELETE FROM clients WHERE id=$1', [+req.params.id]);
+  await logOperation({
+    action: 'client_deleted',
+    entity_type: 'client',
+    entity_id: +req.params.id,
+    entity_label: client?.name || null,
+    description: 'Удалён клиент',
+  });
   res.json({ success: true });
 });
 
@@ -2142,6 +2317,13 @@ app.post('/api/import/counterparties/commit', async (req, res) => {
       };
     });
 
+    await logOperation({
+      action: 'counterparty_import',
+      entity_type: 'counterparty_import',
+      description: 'Импортированы контрагенты',
+      meta: result,
+    });
+
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message || 'Не удалось импортировать контрагентов' });
@@ -2157,6 +2339,13 @@ app.post('/api/suppliers', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя поставщика обязательно' });
   const row = await get('INSERT INTO suppliers(name,phone,notes) VALUES($1,$2,$3) RETURNING id', [name.trim(), phone || null, notes || null]);
+  await logOperation({
+    action: 'supplier_created',
+    entity_type: 'supplier',
+    entity_id: row.id,
+    entity_label: name.trim(),
+    description: 'Создан поставщик',
+  });
   res.json({ id: row.id });
 });
 
@@ -2164,13 +2353,28 @@ app.put('/api/suppliers/:id', async (req, res) => {
   const { name, phone, notes } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Имя поставщика обязательно' });
   await query('UPDATE suppliers SET name=$1,phone=$2,notes=$3 WHERE id=$4', [name.trim(), phone || null, notes || null, +req.params.id]);
+  await logOperation({
+    action: 'supplier_updated',
+    entity_type: 'supplier',
+    entity_id: +req.params.id,
+    entity_label: name.trim(),
+    description: 'Изменён поставщик',
+  });
   res.json({ success: true });
 });
 
 app.delete('/api/suppliers/:id', async (req, res) => {
   const used = await get('SELECT id FROM purchases WHERE supplier_id=$1 LIMIT 1', [+req.params.id]);
   if (used) return res.status(400).json({ error: 'Поставщик используется в приходах' });
+  const supplier = await get('SELECT name FROM suppliers WHERE id=$1', [+req.params.id]);
   await query('DELETE FROM suppliers WHERE id=$1', [+req.params.id]);
+  await logOperation({
+    action: 'supplier_deleted',
+    entity_type: 'supplier',
+    entity_id: +req.params.id,
+    entity_label: supplier?.name || null,
+    description: 'Удалён поставщик',
+  });
   res.json({ success: true });
 });
 
@@ -2196,6 +2400,14 @@ app.post('/api/markings', async (req, res) => {
       'INSERT INTO markings(client_id,marking,keywords) VALUES($1,$2,$3) RETURNING id',
       [+client_id, normalizedMarking, keywords?.trim() || normalizedMarking]
     );
+    await logOperation({
+      action: 'marking_created',
+      entity_type: 'marking',
+      entity_id: row.id,
+      entity_label: normalizedMarking,
+      description: 'Создана маркировка',
+      meta: { client_id: +client_id },
+    });
     res.json({ id: row.id });
   } catch (e) {
     res.status(400).json({ error: e.message.includes('unique') ? 'Такая маркировка уже существует' : e.message });
@@ -2211,6 +2423,14 @@ app.put('/api/markings/:id', async (req, res) => {
       'UPDATE markings SET client_id=$1,marking=$2,keywords=$3 WHERE id=$4',
       [+client_id, normalizedMarking, keywords?.trim() || normalizedMarking, +req.params.id]
     );
+    await logOperation({
+      action: 'marking_updated',
+      entity_type: 'marking',
+      entity_id: +req.params.id,
+      entity_label: normalizedMarking,
+      description: 'Изменена маркировка',
+      meta: { client_id: +client_id },
+    });
     res.json({ success: true });
   } catch (e) {
     res.status(400).json({ error: e.message.includes('unique') ? 'Такая маркировка уже существует' : e.message });
@@ -2218,7 +2438,15 @@ app.put('/api/markings/:id', async (req, res) => {
 });
 
 app.delete('/api/markings/:id', async (req, res) => {
+  const marking = await get('SELECT marking FROM markings WHERE id=$1', [+req.params.id]);
   await query('DELETE FROM markings WHERE id=$1', [+req.params.id]);
+  await logOperation({
+    action: 'marking_deleted',
+    entity_type: 'marking',
+    entity_id: +req.params.id,
+    entity_label: marking?.marking || null,
+    description: 'Удалена маркировка',
+  });
   res.json({ success: true });
 });
 
@@ -2237,6 +2465,14 @@ app.post('/api/products', async (req, res) => {
   if (!name?.trim()) return res.status(400).json({ error: 'Название товара обязательно' });
   const product = await get('INSERT INTO products(name,category,is_active) VALUES($1,$2,$3) RETURNING id', [name.trim(), category || null, is_active !== false]);
   if (sale_type) await query('INSERT INTO product_rules(product_id,sale_type) VALUES($1,$2)', [product.id, sale_type]);
+  await logOperation({
+    action: 'product_created',
+    entity_type: 'product',
+    entity_id: product.id,
+    entity_label: name.trim(),
+    description: 'Создан товар',
+    meta: { category: category || null, sale_type: sale_type || null },
+  });
   res.json({ id: product.id });
 });
 
@@ -2249,11 +2485,27 @@ app.put('/api/products/:id', async (req, res) => {
     if (existing) await query('UPDATE product_rules SET sale_type=$1 WHERE product_id=$2', [sale_type, +req.params.id]);
     else await query('INSERT INTO product_rules(product_id,sale_type) VALUES($1,$2)', [+req.params.id, sale_type]);
   }
+  await logOperation({
+    action: 'product_updated',
+    entity_type: 'product',
+    entity_id: +req.params.id,
+    entity_label: name.trim(),
+    description: 'Изменён товар',
+    meta: { category: category || null, sale_type: sale_type || null },
+  });
   res.json({ success: true });
 });
 
 app.delete('/api/products/:id', async (req, res) => {
+  const product = await get('SELECT name FROM products WHERE id=$1', [+req.params.id]);
   await query('DELETE FROM products WHERE id=$1', [+req.params.id]);
+  await logOperation({
+    action: 'product_deleted',
+    entity_type: 'product',
+    entity_id: +req.params.id,
+    entity_label: product?.name || null,
+    description: 'Удалён товар',
+  });
   res.json({ success: true });
 });
 
@@ -2286,6 +2538,14 @@ app.post('/api/tariffs', async (req, res) => {
     Boolean(body.is_default),
     body.is_active !== false,
   ]);
+  await logOperation({
+    action: 'tariff_created',
+    entity_type: 'tariff',
+    entity_id: row.id,
+    entity_label: body.name.trim(),
+    description: 'Создан тариф',
+    meta: { tariff_type: tariffType, class_code: body.class_code || null },
+  });
   res.json({ id: row.id });
 });
 
@@ -2314,11 +2574,28 @@ app.put('/api/tariffs/:id', async (req, res) => {
     body.is_active !== false,
     +req.params.id,
   ]);
+  await logOperation({
+    action: 'tariff_updated',
+    entity_type: 'tariff',
+    entity_id: +req.params.id,
+    entity_label: body.name.trim(),
+    description: 'Изменён тариф',
+    meta: { tariff_type: tariffType, class_code: body.class_code || null },
+  });
   res.json({ success: true });
 });
 
 app.delete('/api/tariffs/:id', async (req, res) => {
+  const tariff = await get('SELECT name,tariff_type FROM tariffs WHERE id=$1', [+req.params.id]);
   await query('UPDATE tariffs SET is_active=FALSE WHERE id=$1', [+req.params.id]);
+  await logOperation({
+    action: 'tariff_deleted',
+    entity_type: 'tariff',
+    entity_id: +req.params.id,
+    entity_label: tariff?.name || null,
+    description: 'Отключён тариф',
+    meta: { tariff_type: tariff?.tariff_type || null },
+  });
   res.json({ success: true, soft_deleted: true });
 });
 
@@ -2624,6 +2901,8 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
           client
         );
         receiptIds.push(receipt.id);
+        let receiptTotal = 0;
+        let saleTotal = 0;
 
         let salesDocument = null;
         const saleItems = [];
@@ -2650,6 +2929,7 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
             alaRate: row.app_ala_rate,
             alaUnit: row.app_ala_unit,
           });
+          receiptTotal += cost.totalCost;
           const noteParts = [`Google Sheets row ${row.source_row}`];
           if (row.class) noteParts.push(`CLASS ${row.class}`);
           const note = noteParts.join(' · ');
@@ -2675,6 +2955,7 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
             const salePrice = +row.sale_price;
             const saleQuantity = saleUnit === 'pcs' ? +row.quantity_pcs || 0 : +row.weight_kg || 0;
             const saleNote = `${note} · Реализация из Google Sheets import`;
+            saleTotal += saleQuantity * salePrice;
             await query(
               'INSERT INTO sales_items(sales_document_id,product_id,sale_unit,quantity,price_per_unit,note) VALUES($1,$2,$3,$4,$5,$6)',
               [salesDocument.id, +productRow.id, saleUnit, saleQuantity, salePrice, saleNote],
@@ -2693,17 +2974,37 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
         }
 
         if (createSales) {
-          await createLegacySalesForDocument({
+          const saleIds = await createLegacySalesForDocument({
             date: first.date,
             clientId: +first.client_id,
             markingId: +first.marking_id,
             items: saleItems,
             salesDocumentId: salesDocument.id,
           }, client);
+          await logOperation(client, {
+            action: 'sale_created',
+            entity_type: 'sales_document',
+            entity_id: salesDocument.id,
+            entity_label: `Реализация №${salesDocument.id}`,
+            amount: Math.round(saleTotal * 100) / 100,
+            currency: 'USD',
+            description: 'Создана реализация из Google Sheets import',
+            meta: { source: 'google_sheets_import', sale_ids: saleIds, items_count: saleItems.length, client_id: +first.client_id, marking_id: +first.marking_id },
+          });
         }
+        await logOperation(client, {
+          action: 'receipt_created',
+          entity_type: 'receipt',
+          entity_id: receipt.id,
+          entity_label: `Приход №${receipt.id}`,
+          amount: Math.round(receiptTotal * 100) / 100,
+          currency: 'USD',
+          description: 'Создан приход из Google Sheets import',
+          meta: { source: 'google_sheets_import', items_count: groupRows.length, supplier_id: +supplier_id, client_id: +first.client_id, marking_id: +first.marking_id },
+        });
       }
 
-      return {
+      const importResult = {
         created_receipts: receiptIds.length,
         receipt_ids: receiptIds,
         created_sales_documents: salesDocumentIds.length,
@@ -2711,6 +3012,15 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
         imported_rows: importedRows,
         skipped_rows: skippedRows,
       };
+      await logOperation(client, {
+        action: 'google_sheets_import',
+        entity_type: 'google_sheets_import',
+        description: createSales
+          ? 'Импортированы приходы и реализации из Google Sheets'
+          : 'Импортированы приходы из Google Sheets',
+        meta: { mode, ...importResult },
+      });
+      return importResult;
     });
     res.json(result);
   } catch (e) {
@@ -2821,6 +3131,7 @@ app.post('/api/receipts', async (req, res) => {
       );
 
       const purchaseIds = [];
+      let totalCostSum = 0;
       for (const item of items) {
         if (!item.product_id) throw new Error('Выберите товар в каждой строке');
         const product = await get('SELECT name FROM products WHERE id=$1', [+item.product_id], client);
@@ -2842,6 +3153,7 @@ app.post('/api/receipts', async (req, res) => {
           ala_unit: item.ala_unit,
         });
         const note = item.note || item.notes || null;
+        totalCostSum += totalCost;
 
         await query(
           'INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,ala_unit,total_cost,class_code,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
@@ -2856,6 +3168,17 @@ app.post('/api/receipts', async (req, res) => {
         `, [body.date, cid, mid, +body.supplier_id, receipt.id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, 0, note], client);
         purchaseIds.push(purchase.id);
       }
+
+      await logOperation(client, {
+        action: 'receipt_created',
+        entity_type: 'receipt',
+        entity_id: receipt.id,
+        entity_label: `Приход №${receipt.id}`,
+        amount: totalCostSum,
+        currency: 'USD',
+        description: 'Создан приход',
+        meta: { purchase_ids: purchaseIds, items_count: items.length, supplier_id: +body.supplier_id, client_id: cid, marking_id: mid },
+      });
 
       return { receipt_id: receipt.id, purchase_ids: purchaseIds };
     });
@@ -2891,6 +3214,7 @@ app.put('/api/receipts/:id', async (req, res) => {
       await query('DELETE FROM receipt_items WHERE receipt_id=$1', [id], client);
 
       const ids = [];
+      let totalCostSum = 0;
       for (const item of items) {
         if (!item.product_id) throw new Error('Выберите товар в каждой строке');
         const product = await get('SELECT name FROM products WHERE id=$1', [+item.product_id], client);
@@ -2912,6 +3236,7 @@ app.put('/api/receipts/:id', async (req, res) => {
           ala_unit: item.ala_unit,
         });
         const note = item.note || item.notes || null;
+        totalCostSum += totalCost;
 
         await query('INSERT INTO receipt_items(receipt_id,product_id,weight,quantity,cost_almaty,cost_dubai,ala_unit,total_cost,class_code,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [id, +item.product_id, weight, quantity, costAlmaty, costDubai, alaUnit, totalCost, classCode, note], client);
         const purchase = await get(`
@@ -2921,6 +3246,16 @@ app.put('/api/receipts/:id', async (req, res) => {
         `, [body.date, cid, mid, +body.supplier_id, id, +item.product_id, quantity, weight, +(item.boxes_count || item.boxes || 0), costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, 0, note], client);
         ids.push(purchase.id);
       }
+      await logOperation(client, {
+        action: 'receipt_updated',
+        entity_type: 'receipt',
+        entity_id: id,
+        entity_label: `Приход №${id}`,
+        amount: totalCostSum,
+        currency: 'USD',
+        description: 'Изменён приход',
+        meta: { purchase_ids: ids, items_count: items.length, supplier_id: +body.supplier_id, client_id: cid, marking_id: mid },
+      });
       return ids;
     });
 
@@ -2936,6 +3271,7 @@ app.delete('/api/receipts/:id', async (req, res) => {
     await withTx(async (client) => {
       const receipt = await get('SELECT * FROM receipts WHERE id=$1', [id], client);
       if (!receipt) throw new Error('Приход не найден');
+      const totalRow = await get('SELECT COALESCE(SUM(total_cost::numeric),0) AS total FROM purchases WHERE receipt_id=$1', [id], client);
 
       const usedSale = await get(`
         SELECT s.id, pr.name AS product_name
@@ -2974,6 +3310,16 @@ app.delete('/api/receipts/:id', async (req, res) => {
       await query('DELETE FROM purchases WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM receipt_items WHERE receipt_id=$1', [id], client);
       await query('DELETE FROM receipts WHERE id=$1', [id], client);
+      await logOperation(client, {
+        action: 'receipt_deleted',
+        entity_type: 'receipt',
+        entity_id: id,
+        entity_label: `Приход №${id}`,
+        amount: +(totalRow?.total || 0),
+        currency: 'USD',
+        description: 'Удалён приход',
+        meta: { supplier_id: receipt.supplier_id, client_id: receipt.client_id, marking_id: receipt.marking_id },
+      });
     });
     res.json({ success: true });
   } catch (e) {
@@ -3016,6 +3362,16 @@ app.put('/api/receipts/:id/pay', async (req, res) => {
       `, ['expense', amount, accountFromId, id, date, comment, 'payment', payment.id], client);
       await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
       await rebalanceReceiptPurchasePaidAmounts(id, client);
+      await logOperation(client, {
+        action: 'supplier_payment',
+        entity_type: 'receipt',
+        entity_id: id,
+        entity_label: `Приход №${id}`,
+        amount,
+        currency: 'USD',
+        description: 'Оплата поставщику',
+        meta: { payment_id: payment.id, transaction_id: transaction.id, account_from_id: accountFromId, comment },
+      });
     });
 
     const newPaid = await getReceiptPaidAmount(id);
@@ -3141,6 +3497,16 @@ app.put('/api/purchases/:id/pay', async (req, res) => {
       `, ['expense', amount, accountFromId, +purchase.receipt_id, date, comment, 'payment', payment.id], client);
       await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
       await rebalanceReceiptPurchasePaidAmounts(+purchase.receipt_id, client);
+      await logOperation(client, {
+        action: 'supplier_payment',
+        entity_type: 'receipt',
+        entity_id: +purchase.receipt_id,
+        entity_label: `Приход №${purchase.receipt_id}`,
+        amount,
+        currency: 'USD',
+        description: 'Оплата поставщику',
+        meta: { purchase_id: id, payment_id: payment.id, transaction_id: transaction.id, account_from_id: accountFromId, comment },
+      });
     });
 
     const paidAmount = +(await getReceiptPaidAmount(+purchase.receipt_id));
@@ -3190,6 +3556,17 @@ app.post('/api/sales-documents', async (req, res) => {
         items,
         salesDocumentId: salesDocument.id,
       }, client);
+      const totalAmount = items.reduce((sum, item) => sum + Math.round(+item.quantity * +item.price_per_unit * 100) / 100, 0);
+      await logOperation(client, {
+        action: 'sale_created',
+        entity_type: 'sales_document',
+        entity_id: salesDocument.id,
+        entity_label: `Реализация №${salesDocument.id}`,
+        amount: Math.round(totalAmount * 100) / 100,
+        currency: 'USD',
+        description: 'Создана реализация',
+        meta: { sale_ids: saleIds, items_count: items.length, client_id: cid, marking_id: mid },
+      });
 
       return { id: salesDocument.id, sale_ids: saleIds };
     });
@@ -3338,6 +3715,16 @@ app.post('/api/sales', async (req, res) => {
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING id
     `, [body.date, cid, mid, +body.product_id, body.sale_unit, +body.quantity, +body.price_per_unit, totalAmount, paidAmount, body.notes || null]);
+    await logOperation({
+      action: 'sale_created',
+      entity_type: 'sale',
+      entity_id: row.id,
+      entity_label: `Реализация №${row.id}`,
+      amount: totalAmount,
+      currency: 'USD',
+      description: 'Создана реализация',
+      meta: { client_id: cid, marking_id: mid, product_id: +body.product_id, sale_unit: body.sale_unit },
+    });
     res.json({ id: row.id, total_amount: totalAmount, paid_amount: paidAmount, debt: totalAmount - paidAmount });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -3368,6 +3755,16 @@ app.put('/api/sales/:id', async (req, res) => {
           SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
           WHERE id=$10
         `, [body.date, cid, mid, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, totalAmount, item.notes || item.note || null, +req.params.id]);
+        await logOperation({
+          action: 'sale_updated',
+          entity_type: 'sale',
+          entity_id: +req.params.id,
+          entity_label: `Реализация №${req.params.id}`,
+          amount: totalAmount,
+          currency: 'USD',
+          description: 'Изменена реализация',
+          meta: { client_id: cid, marking_id: mid, product_id: +item.product_id, sale_unit: item.sale_unit },
+        });
         return res.json({ success: true, total_amount: totalAmount });
       }
 
@@ -3419,6 +3816,16 @@ app.put('/api/sales/:id', async (req, res) => {
         }
 
         await rebalanceSalesDocumentPaidAmounts(salesDocumentId, client);
+        await logOperation(client, {
+          action: 'sale_updated',
+          entity_type: 'sales_document',
+          entity_id: salesDocumentId,
+          entity_label: `Реализация №${salesDocumentId}`,
+          amount: Math.round(totalAmount * 100) / 100,
+          currency: 'USD',
+          description: 'Изменена реализация',
+          meta: { items_count: documentItems.length, client_id: cid, marking_id: mid },
+        });
         return { total_amount: Math.round(totalAmount * 100) / 100 };
       });
 
@@ -3440,6 +3847,16 @@ app.put('/api/sales/:id', async (req, res) => {
       SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
       WHERE id=$10
     `, [body.date, cid, mid, +body.product_id, body.sale_unit, +body.quantity, +body.price_per_unit, totalAmount, body.notes || null, +req.params.id]);
+    await logOperation({
+      action: 'sale_updated',
+      entity_type: 'sale',
+      entity_id: +req.params.id,
+      entity_label: `Реализация №${req.params.id}`,
+      amount: totalAmount,
+      currency: 'USD',
+      description: 'Изменена реализация',
+      meta: { client_id: cid, marking_id: mid, product_id: +body.product_id, sale_unit: body.sale_unit },
+    });
     res.json({ success: true, total_amount: totalAmount });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -3475,6 +3892,16 @@ app.put('/api/sales/:id/pay', async (req, res) => {
       `, ['income', amount, accountToId, id, date, comment, 'payment', payment.id], client);
       await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
       await query('UPDATE sales SET paid_amount = COALESCE(paid_amount,0) + $1 WHERE id=$2', [amount, id], client);
+      await logOperation(client, {
+        action: 'client_payment',
+        entity_type: 'sale',
+        entity_id: id,
+        entity_label: `Реализация №${id}`,
+        amount,
+        currency: 'USD',
+        description: 'Оплата клиента',
+        meta: { payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
+      });
     });
 
     const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [id]);
@@ -3494,17 +3921,38 @@ app.delete('/api/sales/:id', async (req, res) => {
       if (sale.sales_document_id) {
         const saleRows = await all('SELECT id FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
         const saleIds = saleRows.map((row) => +row.id);
+        const totalRow = await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
         await query('DELETE FROM transactions WHERE sale_id = ANY($1::int[])', [saleIds], client);
         await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id = ANY($1::int[])", [saleIds], client);
         await query('DELETE FROM sales_items WHERE sales_document_id=$1', [+sale.sales_document_id], client);
         await query('DELETE FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
         await query('DELETE FROM sales_documents WHERE id=$1', [+sale.sales_document_id], client);
+        await logOperation(client, {
+          action: 'sale_deleted',
+          entity_type: 'sales_document',
+          entity_id: +sale.sales_document_id,
+          entity_label: `Реализация №${sale.sales_document_id}`,
+          amount: +(totalRow?.total || 0),
+          currency: 'USD',
+          description: 'Удалена реализация',
+          meta: { sale_ids: saleIds },
+        });
         return;
       }
 
       await query('DELETE FROM transactions WHERE sale_id=$1', [id], client);
       await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id=$1", [id], client);
       await query('DELETE FROM sales WHERE id=$1', [id], client);
+      await logOperation(client, {
+        action: 'sale_deleted',
+        entity_type: 'sale',
+        entity_id: id,
+        entity_label: `Реализация №${id}`,
+        amount: +(sale.total_amount || 0),
+        currency: 'USD',
+        description: 'Удалена реализация',
+        meta: { client_id: sale.client_id, marking_id: sale.marking_id, product_id: sale.product_id },
+      });
     });
     res.json({ success: true });
   } catch (e) {
@@ -3822,6 +4270,14 @@ app.post('/api/accounts', async (req, res) => {
   const { name, currency } = req.body;
   if (!name?.trim() || !currency?.trim()) return res.status(400).json({ error: 'Название и валюта обязательны' });
   const row = await get('INSERT INTO accounts(name,currency) VALUES($1,$2) RETURNING id', [name.trim(), currency.trim().toUpperCase()]);
+  await logOperation({
+    action: 'cashbox_created',
+    entity_type: 'account',
+    entity_id: row.id,
+    entity_label: name.trim(),
+    description: 'Создана касса',
+    meta: { currency: currency.trim().toUpperCase() },
+  });
   res.json({ id: row.id });
 });
 
@@ -3858,6 +4314,22 @@ app.post('/api/transactions', async (req, res) => {
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     RETURNING id
   `, [type, +amount, accountFromId || null, accountToId || null, receiptId, saleId, date, comment || null, related_type || null, related_id || null]);
+  const actionByType = {
+    transfer: 'cashbox_transfer',
+    income: 'income',
+    expense: 'expense',
+    withdraw: 'owner_withdrawal',
+  };
+  await logOperation({
+    action: actionByType[type] || type,
+    entity_type: 'transaction',
+    entity_id: row.id,
+    entity_label: `Движение №${row.id}`,
+    amount: +amount,
+    currency: 'USD',
+    description: type === 'transfer' ? 'Перевод между кассами' : 'Создано движение денег',
+    meta: { type, account_from_id: accountFromId || null, account_to_id: accountToId || null, receipt_id: receiptId, sale_id: saleId, related_type: related_type || null, related_id: related_id || null, comment: comment || null },
+  });
   res.json({ id: row.id });
 });
 
@@ -3886,6 +4358,16 @@ app.post('/api/transactions/manual', async (req, res) => {
     VALUES($1,$2,$3,$4,$5,$6,$7)
     RETURNING id
   `, [type, +amount, accountFromId, accountToId, date, comment || null, 'manual']);
+  await logOperation({
+    action: type,
+    entity_type: 'transaction',
+    entity_id: row.id,
+    entity_label: `Движение №${row.id}`,
+    amount: +amount,
+    currency: 'USD',
+    description: 'Создано ручное движение денег',
+    meta: { type, account_id: accountId, account_from_id: accountFromId, account_to_id: accountToId, comment: comment || null },
+  });
   res.json({ id: row.id });
 });
 

@@ -18,6 +18,7 @@ import Accounts from './pages/Accounts'
 import Transactions from './pages/Transactions'
 import Ledger from './pages/Ledger'
 import Audit from './pages/Audit'
+import OperationLogs from './pages/OperationLogs'
 import Analytics from './pages/Analytics'
 import AICommands from './pages/AICommands'
 
@@ -45,6 +46,7 @@ export default function App() {
           <Route path="transactions" element={<Transactions />} />
           <Route path="ledger" element={<Ledger />} />
           <Route path="audit" element={<Audit />} />
+          <Route path="operation-logs" element={<OperationLogs />} />
           <Route path="analytics" element={<Analytics />} />
           <Route path="ai" element={<AICommands />} />
         </Route>
