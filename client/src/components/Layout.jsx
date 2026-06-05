@@ -19,7 +19,6 @@ const NAV = [
   ]},
   { section: 'Финансы', items: [
     { path: '/finance', icon: '▦', label: 'Финансы' },
-    { path: '/profit', icon: '◉', label: 'Прибыль' },
     { path: '/accounts', icon: '💰', label: 'Кассы' },
     { path: '/transactions', icon: '⇄', label: 'Движение' },
     { path: '/money-assets', icon: '◇', label: 'Активы' },

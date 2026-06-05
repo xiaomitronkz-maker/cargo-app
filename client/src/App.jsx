@@ -14,7 +14,6 @@ import Liabilities from './pages/Liabilities'
 import Debts from './pages/Debts'
 import Payments from './pages/Payments'
 import Finance from './pages/Finance'
-import Profit from './pages/Profit'
 import Accounts from './pages/Accounts'
 import Transactions from './pages/Transactions'
 import Ledger from './pages/Ledger'
@@ -42,7 +41,6 @@ export default function App() {
           <Route path="debts" element={<Debts />} />
           <Route path="payments" element={<Payments />} />
           <Route path="finance" element={<Finance />} />
-          <Route path="profit" element={<Profit />} />
           <Route path="accounts" element={<Accounts />} />
           <Route path="transactions" element={<Transactions />} />
           <Route path="ledger" element={<Ledger />} />
