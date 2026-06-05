@@ -70,9 +70,21 @@ const prepareImportRowsForSale = (rows) => normalizeArray(rows).map(row => ({
   sale_price: row.sale_price ?? row.suggested_sale_price ?? '',
 }))
 const importSaleBase = (row) => row.sale_unit === 'pcs' ? toNumber(row.quantity_pcs) : toNumber(row.weight_kg)
-const importSaleTotal = (row) => Math.round(importSaleBase(row) * toNumber(row.sale_price) * 100) / 100
+const importSalePrice = (row) => row.sale_price == null || row.sale_price === '' ? 0 : Number(row.sale_price)
+const importSaleTotal = (row) => {
+  const base = importSaleBase(row)
+  const price = importSalePrice(row)
+  return Number.isFinite(base) && Number.isFinite(price) ? Math.round(base * price * 100) / 100 : 0
+}
 const importRowWillImport = (row) => row.status === 'ready'
-const importSaleReady = (row) => !importRowWillImport(row) || (toNumber(row.sale_price) > 0 && importSaleBase(row) > 0)
+const importSaleReady = (row) => {
+  if (!importRowWillImport(row)) return true
+  const base = importSaleBase(row)
+  const price = importSalePrice(row)
+  if (!Number.isFinite(base) || base < 0) return false
+  if (!Number.isFinite(price) || price < 0) return false
+  return base === 0 || price > 0
+}
 
 export default function Receipts() {
   const [receipts, setReceipts] = useState([])
@@ -252,7 +264,7 @@ export default function Receipts() {
       return
     }
     if (importWithSale && rows.some(row => !importSaleReady(row))) {
-      setImportError('Заполните цену реализации для всех строк')
+      setImportError('Заполните цену реализации для строк с весом или количеством')
       return
     }
     setImportCommitting(true)
@@ -301,8 +313,9 @@ export default function Receipts() {
   }
 
   const applySalePriceToAll = () => {
-    if (!(toNumber(saleBulk.sale_price) > 0)) {
-      setImportError('Укажите цену реализации')
+    const bulkPrice = saleBulk.sale_price === '' ? 0 : Number(saleBulk.sale_price)
+    if (!Number.isFinite(bulkPrice) || bulkPrice < 0) {
+      setImportError('Цена реализации не может быть отрицательной')
       return
     }
     setImportError('')
@@ -822,7 +835,7 @@ export default function Receipts() {
                     </div>
                   </div>
                   {hasSaleProblems && (
-                    <div className="alert alert-error" style={{ marginTop: 10 }}>Заполните цену реализации для всех строк</div>
+                    <div className="alert alert-error" style={{ marginTop: 10 }}>Заполните цену реализации для строк с весом или количеством</div>
                   )}
                 </div>
               )}
@@ -989,7 +1002,14 @@ export default function Receipts() {
                           </td>
                         )}
                         {importWithSale && (
-                          <td><span className="badge badge-success">{fmtMoney(importSaleTotal(row))}</span></td>
+                          <td>
+                            <span className="badge badge-success">{fmtMoney(importSaleTotal(row))}</span>
+                            {importRowWillImport(row) && importSaleBase(row) === 0 && (
+                              <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                                0 {row.sale_unit === 'pcs' ? 'шт' : 'кг'} — сумма реализации $0
+                              </div>
+                            )}
+                          </td>
                         )}
                         <td>
                           <span className={`badge ${statusBadge(row.status)}`}>{STATUS_LABELS[row.status] || row.status}</span>

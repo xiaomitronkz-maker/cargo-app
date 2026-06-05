@@ -1452,21 +1452,26 @@ async function rebalanceSalesDocumentPaidAmounts(salesDocumentId, client = pool)
   }
 }
 
-async function createLegacySalesForDocument({ date, clientId, markingId, items, salesDocumentId }, client = pool) {
+async function createLegacySalesForDocument({ date, clientId, markingId, items, salesDocumentId, allowZeroItems = false }, client = pool) {
   const saleIds = [];
   for (const item of items) {
     if (!item.product_id) throw new Error('Выберите товар в каждой строке');
     if (!item.sale_unit) throw new Error('Укажите единицу продажи в каждой строке');
-    if (item.quantity == null || !(+item.quantity > 0)) throw new Error('Количество в каждой строке должно быть больше 0');
-    if (item.price_per_unit == null || !(+item.price_per_unit > 0)) throw new Error('Цена в каждой строке должна быть больше 0');
-
-    await validateSale(item.product_id, item.sale_unit, item.quantity, item.price_per_unit, client);
-    const totalAmount = Math.round(+item.quantity * +item.price_per_unit * 100) / 100;
+    const quantity = item.quantity == null || item.quantity === '' ? 0 : +item.quantity;
+    const pricePerUnit = item.price_per_unit == null || item.price_per_unit === '' ? 0 : +item.price_per_unit;
+    if (!Number.isFinite(quantity) || quantity < 0) throw new Error('Количество не может быть отрицательным');
+    if (!Number.isFinite(pricePerUnit) || pricePerUnit < 0) throw new Error('Цена не может быть отрицательной');
+    if (!allowZeroItems || quantity > 0) {
+      if (!(quantity > 0)) throw new Error('Количество в каждой строке должно быть больше 0');
+      if (!(pricePerUnit > 0)) throw new Error('Цена в каждой строке должна быть больше 0');
+      await validateSale(item.product_id, item.sale_unit, quantity, pricePerUnit, client);
+    }
+    const totalAmount = Math.round(quantity * pricePerUnit * 100) / 100;
     const sale = await get(`
       INSERT INTO sales(date,client_id,marking_id,sales_document_id,product_id,sale_unit,quantity,price_per_unit,total_amount,paid_amount,notes)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       RETURNING id
-    `, [date, clientId, markingId, salesDocumentId, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, totalAmount, 0, item.note || item.notes || null], client);
+    `, [date, clientId, markingId, salesDocumentId, +item.product_id, item.sale_unit, quantity, pricePerUnit, totalAmount, 0, item.note || item.notes || null], client);
     saleIds.push(sale.id);
   }
   return saleIds;
@@ -2874,15 +2879,14 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
         if (createSales && !row.date) throw new Error('Дата обязательна для реализации');
         if (createSales) {
           const saleUnit = row.sale_unit;
-          const salePrice = +row.sale_price;
           if (!['kg', 'pcs'].includes(saleUnit)) throw new Error('Единица реализации должна быть кг или шт');
-          if (!(salePrice > 0)) throw new Error('Укажите цену реализации для всех строк');
-          const saleBase = saleUnit === 'pcs' ? +row.quantity_pcs || 0 : +row.weight_kg || 0;
-          if (!(saleBase > 0)) {
-            throw new Error(saleUnit === 'pcs'
-              ? 'Для реализации по штукам количество должно быть больше 0'
-              : 'Для реализации по кг вес должен быть больше 0');
-          }
+          const salePrice = row.sale_price == null || row.sale_price === '' ? 0 : +row.sale_price;
+          const saleBase = saleUnit === 'pcs'
+            ? (row.quantity_pcs == null || row.quantity_pcs === '' ? 0 : +row.quantity_pcs)
+            : (row.weight_kg == null || row.weight_kg === '' ? 0 : +row.weight_kg);
+          if (!Number.isFinite(saleBase) || saleBase < 0) throw new Error('База реализации не может быть отрицательной');
+          if (!Number.isFinite(salePrice) || salePrice < 0) throw new Error('Цена реализации не может быть отрицательной');
+          if (saleBase > 0 && !(salePrice > 0)) throw new Error('Укажите цену реализации для строк с количеством или весом');
         }
         const key = `${importRow.date}||${importRow.marking_id}`;
         if (!groups.has(key)) groups.set(key, []);
@@ -2952,8 +2956,10 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
 
           if (createSales) {
             const saleUnit = row.sale_unit;
-            const salePrice = +row.sale_price;
-            const saleQuantity = saleUnit === 'pcs' ? +row.quantity_pcs || 0 : +row.weight_kg || 0;
+            const salePrice = row.sale_price == null || row.sale_price === '' ? 0 : +row.sale_price;
+            const saleQuantity = saleUnit === 'pcs'
+              ? (row.quantity_pcs == null || row.quantity_pcs === '' ? 0 : +row.quantity_pcs)
+              : (row.weight_kg == null || row.weight_kg === '' ? 0 : +row.weight_kg);
             const saleNote = `${note} · Реализация из Google Sheets import`;
             saleTotal += saleQuantity * salePrice;
             await query(
@@ -2980,6 +2986,7 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
             markingId: +first.marking_id,
             items: saleItems,
             salesDocumentId: salesDocument.id,
+            allowZeroItems: true,
           }, client);
           await logOperation(client, {
             action: 'sale_created',
