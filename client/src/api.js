@@ -94,6 +94,7 @@ const api = {
   updateSale: (id, data) => api.put(`/sales/${id}`, data),
   deleteSale: (id) => api.del(`/sales/${id}`),
   paySale: (id, data) => api.put(`/sales/${id}/pay`, data),
+  paySalesDocument: (id, data) => api.put(`/sales-documents/${id}/pay`, data),
 
   // Debts
   getDebts: () => api.get('/debts'),

@@ -21,6 +21,13 @@ const normalizeArray = (data) => Array.isArray(data) ? data : []
 const toNumber = (value) => Number(value || 0)
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const fmtPlain = (n) => toNumber(n) ? fmt(n) : '—'
+const roundMoney = (value) => Math.round(toNumber(value) * 100) / 100
+const todayIso = () => {
+  const date = new Date()
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset())
+  return date.toISOString().slice(0, 10)
+}
+const emptyPaymentForm = () => ({ account_id: '', amount: '', date: todayIso(), comment: '' })
 
 const tabLabels = {
   customers: 'Клиенты',
@@ -50,34 +57,101 @@ function operationKind(kind) {
   return 'Реализация'
 }
 
+function hasOpenDebt(row) {
+  return toNumber(row?.balance) > 0.009
+}
+
+function paymentActionLabel(row) {
+  return row?.type === 'supplier' ? 'Оплатить' : 'Принять оплату'
+}
+
+function paymentTitle(row) {
+  return row?.type === 'supplier' ? 'Оплата поставщику' : 'Погашение долга клиента'
+}
+
+function entryDocumentType(entry, rowType) {
+  if (entry.document_type) return entry.document_type
+  if (rowType === 'supplier') return 'receipt'
+  return 'sales_document'
+}
+
+function getOpenDocuments(row) {
+  const documents = []
+  normalizeArray(row?.entries).forEach((entry) => {
+    const charge = roundMoney(entry.charge)
+    const payment = roundMoney(entry.payment)
+    if (charge > 0 && entry.document_id) {
+      documents.push({
+        document_id: entry.document_id,
+        document_type: entryDocumentType(entry, row?.type),
+        date: entry.date,
+        description: entry.description || operationKind(entry.kind),
+        total: charge,
+        remaining: charge,
+      })
+    }
+    if (payment > 0) {
+      let rest = payment
+      for (const document of documents) {
+        if (rest <= 0) break
+        const applied = Math.min(document.remaining, rest)
+        document.remaining = roundMoney(document.remaining - applied)
+        rest = roundMoney(rest - applied)
+      }
+    }
+  })
+  return documents.filter(document => document.remaining > 0.009)
+}
+
 export default function Debts() {
   const [ledger, setLedger] = useState(emptyLedger)
+  const [accounts, setAccounts] = useState([])
   const [activeTab, setActiveTab] = useState('customers')
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState(null)
+  const [paymentTarget, setPaymentTarget] = useState(null)
+  const [paymentForm, setPaymentForm] = useState(emptyPaymentForm())
+  const [paymentError, setPaymentError] = useState('')
+  const [paymentSaving, setPaymentSaving] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+
+  const normalizeLedgerData = (data) => ({
+    summary: { ...emptyLedger.summary, ...(data?.summary || {}) },
+    customers: normalizeArray(data?.customers),
+    suppliers: normalizeArray(data?.suppliers),
+    closed: normalizeArray(data?.closed),
+  })
 
   const load = async () => {
     setLoading(true)
     setError('')
     try {
       const data = await api.getDebtsLedger()
-      setLedger({
-        summary: { ...emptyLedger.summary, ...(data?.summary || {}) },
-        customers: normalizeArray(data?.customers),
-        suppliers: normalizeArray(data?.suppliers),
-        closed: normalizeArray(data?.closed),
-      })
+      const nextLedger = normalizeLedgerData(data)
+      setLedger(nextLedger)
+      return nextLedger
     } catch (e) {
       setLedger(emptyLedger)
       setError(e.message || 'Не удалось загрузить взаиморасчеты')
+      return emptyLedger
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => { load() }, [])
+  const loadAccounts = async () => {
+    try {
+      setAccounts(normalizeArray(await api.getAccounts()))
+    } catch (e) {
+      setAccounts([])
+    }
+  }
+
+  useEffect(() => {
+    load()
+    loadAccounts()
+  }, [])
 
   const rows = useMemo(() => {
     const source = activeTab === 'history'
@@ -91,6 +165,111 @@ export default function Debts() {
   }, [activeTab, ledger, search])
 
   const summary = ledger.summary || emptyLedger.summary
+  const paymentDocuments = useMemo(() => getOpenDocuments(paymentTarget), [paymentTarget])
+  const paymentAccount = accounts.find(account => String(account.id) === String(paymentForm.account_id))
+  const paymentAmount = roundMoney(paymentForm.amount)
+  const paymentDebt = roundMoney(paymentTarget?.balance)
+  const paymentDisabled = paymentSaving ||
+    !paymentTarget ||
+    !paymentForm.account_id ||
+    !(paymentAmount > 0) ||
+    paymentAmount > paymentDebt + 0.009 ||
+    (paymentTarget?.type === 'supplier' && paymentAccount && paymentAmount > toNumber(paymentAccount.balance) + 0.009)
+
+  const openPayment = (row) => {
+    const firstAccount = accounts[0]
+    setPaymentTarget(row)
+    setPaymentForm({
+      account_id: firstAccount?.id ? String(firstAccount.id) : '',
+      amount: hasOpenDebt(row) ? String(roundMoney(row.balance)) : '',
+      date: todayIso(),
+      comment: '',
+    })
+    setPaymentError('')
+  }
+
+  const setPaymentField = (key, value) => {
+    setPaymentForm(form => ({ ...form, [key]: value }))
+  }
+
+  const closePayment = () => {
+    if (paymentSaving) return
+    setPaymentTarget(null)
+    setPaymentForm(emptyPaymentForm())
+    setPaymentError('')
+  }
+
+  const refreshAfterPayment = async () => {
+    const nextLedger = await load()
+    await loadAccounts()
+    if (selected) {
+      const updated = [...nextLedger.customers, ...nextLedger.suppliers, ...nextLedger.closed]
+        .find(row => row.type === selected.type && String(row.counterparty_id) === String(selected.counterparty_id))
+      setSelected(updated || null)
+    }
+  }
+
+  const submitPayment = async () => {
+    if (!paymentTarget) return
+    const amount = roundMoney(paymentForm.amount)
+    const debt = roundMoney(paymentTarget.balance)
+    if (!paymentForm.account_id) {
+      setPaymentError('Выберите кассу')
+      return
+    }
+    if (!(amount > 0)) {
+      setPaymentError('Сумма должна быть больше 0')
+      return
+    }
+    if (amount > debt + 0.009) {
+      setPaymentError('Сумма оплаты превышает текущий долг')
+      return
+    }
+    const availableByDocuments = paymentDocuments.reduce((sum, document) => sum + roundMoney(document.remaining), 0)
+    if (amount > availableByDocuments + 0.009) {
+      setPaymentError('Не удалось распределить оплату по документам')
+      return
+    }
+    if (paymentTarget.type === 'supplier' && paymentAccount && amount > toNumber(paymentAccount.balance) + 0.009) {
+      setPaymentError('Недостаточно средств в кассе')
+      return
+    }
+
+    setPaymentSaving(true)
+    setPaymentError('')
+    try {
+      let rest = amount
+      for (const document of paymentDocuments) {
+        if (rest <= 0.009) break
+        const part = roundMoney(Math.min(rest, roundMoney(document.remaining)))
+        if (!(part > 0)) continue
+        const payload = {
+          amount: part,
+          date: paymentForm.date || todayIso(),
+          comment: paymentForm.comment || null,
+        }
+        if (paymentTarget.type === 'supplier') {
+          payload.account_from_id = paymentForm.account_id
+          if (document.document_type === 'purchase') await api.payPurchase(document.document_id, payload)
+          else await api.payReceipt(document.document_id, payload)
+        } else {
+          payload.account_to_id = paymentForm.account_id
+          if (document.document_type === 'sale') await api.paySale(document.document_id, payload)
+          else await api.paySalesDocument(document.document_id, payload)
+        }
+        rest = roundMoney(rest - part)
+      }
+      setPaymentTarget(null)
+      setPaymentForm(emptyPaymentForm())
+      setPaymentError('')
+      await refreshAfterPayment()
+      alert('Оплата сохранена')
+    } catch (e) {
+      setPaymentError(e.message || 'Не удалось сохранить оплату')
+    } finally {
+      setPaymentSaving(false)
+    }
+  }
 
   const renderRows = () => {
     if (rows.length === 0) {
@@ -124,7 +303,14 @@ export default function Debts() {
           </td>
         )}
         <td>
-          <button className="btn btn-secondary btn-sm" onClick={() => setSelected(row)}>Открыть</button>
+          <div className="td-actions">
+            <button className="btn btn-secondary btn-sm" onClick={() => setSelected(row)}>Открыть</button>
+            {activeTab !== 'history' && hasOpenDebt(row) && (
+              <button className="btn btn-primary btn-sm" onClick={() => openPayment(row)}>
+                {paymentActionLabel(row)}
+              </button>
+            )}
+          </div>
         </td>
       </tr>
     ))
@@ -202,7 +388,7 @@ export default function Debts() {
                 {activeTab !== 'history' && <th>Документов</th>}
                 <th>Последняя операция</th>
                 {activeTab !== 'history' && <th>Статус</th>}
-                <th>Открыть</th>
+                <th>Действия</th>
               </tr>
             </thead>
             <tbody>{renderRows()}</tbody>
@@ -215,7 +401,16 @@ export default function Debts() {
           wide
           title={selected.counterparty_name || 'Контрагент'}
           onClose={() => setSelected(null)}
-          footer={<button className="btn btn-secondary" onClick={() => setSelected(null)}>Закрыть</button>}
+          footer={
+            <>
+              {hasOpenDebt(selected) && (
+                <button className="btn btn-primary" onClick={() => openPayment(selected)}>
+                  {paymentActionLabel(selected)}
+                </button>
+              )}
+              <button className="btn btn-secondary" onClick={() => setSelected(null)}>Закрыть</button>
+            </>
+          }
         >
           <div className="record-meta" style={{ marginBottom: 14 }}>
             <span>Тип</span>
@@ -279,6 +474,115 @@ export default function Debts() {
                       </span>
                     </td>
                     <td className="td-muted">{entry.comment || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+
+      {paymentTarget && (
+        <Modal
+          title={paymentTitle(paymentTarget)}
+          onClose={closePayment}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={closePayment} disabled={paymentSaving}>Отмена</button>
+              <button className="btn btn-primary" onClick={submitPayment} disabled={paymentDisabled}>
+                {paymentSaving ? 'Сохранение...' : paymentActionLabel(paymentTarget)}
+              </button>
+            </>
+          }
+        >
+          {paymentError && <div className="alert alert-error">{paymentError}</div>}
+
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>{typeLabel(paymentTarget.type)}</span>
+            <strong>{paymentTarget.counterparty_name || '—'}</strong>
+          </div>
+
+          <div className="balance-grid" style={{ marginBottom: 18 }}>
+            <div className="balance-card">
+              <div className="balance-card-label">Текущий долг</div>
+              <div className="balance-card-value negative">{fmt(paymentTarget.balance)}</div>
+            </div>
+            <div className="balance-card">
+              <div className="balance-card-label">После оплаты</div>
+              <div className={`balance-card-value ${paymentDebt - paymentAmount > 0.009 ? 'negative' : 'positive'}`}>
+                {fmt(Math.max(0, paymentDebt - paymentAmount))}
+              </div>
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Касса</label>
+            <select className="form-select" value={paymentForm.account_id} onChange={e => setPaymentField('account_id', e.target.value)}>
+              <option value="">— Выберите кассу —</option>
+              {accounts.map(account => (
+                <option key={account.id} value={String(account.id)}>
+                  {account.name} · {account.currency || 'USD'} · {fmt(account.balance)}
+                </option>
+              ))}
+            </select>
+            {paymentTarget.type === 'supplier' && paymentAccount && (
+              <div className="td-muted" style={{ fontSize: 12, marginTop: 6 }}>
+                Доступно в кассе: {fmt(paymentAccount.balance)}
+              </div>
+            )}
+          </div>
+
+          <div className="form-row">
+            <div className="form-group">
+              <label className="form-label">Сумма оплаты</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                className="form-input"
+                value={paymentForm.amount}
+                onChange={e => setPaymentField('amount', e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Дата</label>
+              <input
+                type="date"
+                className="form-input"
+                value={paymentForm.date}
+                onChange={e => setPaymentField('date', e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Комментарий</label>
+            <textarea
+              className="form-textarea"
+              value={paymentForm.comment}
+              onChange={e => setPaymentField('comment', e.target.value)}
+              placeholder={paymentTarget.type === 'supplier' ? 'Оплата поставщику' : 'Оплата клиента'}
+            />
+          </div>
+
+          <div style={{ fontWeight: 700, margin: '16px 0 10px' }}>Открытые документы</div>
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Дата</th>
+                  <th>Документ</th>
+                  <th>Остаток</th>
+                </tr>
+              </thead>
+              <tbody>
+                {paymentDocuments.length === 0 ? (
+                  <tr><td colSpan={3}><div className="empty-state"><p>Открытых документов нет</p></div></td></tr>
+                ) : paymentDocuments.map(document => (
+                  <tr key={`${document.document_type}-${document.document_id}`}>
+                    <td className="td-date td-muted">{formatDate(document.date)}</td>
+                    <td>{document.description}</td>
+                    <td className="td-mono">{fmt(document.remaining)}</td>
                   </tr>
                 ))}
               </tbody>

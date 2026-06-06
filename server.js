@@ -1629,6 +1629,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
     group.entries.push({
       date: row.date || null,
       kind: row.kind || (type === 'customer' ? 'sale' : 'receipt'),
+      document_type: row.document_type || (type === 'customer' ? 'sale' : 'receipt'),
       document_id: row.document_id == null ? null : +row.document_id,
       description: row.description || (type === 'customer' ? 'Реализация' : 'Приход'),
       charge: amount,
@@ -1677,6 +1678,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
       return {
         date: entry.date,
         kind: entry.kind,
+        document_type: entry.document_type || null,
         document_id: entry.document_id,
         description: entry.description,
         charge: ledgerNumber(entry.charge),
@@ -1710,6 +1712,7 @@ async function debtsLedgerData(client = pool) {
       c.name::text AS counterparty_name,
       COALESCE(SUM(s.total_amount::numeric),0) AS charge,
       'sale'::text AS kind,
+      CASE WHEN sd.id IS NOT NULL THEN 'sales_document' ELSE 'sale' END::text AS document_type,
       CASE
         WHEN sd.id IS NOT NULL THEN 'Реализация №' || sd.id
         ELSE 'Реализация №' || MIN(s.id)
@@ -1761,6 +1764,7 @@ async function debtsLedgerData(client = pool) {
         s.name::text AS counterparty_name,
         COALESCE(SUM(p.total_cost::numeric),0) AS charge,
         'receipt'::text AS kind,
+        'receipt'::text AS document_type,
         'Приход №' || r.id AS description,
         NULL::text AS comment
       FROM receipts r
@@ -1779,6 +1783,7 @@ async function debtsLedgerData(client = pool) {
         s.name::text AS counterparty_name,
         COALESCE(p.total_cost::numeric,0) AS charge,
         'receipt'::text AS kind,
+        'purchase'::text AS document_type,
         'Приход №' || p.id AS description,
         p.notes::text AS comment
       FROM purchases p
