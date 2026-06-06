@@ -2896,6 +2896,8 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
       const receiptIds = [];
       const salesDocumentIds = [];
       let importedRows = 0;
+      let totalPurchaseAmount = 0;
+      let totalSaleAmount = 0;
       for (const groupRows of groups.values()) {
         if (!groupRows.length) continue;
         const first = groupRows[0];
@@ -3009,6 +3011,8 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
           description: 'Создан приход из Google Sheets import',
           meta: { source: 'google_sheets_import', items_count: groupRows.length, supplier_id: +supplier_id, client_id: +first.client_id, marking_id: +first.marking_id },
         });
+        totalPurchaseAmount += receiptTotal;
+        totalSaleAmount += saleTotal;
       }
 
       const importResult = {
@@ -3018,6 +3022,8 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
         sales_document_ids: salesDocumentIds,
         imported_rows: importedRows,
         skipped_rows: skippedRows,
+        purchase_total: Math.round(totalPurchaseAmount * 100) / 100,
+        sale_total: Math.round(totalSaleAmount * 100) / 100,
       };
       await logOperation(client, {
         action: 'google_sheets_import',

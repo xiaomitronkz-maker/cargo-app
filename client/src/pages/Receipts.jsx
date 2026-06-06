@@ -46,6 +46,7 @@ const MARKING_MATCH_LABELS = {
   ambiguous: 'Несколько вариантов',
   not_found: 'Не найдена',
   selected: 'Выбрано вручную',
+  manual_created: 'Создано вручную',
 }
 const statusBadge = (status) => {
   if (status === 'ready') return 'badge-success'
@@ -71,12 +72,14 @@ const prepareImportRowsForSale = (rows) => normalizeArray(rows).map(row => ({
 }))
 const importSaleBase = (row) => row.sale_unit === 'pcs' ? toNumber(row.quantity_pcs) : toNumber(row.weight_kg)
 const importSalePrice = (row) => row.sale_price == null || row.sale_price === '' ? 0 : Number(row.sale_price)
+const importPurchaseTotal = (row) => toNumber(row.app_total ?? row.total_cost ?? row.total_amount ?? row.cost)
 const importSaleTotal = (row) => {
   const base = importSaleBase(row)
   const price = importSalePrice(row)
   return Number.isFinite(base) && Number.isFinite(price) ? Math.round(base * price * 100) / 100 : 0
 }
 const importRowWillImport = (row) => row.status === 'ready'
+const sourceMarkingKey = (value) => String(value || '').trim().toLowerCase()
 const importSaleReady = (row) => {
   if (!importRowWillImport(row)) return true
   const base = importSaleBase(row)
@@ -85,6 +88,7 @@ const importSaleReady = (row) => {
   if (!Number.isFinite(price) || price < 0) return false
   return base === 0 || price > 0
 }
+const makeImportGroupKey = (row) => `${row.date || ''}||${row.marking_id || sourceMarkingKey(row.marking)}`
 
 export default function Receipts() {
   const [receipts, setReceipts] = useState([])
@@ -109,6 +113,7 @@ export default function Receipts() {
   const [importLoading, setImportLoading] = useState(false)
   const [importCommitting, setImportCommitting] = useState(false)
   const [saleBulk, setSaleBulk] = useState(SALE_BULK_EMPTY)
+  const [markingCreate, setMarkingCreate] = useState(null)
   const [viewMode, setViewMode] = useState('dates')
   const [expandedDate, setExpandedDate] = useState(null)
 
@@ -230,6 +235,7 @@ export default function Receipts() {
     setImportResult(null)
     setImportError('')
     setSaleBulk(SALE_BULK_EMPTY)
+    setMarkingCreate(null)
     setImportOpen(true)
   }
 
@@ -291,26 +297,96 @@ export default function Receipts() {
     }))
   }
 
-  const selectImportMarking = (index, candidateId) => {
+  const applyImportMarkingToSource = (sourceMarking, marking, matchStatus = 'selected', matchedKeyword = null) => {
+    const key = sourceMarkingKey(sourceMarking)
+    const markingName = marking.marking || marking.name || ''
     setImportPreview(prev => ({
       ...prev,
-      rows: normalizeArray(prev?.rows).map((row, rowIndex) => {
-        if (rowIndex !== index) return row
-        const candidate = normalizeArray(row.marking_candidates).find(item => String(item.marking_id) === String(candidateId))
-        if (!candidate) return row
+      rows: normalizeArray(prev?.rows).map(row => {
+        if (sourceMarkingKey(row.marking) !== key) return row
+        if (row.status === 'already_imported') return row
         return {
           ...row,
-          marking_id: candidate.marking_id,
-          matched_marking: candidate.marking,
-          client_id: candidate.client_id,
-          client_name: candidate.client_name,
-          matched_keyword: candidate.matched_keyword,
-          marking_match_status: 'selected',
+          marking_id: marking.id || marking.marking_id,
+          matched_marking: markingName,
+          client_id: marking.client_id,
+          client_name: marking.client_name,
+          matched_keyword: matchedKeyword,
+          marking_match_status: matchStatus,
           status: 'ready',
+          warnings: normalizeArray(row.warnings).filter(warning => !String(warning).includes('Маркировка')),
         }
       }),
     }))
   }
+
+  const selectImportMarking = (index, candidateId) => {
+    const row = normalizeArray(importPreview?.rows)[index]
+    if (!row) return
+    const candidate = normalizeArray(row.marking_candidates).find(item => String(item.marking_id) === String(candidateId))
+    if (!candidate) return
+    applyImportMarkingToSource(row.marking, {
+      id: candidate.marking_id,
+      marking: candidate.marking,
+      client_id: candidate.client_id,
+      client_name: candidate.client_name,
+    }, 'selected', candidate.matched_keyword)
+  }
+
+  const selectExistingImportMarking = (index, markingId) => {
+    const row = normalizeArray(importPreview?.rows)[index]
+    if (!row) return
+    const marking = normalizeArray(markings).find(item => String(item.id) === String(markingId))
+    if (!marking) return
+    applyImportMarkingToSource(row.marking, marking, 'selected', marking.marking)
+  }
+
+  const openCreateImportMarking = (index) => {
+    const row = normalizeArray(importPreview?.rows)[index]
+    if (!row) return
+    setMarkingCreate({
+      rowIndex: index,
+      source_marking: row.marking || '',
+      marking: row.marking || '',
+      client_id: '',
+      keywords: row.marking || '',
+    })
+  }
+
+  const createAndApplyImportMarking = async () => {
+    if (!markingCreate?.marking?.trim()) {
+      setImportError('Укажите маркировку')
+      return
+    }
+    if (!markingCreate.client_id) {
+      setImportError('Выберите клиента для новой маркировки')
+      return
+    }
+    try {
+      const payload = {
+        marking: markingCreate.marking.trim(),
+        client_id: markingCreate.client_id,
+        keywords: markingCreate.keywords?.trim() || markingCreate.marking.trim(),
+      }
+      const created = await api.createMarking(payload)
+      const client = normalizeArray(clients).find(item => String(item.id) === String(payload.client_id))
+      const newMarking = {
+        id: created.id,
+        marking: payload.marking.trim().toUpperCase(),
+        client_id: +payload.client_id,
+        client_name: client?.name || '',
+        keywords: payload.keywords,
+      }
+      setMarkings(rows => [...normalizeArray(rows), newMarking])
+      applyImportMarkingToSource(markingCreate.source_marking, newMarking, 'manual_created', payload.keywords)
+      setMarkingCreate(null)
+      setImportError('')
+    } catch (e) {
+      setImportError(e.message || 'Не удалось создать маркировку')
+    }
+  }
+
+  const cancelCreateImportMarking = () => setMarkingCreate(null)
 
   const applySalePriceToAll = () => {
     const bulkPrice = saleBulk.sale_price === '' ? 0 : Number(saleBulk.sale_price)
@@ -334,20 +410,55 @@ export default function Receipts() {
   const hasMarkingProblems = previewRows.some(row => ['marking_not_found', 'marking_ambiguous'].includes(row.status))
   const hasReadyRows = previewRows.some(row => row.status === 'ready')
   const hasSaleProblems = importWithSale && previewRows.some(row => !importSaleReady(row))
+  const importSummary = useMemo(() => {
+    const rowsToImport = previewRows.filter(importRowWillImport)
+    const receiptKeys = new Set()
+    let purchaseTotal = 0
+    let saleTotal = 0
+    let totalWeight = 0
+    let totalQuantity = 0
+    rowsToImport.forEach(row => {
+      receiptKeys.add(makeImportGroupKey(row))
+      purchaseTotal += importPurchaseTotal(row)
+      saleTotal += importWithSale ? importSaleTotal(row) : 0
+      totalWeight += toNumber(row.weight_kg)
+      totalQuantity += toNumber(row.quantity_pcs)
+    })
+    return {
+      rows_count: rowsToImport.length,
+      future_receipts: receiptKeys.size,
+      future_sales: importWithSale ? receiptKeys.size : 0,
+      purchase_total: Math.round(purchaseTotal * 100) / 100,
+      sale_total: Math.round(saleTotal * 100) / 100,
+      gross_profit: Math.round((saleTotal - purchaseTotal) * 100) / 100,
+      total_weight: totalWeight,
+      total_quantity: totalQuantity,
+    }
+  }, [previewRows, importWithSale])
   const previewGroupsWithSales = useMemo(() => {
     const saleTotalsByGroup = new Map()
     const rowsByGroup = new Map()
+    const purchaseTotalsByGroup = new Map()
+    const weightsByGroup = new Map()
+    const quantitiesByGroup = new Map()
+    const rowsCountByGroup = new Map()
     previewRows.forEach(row => {
       const key = `${row.date}||${row.marking}`
       if (!rowsByGroup.has(key)) rowsByGroup.set(key, [])
       rowsByGroup.get(key).push(row)
       if (!importRowWillImport(row)) return
       saleTotalsByGroup.set(key, toNumber(saleTotalsByGroup.get(key)) + importSaleTotal(row))
+      purchaseTotalsByGroup.set(key, toNumber(purchaseTotalsByGroup.get(key)) + importPurchaseTotal(row))
+      weightsByGroup.set(key, toNumber(weightsByGroup.get(key)) + toNumber(row.weight_kg))
+      quantitiesByGroup.set(key, toNumber(quantitiesByGroup.get(key)) + toNumber(row.quantity_pcs))
+      rowsCountByGroup.set(key, toNumber(rowsCountByGroup.get(key)) + 1)
     })
     return previewGroups.map(group => {
       const key = `${group.date}||${group.marking}`
       const saleTotal = toNumber(saleTotalsByGroup.get(key))
+      const purchaseTotal = toNumber(purchaseTotalsByGroup.get(key))
       const groupRows = normalizeArray(rowsByGroup.get(key))
+      const resolvedRow = groupRows.find(row => row.client_name || row.matched_marking)
       let status = group.status
       if (groupRows.some(row => row.status === 'marking_not_found')) status = 'marking_not_found'
       else if (groupRows.some(row => row.status === 'marking_ambiguous')) status = 'marking_ambiguous'
@@ -357,8 +468,15 @@ export default function Receipts() {
       return {
         ...group,
         status,
+        client_id: resolvedRow?.client_id ?? group.client_id,
+        client_name: resolvedRow?.client_name || group.client_name,
+        matched_marking: resolvedRow?.matched_marking || group.marking,
+        items_count: toNumber(rowsCountByGroup.get(key)) || group.items_count,
+        total_weight: toNumber(weightsByGroup.get(key)) || group.total_weight,
+        total_quantity: toNumber(quantitiesByGroup.get(key)) || group.total_quantity,
+        app_total: purchaseTotal || toNumber(group.app_total),
         sale_total: saleTotal,
-        gross_profit: saleTotal - toNumber(group.app_total),
+        gross_profit: saleTotal - (purchaseTotal || toNumber(group.app_total)),
       }
     })
   }, [previewGroups, previewRows])
@@ -732,6 +850,8 @@ export default function Receipts() {
               Создано приходов: {importResult.created_receipts || 0}
               {importResult.created_sales_documents ? ` · реализаций: ${importResult.created_sales_documents}` : ''}
               {' '}· импортировано строк: {importResult.imported_rows || 0} · пропущено дублей: {importResult.skipped_rows || 0}
+              {' '}· сумма прихода: {fmtMoney(importResult.purchase_total ?? importSummary.purchase_total)}
+              {importWithSale && ` · сумма реализации: ${fmtMoney(importResult.sale_total ?? importSummary.sale_total)}`}
             </div>
           )}
 
@@ -814,6 +934,50 @@ export default function Receipts() {
                 </div>
               </div>
 
+              <div style={{ fontWeight: 700, margin: '18px 0 10px' }}>Сводка импорта</div>
+              <div className="stat-grid">
+                <div className="stat-card">
+                  <div className="stat-label">Строк к импорту</div>
+                  <div className="stat-value">{importSummary.rows_count}</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Будущих приходов</div>
+                  <div className="stat-value">{importSummary.future_receipts}</div>
+                </div>
+                {importWithSale && (
+                  <div className="stat-card">
+                    <div className="stat-label">Будущих реализаций</div>
+                    <div className="stat-value">{importSummary.future_sales}</div>
+                  </div>
+                )}
+                <div className="stat-card">
+                  <div className="stat-label">Себестоимость прихода</div>
+                  <div className="stat-value">{fmtMoney(importSummary.purchase_total)}</div>
+                </div>
+                {importWithSale && (
+                  <div className="stat-card">
+                    <div className="stat-label">Сумма реализации</div>
+                    <div className="stat-value positive">{fmtMoney(importSummary.sale_total)}</div>
+                  </div>
+                )}
+                {importWithSale && (
+                  <div className="stat-card">
+                    <div className="stat-label">Валовая прибыль</div>
+                    <div className={`stat-value ${importSummary.gross_profit >= 0 ? 'positive' : 'negative'}`}>
+                      {fmtMoney(importSummary.gross_profit)}
+                    </div>
+                  </div>
+                )}
+                <div className="stat-card">
+                  <div className="stat-label">Общий вес</div>
+                  <div className="stat-value">{fmtNum(importSummary.total_weight, 3)} кг</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Общее количество</div>
+                  <div className="stat-value">{fmtNum(importSummary.total_quantity, 0)} шт</div>
+                </div>
+              </div>
+
               {importWithSale && (
                 <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginTop: 16 }}>
                   <div style={{ fontWeight: 700, marginBottom: 10 }}>Цена реализации</div>
@@ -837,6 +1001,48 @@ export default function Receipts() {
                   {hasSaleProblems && (
                     <div className="alert alert-error" style={{ marginTop: 10 }}>Заполните цену реализации для строк с весом или количеством</div>
                   )}
+                </div>
+              )}
+
+              {markingCreate && (
+                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginTop: 16 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 10 }}>Создать маркировку из preview</div>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label className="form-label">Маркировка</label>
+                      <input
+                        className="form-input"
+                        value={markingCreate.marking}
+                        onChange={e => setMarkingCreate(value => ({ ...value, marking: e.target.value }))}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Клиент</label>
+                      <select
+                        className="form-select"
+                        value={markingCreate.client_id}
+                        onChange={e => setMarkingCreate(value => ({ ...value, client_id: e.target.value }))}
+                      >
+                        <option value="">— Выберите клиента —</option>
+                        {clients.map(client => <option key={client.id} value={String(client.id)}>{client.name}</option>)}
+                      </select>
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Ключевые слова</label>
+                      <input
+                        className="form-input"
+                        value={markingCreate.keywords}
+                        onChange={e => setMarkingCreate(value => ({ ...value, keywords: e.target.value }))}
+                      />
+                    </div>
+                  </div>
+                  <div className="td-muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                    После создания маркировка применится ко всем строкам Google Sheets с тем же значением: {markingCreate.source_marking || '—'}.
+                  </div>
+                  <div className="td-actions">
+                    <button type="button" className="btn btn-primary btn-sm" onClick={createAndApplyImportMarking}>Создать и применить</button>
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={cancelCreateImportMarking}>Отмена</button>
+                  </div>
                 </div>
               )}
 
@@ -916,27 +1122,52 @@ export default function Receipts() {
                         <td>{row.marking}</td>
                         <td>
                           {row.status === 'marking_ambiguous' ? (
-                            <select
-                              className="form-select"
-                              value=""
-                              onChange={e => selectImportMarking(rowIndex, e.target.value)}
-                              style={{ minWidth: 190 }}
-                            >
-                              <option value="">— Выберите маркировку —</option>
+                            <>
+                              <select
+                                className="form-select"
+                                value=""
+                                onChange={e => selectImportMarking(rowIndex, e.target.value)}
+                                style={{ minWidth: 210 }}
+                              >
+                                <option value="">— Выберите маркировку —</option>
+                                {normalizeArray(row.marking_candidates).map(candidate => (
+                                  <option key={candidate.marking_id} value={candidate.marking_id}>
+                                    {candidate.marking} · {candidate.client_name}
+                                  </option>
+                                ))}
+                              </select>
                               {normalizeArray(row.marking_candidates).map(candidate => (
-                                <option key={candidate.marking_id} value={candidate.marking_id}>
-                                  {candidate.marking} · {candidate.client_name}
-                                </option>
+                                <div key={candidate.marking_id} className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                                  {candidate.marking} · {candidate.client_name} · {candidate.matched_keyword}
+                                </div>
                               ))}
-                            </select>
+                            </>
+                          ) : row.status === 'marking_not_found' ? (
+                            <div style={{ minWidth: 240 }}>
+                              <select
+                                className="form-select"
+                                value=""
+                                onChange={e => selectExistingImportMarking(rowIndex, e.target.value)}
+                                style={{ minWidth: 220, marginBottom: 6 }}
+                              >
+                                <option value="">— Выбрать из справочника —</option>
+                                {markings.map(marking => (
+                                  <option key={marking.id} value={String(marking.id)}>
+                                    {marking.marking} · {marking.client_name || 'без клиента'}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                className="btn btn-secondary btn-sm"
+                                onClick={() => openCreateImportMarking(rowIndex)}
+                              >
+                                Создать маркировку
+                              </button>
+                            </div>
                           ) : (
                             row.matched_marking || '—'
                           )}
-                          {row.status === 'marking_ambiguous' && normalizeArray(row.marking_candidates).map(candidate => (
-                            <div key={candidate.marking_id} className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
-                              {candidate.marking} · {candidate.client_name} · {candidate.matched_keyword}
-                            </div>
-                          ))}
                         </td>
                         <td>{row.client_name || '—'}</td>
                         <td>
