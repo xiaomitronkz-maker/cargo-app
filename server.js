@@ -318,7 +318,7 @@ async function initDb() {
       tariff_type TEXT DEFAULT 'purchase',
       product_pattern TEXT,
       class_code TEXT,
-      dxb_rate NUMERIC DEFAULT 5.5,
+      dxb_rate NUMERIC DEFAULT 5,
       ala_rate NUMERIC DEFAULT 0,
       ala_unit TEXT CHECK(ala_unit IN ('kg','pcs')) DEFAULT 'kg',
       sale_rate NUMERIC DEFAULT 0,
@@ -373,6 +373,7 @@ async function initDb() {
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS tariff_type TEXT DEFAULT 'purchase';
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_rate NUMERIC DEFAULT 0;
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_unit TEXT DEFAULT 'kg';
+    ALTER TABLE tariffs ALTER COLUMN dxb_rate SET DEFAULT 5;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE SET NULL;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
@@ -397,6 +398,11 @@ async function initDb() {
     SET tariff_type='purchase'
     WHERE tariff_type IS NULL OR tariff_type NOT IN ('purchase','sale');
     UPDATE tariffs SET sale_unit='kg' WHERE sale_unit IS NULL OR sale_unit NOT IN ('kg','pcs');
+    UPDATE tariffs
+    SET dxb_rate=5
+    WHERE tariff_type='purchase'
+      AND name IN ('Базовый тариф','Телефоны')
+      AND dxb_rate::numeric = 5.5;
     UPDATE markings SET keywords=marking WHERE keywords IS NULL OR trim(keywords) = '';
   `);
 
@@ -405,8 +411,8 @@ async function initDb() {
     await query(`
       INSERT INTO tariffs(name,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,is_default,is_active)
       VALUES
-        ('Базовый тариф', NULL, NULL, 5.5, 3, 'kg', TRUE, TRUE),
-        ('Телефоны', 'phone,iphone,айфон,телефон,smartphone', NULL, 5.5, 3, 'pcs', FALSE, TRUE)
+        ('Базовый тариф', NULL, NULL, 5, 3, 'kg', TRUE, TRUE),
+        ('Телефоны', 'phone,iphone,айфон,телефон,smartphone', NULL, 5, 3, 'pcs', FALSE, TRUE)
     `);
   }
 
@@ -636,7 +642,7 @@ function matchTariff(productName, classCode, tariffs = []) {
   return {
     id: null,
     name: 'Авто',
-    dxb_rate: 5.5,
+    dxb_rate: 5,
     ala_rate: 0,
     ala_unit: isPhoneProduct(productName) ? 'pcs' : 'kg',
   };
@@ -671,7 +677,7 @@ function matchSaleTariff(productName, classCode, tariffs = []) {
   };
 }
 
-function calculateImportCost({ productName = '', classCode = '', weightKg = 0, quantityPcs = 0, dxbRate = 5.5, alaRate = 0, alaUnit }) {
+function calculateImportCost({ productName = '', classCode = '', weightKg = 0, quantityPcs = 0, dxbRate = 5, alaRate = 0, alaUnit }) {
   const weight = +weightKg || 0;
   const quantity = +quantityPcs || 0;
   const dubaiRate = +dxbRate || 0;

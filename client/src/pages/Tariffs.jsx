@@ -8,7 +8,7 @@ const emptyForm = (type = 'purchase') => ({
   tariff_type: type,
   product_pattern: '',
   class_code: '',
-  dxb_rate: type === 'purchase' ? '5.5' : '0',
+  dxb_rate: type === 'purchase' ? '5' : '0',
   ala_rate: type === 'purchase' ? '3' : '0',
   ala_unit: 'kg',
   sale_rate: '0',
@@ -60,7 +60,7 @@ export default function Tariffs() {
       tariff_type: type,
       product_pattern: tariff.product_pattern || '',
       class_code: tariff.class_code || '',
-      dxb_rate: tariff.dxb_rate ?? (type === 'purchase' ? '5.5' : '0'),
+      dxb_rate: tariff.dxb_rate ?? (type === 'purchase' ? '5' : '0'),
       ala_rate: tariff.ala_rate ?? (type === 'purchase' ? '3' : '0'),
       ala_unit: tariff.ala_unit || 'kg',
       sale_rate: tariff.sale_rate ?? '0',
@@ -103,7 +103,7 @@ export default function Tariffs() {
       ...emptyForm(type),
       ...current,
       tariff_type: type,
-      dxb_rate: type === 'sale' ? '0' : (current.tariff_type === 'sale' ? '5.5' : current.dxb_rate),
+      dxb_rate: type === 'sale' ? '0' : (current.tariff_type === 'sale' ? '5' : current.dxb_rate),
       ala_rate: type === 'sale' ? '0' : (current.tariff_type === 'sale' ? '3' : current.ala_rate),
     }))
   }
