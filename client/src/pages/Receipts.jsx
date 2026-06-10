@@ -1197,6 +1197,14 @@ export default function Receipts() {
                         {importWithSale && (
                           <td>
                             <div>{row.sale_tariff_name || '—'}</div>
+                            {row.sale_tariff_client_id && (
+                              <div style={{ marginTop: 4 }}>
+                                <span className="badge badge-primary">Клиентский тариф</span>
+                                <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                                  {row.sale_tariff_client_name || row.client_name || 'для клиента'}
+                                </div>
+                              </div>
+                            )}
                             {toNumber(row.suggested_sale_price) > 0 && (
                               <div className="td-muted" style={{ fontSize: 11 }}>
                                 {fmtMoney(row.suggested_sale_price)} / {row.suggested_sale_unit === 'pcs' ? 'шт' : 'кг'}

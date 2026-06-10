@@ -6,6 +6,7 @@ import { normalizeArray, toNumber } from '../utils/data'
 const emptyForm = (type = 'purchase') => ({
   name: '',
   tariff_type: type,
+  client_id: '',
   product_pattern: '',
   class_code: '',
   dxb_rate: type === 'purchase' ? '5' : '0',
@@ -22,6 +23,7 @@ const unitLabel = (unit) => unit === 'pcs' ? 'шт' : 'кг'
 
 export default function Tariffs() {
   const [tariffs, setTariffs] = useState([])
+  const [clients, setClients] = useState([])
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
   const [selected, setSelected] = useState(null)
@@ -32,8 +34,11 @@ export default function Tariffs() {
 
   const load = () => {
     setLoading(true)
-    api.getTariffs()
-      .then((data) => setTariffs(normalizeArray(data)))
+    Promise.all([api.getTariffs(), api.getClients()])
+      .then(([tariffsData, clientsData]) => {
+        setTariffs(normalizeArray(tariffsData))
+        setClients(normalizeArray(clientsData))
+      })
       .catch((e) => setError(e.message || 'Не удалось загрузить тарифы'))
       .finally(() => setLoading(false))
   }
@@ -58,6 +63,7 @@ export default function Tariffs() {
     setForm({
       name: tariff.name || '',
       tariff_type: type,
+      client_id: type === 'sale' && tariff.client_id ? String(tariff.client_id) : '',
       product_pattern: tariff.product_pattern || '',
       class_code: tariff.class_code || '',
       dxb_rate: tariff.dxb_rate ?? (type === 'purchase' ? '5' : '0'),
@@ -103,6 +109,7 @@ export default function Tariffs() {
       ...emptyForm(type),
       ...current,
       tariff_type: type,
+      client_id: type === 'sale' ? current.client_id : '',
       dxb_rate: type === 'sale' ? '0' : (current.tariff_type === 'sale' ? '5' : current.dxb_rate),
       ala_rate: type === 'sale' ? '0' : (current.tariff_type === 'sale' ? '3' : current.ala_rate),
     }))
@@ -126,7 +133,7 @@ export default function Tariffs() {
       <div className="alert" style={{ marginBottom: 16 }}>
         {activeTab === 'purchase'
           ? 'DXB считается по кг. ALA для телефонов обычно по шт, для остальных по кг.'
-          : 'Приоритет подбора: товар + класс → товар → класс → общий тариф. Более точное совпадение товара важнее общего.'}
+          : 'Приоритет: клиент + товар + класс → клиент + товар → клиент + класс → товар + класс → товар → класс → общий тариф. Если клиент не выбран — тариф общий для всех.'}
       </div>
 
       {error && <div className="alert alert-error">{error}</div>}
@@ -149,6 +156,7 @@ export default function Tariffs() {
               ) : (
                 <tr>
                   <th>Название</th>
+                  <th>Клиент</th>
                   <th>Товар / ключевые слова</th>
                   <th>Класс</th>
                   <th>Цена реализации</th>
@@ -160,13 +168,14 @@ export default function Tariffs() {
             </thead>
             <tbody>
               {visibleTariffs.length === 0 && (
-                <tr><td colSpan={activeTab === 'purchase' ? 8 : 7}>
+                <tr><td colSpan={activeTab === 'purchase' ? 8 : 8}>
                   <div className="empty-state"><p>Тарифов нет</p></div>
                 </td></tr>
               )}
               {visibleTariffs.map((tariff) => (
                 <tr key={tariff.id}>
                   <td style={{ fontWeight: 700 }}>{tariff.name}</td>
+                  {activeTab === 'sale' && <td>{tariff.client_name || 'Все клиенты'}</td>}
                   <td className="td-muted">{tariff.product_pattern || '—'}</td>
                   <td>{tariff.class_code || '—'}</td>
                   {activeTab === 'purchase' ? (
@@ -224,6 +233,18 @@ export default function Tariffs() {
             <label className="form-label">Название</label>
             <input className="form-input" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} autoFocus />
           </div>
+          {form.tariff_type === 'sale' && (
+            <div className="form-group">
+              <label className="form-label">Клиент</label>
+              <select className="form-select" value={form.client_id} onChange={e => setForm(f => ({ ...f, client_id: e.target.value }))}>
+                <option value="">Все клиенты</option>
+                {clients.map(client => <option key={client.id} value={String(client.id)}>{client.name}</option>)}
+              </select>
+              <div className="td-muted" style={{ fontSize: 12, marginTop: 6 }}>
+                Если выбран клиент, тариф применяется только этому клиенту. Если клиент не выбран — тариф общий для всех.
+              </div>
+            </div>
+          )}
           <div className="form-group">
             <label className="form-label">Ключевые слова товара</label>
             <input className="form-input" value={form.product_pattern} onChange={e => setForm(f => ({ ...f, product_pattern: e.target.value }))} placeholder={form.tariff_type === 'sale' ? 'airpods, air pods, airpods max' : 'iphone, phone, айфон'} />

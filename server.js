@@ -318,6 +318,7 @@ async function initDb() {
       tariff_type TEXT DEFAULT 'purchase',
       product_pattern TEXT,
       class_code TEXT,
+      client_id INTEGER,
       dxb_rate NUMERIC DEFAULT 5,
       ala_rate NUMERIC DEFAULT 0,
       ala_unit TEXT CHECK(ala_unit IN ('kg','pcs')) DEFAULT 'kg',
@@ -371,6 +372,7 @@ async function initDb() {
     ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS class_code TEXT;
     ALTER TABLE markings ADD COLUMN IF NOT EXISTS keywords TEXT;
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS tariff_type TEXT DEFAULT 'purchase';
+    ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS client_id INTEGER;
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_rate NUMERIC DEFAULT 0;
     ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sale_unit TEXT DEFAULT 'kg';
     ALTER TABLE tariffs ALTER COLUMN dxb_rate SET DEFAULT 5;
@@ -648,24 +650,50 @@ function matchTariff(productName, classCode, tariffs = []) {
   };
 }
 
-function matchSaleTariff(productName, classCode, tariffs = []) {
+function tariffClientMatches(tariff, clientId) {
+  return Boolean(clientId) && tariff.client_id != null && +tariff.client_id === +clientId;
+}
+
+function isGeneralTariff(tariff) {
+  return tariff.client_id == null || tariff.client_id === '';
+}
+
+function matchSaleTariff(productName, classCode, clientId, tariffs = []) {
   const active = tariffs.filter((tariff) => tariff && tariff.is_active !== false && normalizeText(tariff.tariff_type) === 'sale');
+
+  const clientTariffs = active.filter((tariff) => tariffClientMatches(tariff, clientId));
+  const clientProductAndClass = bestProductPatternTariff(
+    clientTariffs.filter((tariff) => tariffClassMatches(tariff, classCode)),
+    productName
+  );
+  if (clientProductAndClass) return clientProductAndClass;
+
+  const clientProductOnly = bestProductPatternTariff(
+    clientTariffs.filter((tariff) => !normalizeText(tariff.class_code)),
+    productName
+  );
+  if (clientProductOnly) return clientProductOnly;
+
+  const clientClassOnly = clientTariffs.find((tariff) => !productPatternKeywords(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
+  if (clientClassOnly) return clientClassOnly;
+
+  const generalTariffs = active.filter(isGeneralTariff);
   const productAndClass = bestProductPatternTariff(
-    active.filter((tariff) => tariffClassMatches(tariff, classCode)),
+    generalTariffs.filter((tariff) => tariffClassMatches(tariff, classCode)),
     productName
   );
   if (productAndClass) return productAndClass;
 
   const productOnly = bestProductPatternTariff(
-    active.filter((tariff) => !normalizeText(tariff.class_code)),
+    generalTariffs.filter((tariff) => !normalizeText(tariff.class_code)),
     productName
   );
   if (productOnly) return productOnly;
 
-  const classOnly = active.find((tariff) => !productPatternKeywords(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
+  const classOnly = generalTariffs.find((tariff) => !productPatternKeywords(tariff.product_pattern).length && tariffClassMatches(tariff, classCode));
   if (classOnly) return classOnly;
 
-  const defaultTariff = active.find((tariff) => tariff.is_default);
+  const defaultTariff = generalTariffs.find((tariff) => tariff.is_default);
   if (defaultTariff) return defaultTariff;
 
   return {
@@ -2527,7 +2555,12 @@ app.delete('/api/products/:id', async (req, res) => {
 
 // Tariffs
 app.get('/api/tariffs', async (req, res) => {
-  res.json(await all('SELECT * FROM tariffs ORDER BY is_default DESC, is_active DESC, name'));
+  res.json(await all(`
+    SELECT t.*, c.name AS client_name
+    FROM tariffs t
+    LEFT JOIN clients c ON c.id = t.client_id
+    ORDER BY t.is_default DESC, t.is_active DESC, t.name
+  `));
 });
 
 app.post('/api/tariffs', async (req, res) => {
@@ -2537,15 +2570,21 @@ app.post('/api/tariffs', async (req, res) => {
   if (!['purchase', 'sale'].includes(tariffType)) return res.status(400).json({ error: 'Тип тарифа обязателен' });
   if (!['kg', 'pcs'].includes(body.ala_unit || 'kg')) return res.status(400).json({ error: 'ALA единица обязательна' });
   if (!['kg', 'pcs'].includes(body.sale_unit || 'kg')) return res.status(400).json({ error: 'Единица реализации обязательна' });
+  const clientId = tariffType === 'sale' && +body.client_id > 0 ? +body.client_id : null;
+  if (clientId) {
+    const client = await get('SELECT id FROM clients WHERE id=$1', [clientId]);
+    if (!client) return res.status(400).json({ error: 'Клиент для тарифа не найден' });
+  }
   const row = await get(`
-    INSERT INTO tariffs(name,tariff_type,product_pattern,class_code,dxb_rate,ala_rate,ala_unit,sale_rate,sale_unit,is_default,is_active)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    INSERT INTO tariffs(name,tariff_type,product_pattern,class_code,client_id,dxb_rate,ala_rate,ala_unit,sale_rate,sale_unit,is_default,is_active)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     RETURNING id
   `, [
     body.name.trim(),
     tariffType,
     body.product_pattern?.trim() || null,
     body.class_code?.trim() || null,
+    clientId,
     +body.dxb_rate || 0,
     +body.ala_rate || 0,
     body.ala_unit || 'kg',
@@ -2560,7 +2599,7 @@ app.post('/api/tariffs', async (req, res) => {
     entity_id: row.id,
     entity_label: body.name.trim(),
     description: 'Создан тариф',
-    meta: { tariff_type: tariffType, class_code: body.class_code || null },
+    meta: { tariff_type: tariffType, class_code: body.class_code || null, client_id: clientId },
   });
   res.json({ id: row.id });
 });
@@ -2572,15 +2611,21 @@ app.put('/api/tariffs/:id', async (req, res) => {
   if (!['purchase', 'sale'].includes(tariffType)) return res.status(400).json({ error: 'Тип тарифа обязателен' });
   if (!['kg', 'pcs'].includes(body.ala_unit || 'kg')) return res.status(400).json({ error: 'ALA единица обязательна' });
   if (!['kg', 'pcs'].includes(body.sale_unit || 'kg')) return res.status(400).json({ error: 'Единица реализации обязательна' });
+  const clientId = tariffType === 'sale' && +body.client_id > 0 ? +body.client_id : null;
+  if (clientId) {
+    const client = await get('SELECT id FROM clients WHERE id=$1', [clientId]);
+    if (!client) return res.status(400).json({ error: 'Клиент для тарифа не найден' });
+  }
   await query(`
     UPDATE tariffs
-    SET name=$1,tariff_type=$2,product_pattern=$3,class_code=$4,dxb_rate=$5,ala_rate=$6,ala_unit=$7,sale_rate=$8,sale_unit=$9,is_default=$10,is_active=$11
-    WHERE id=$12
+    SET name=$1,tariff_type=$2,product_pattern=$3,class_code=$4,client_id=$5,dxb_rate=$6,ala_rate=$7,ala_unit=$8,sale_rate=$9,sale_unit=$10,is_default=$11,is_active=$12
+    WHERE id=$13
   `, [
     body.name.trim(),
     tariffType,
     body.product_pattern?.trim() || null,
     body.class_code?.trim() || null,
+    clientId,
     +body.dxb_rate || 0,
     +body.ala_rate || 0,
     body.ala_unit || 'kg',
@@ -2596,7 +2641,7 @@ app.put('/api/tariffs/:id', async (req, res) => {
     entity_id: +req.params.id,
     entity_label: body.name.trim(),
     description: 'Изменён тариф',
-    meta: { tariff_type: tariffType, class_code: body.class_code || null },
+    meta: { tariff_type: tariffType, class_code: body.class_code || null, client_id: clientId },
   });
   res.json({ success: true });
 });
@@ -2626,7 +2671,13 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
     const sheetRows = Array.isArray(sheetRead.rows) ? sheetRead.rows : [];
 
     const cleanedImportRecords = await cleanupOrphanImportRecords();
-    const tariffs = await all('SELECT * FROM tariffs WHERE is_active=TRUE ORDER BY is_default DESC, name');
+    const tariffs = await all(`
+      SELECT t.*, c.name AS client_name
+      FROM tariffs t
+      LEFT JOIN clients c ON c.id = t.client_id
+      WHERE t.is_active=TRUE
+      ORDER BY t.is_default DESC, t.name
+    `);
     const markings = await all(`
       SELECT m.id,m.marking,m.keywords,m.client_id,c.name AS client_name
       FROM markings m
@@ -2691,7 +2742,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       const marking = markingMatch.marking || null;
       const product = productByName.get(normalizeText(productName));
       const tariff = matchTariff(productName, classCode, tariffs);
-      const saleTariff = matchSaleTariff(productName, classCode, tariffs);
+      const saleTariff = matchSaleTariff(productName, classCode, marking?.client_id || null, tariffs);
       const cost = calculateImportCost({
         productName,
         classCode,
@@ -2757,6 +2808,8 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         app_total: cost.totalCost,
         sale_tariff_id: saleTariff.id || null,
         sale_tariff_name: saleTariff.name || 'Не найден',
+        sale_tariff_client_id: saleTariff.client_id || null,
+        sale_tariff_client_name: saleTariff.client_name || null,
         suggested_sale_unit: suggestedSaleUnit,
         suggested_sale_price: suggestedSalePrice,
         suggested_sale_total: suggestedSaleTotal,
