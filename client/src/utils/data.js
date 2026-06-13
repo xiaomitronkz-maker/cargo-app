@@ -18,12 +18,14 @@ export function formatDate(value) {
 }
 
 export const TYPE_LABELS = {
-  expense: 'Расход',
+  expense: 'Расход бизнеса',
   income: 'Доход (legacy)',
   transfer: 'Перевод',
   withdraw: 'Вывод',
   owner_contribution: 'Пополнение владельцем',
   owner_withdrawal: 'Снятие владельцем',
+  cash_adjustment_in: 'Пополнение кассы',
+  cash_adjustment_out: 'Снятие с кассы',
   dubai: 'Дубай',
   almaty: 'Алматы',
   receivable: 'Нам должны',

@@ -273,7 +273,7 @@ async function initDb() {
 
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
-      type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw','owner_contribution','owner_withdrawal')),
+      type TEXT NOT NULL CHECK(type IN ('income','expense','transfer','withdraw','owner_contribution','owner_withdrawal','cash_adjustment_in','cash_adjustment_out')),
       amount NUMERIC NOT NULL,
       account_from_id INTEGER REFERENCES accounts(id),
       account_to_id INTEGER REFERENCES accounts(id),
@@ -383,7 +383,7 @@ async function initDb() {
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL;
     ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
-    ALTER TABLE transactions ADD CONSTRAINT transactions_type_check CHECK(type IN ('income','expense','transfer','withdraw','owner_contribution','owner_withdrawal'));
+    ALTER TABLE transactions ADD CONSTRAINT transactions_type_check CHECK(type IN ('income','expense','transfer','withdraw','owner_contribution','owner_withdrawal','cash_adjustment_in','cash_adjustment_out'));
   `);
 
   await query(`
@@ -750,9 +750,11 @@ async function getAccountBalance(accountId, client = pool) {
     SELECT
       COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=$1),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=$1),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_in' AND account_to_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=$1),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_out' AND account_from_id=$1),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=$1),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=$1),0)
       AS balance
@@ -2438,9 +2440,11 @@ async function analyticsProfitData(period = '', filters = {}) {
       SELECT
         COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
         + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=a.id),0)
+        + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_in' AND account_to_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=a.id),0)
+        - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_out' AND account_from_id=a.id),0)
         + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
         - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
         AS balance
@@ -4687,9 +4691,11 @@ app.get('/api/accounts', async (req, res) => {
       a.*,
       COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=a.id),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_in' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_out' AND account_from_id=a.id),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
       AS balance
@@ -4770,16 +4776,17 @@ app.post('/api/transactions/manual', async (req, res) => {
   const accountId = +(req.body.cash_account_id || req.body.account_id);
   const context = { type, amount: +amount, account_id: accountId || null, receipt_id: null, sale_id: null };
 
-  if (!['owner_contribution', 'owner_withdrawal', 'income', 'expense'].includes(type)) {
+  if (!['owner_contribution', 'owner_withdrawal', 'cash_adjustment_in', 'cash_adjustment_out', 'income', 'expense'].includes(type)) {
     return validationError(res, 'Некорректный тип операции', context);
   }
   if (!accountId) return validationError(res, 'Касса обязательна', context);
   if (!(+amount > 0)) return validationError(res, 'Сумма должна быть больше 0', context);
   if (!date) return validationError(res, 'Дата обязательна', context);
 
-  const isOutflow = type === 'owner_withdrawal' || type === 'expense';
+  const isOutflow = type === 'owner_withdrawal' || type === 'cash_adjustment_out' || type === 'expense';
+  const isInflow = type === 'owner_contribution' || type === 'cash_adjustment_in' || type === 'income';
   const accountFromId = isOutflow ? accountId : null;
-  const accountToId = isOutflow ? null : accountId;
+  const accountToId = isInflow ? accountId : null;
 
   if (isOutflow && await getAccountBalance(accountId) < +amount) {
     return validationError(res, 'Недостаточно средств в кассе', context);
@@ -4818,18 +4825,22 @@ app.get('/api/audit', async (req, res) => {
       a.name AS account_name,
       COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='income' AND account_to_id=a.id),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_contribution' AND account_to_id=a.id),0)
+      + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_in' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='expense' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='withdraw' AND account_from_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='owner_withdrawal' AND account_from_id=a.id),0)
+      - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='cash_adjustment_out' AND account_from_id=a.id),0)
       + COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_to_id=a.id),0)
       - COALESCE((SELECT SUM(amount::numeric) FROM transactions WHERE type='transfer' AND account_from_id=a.id),0)
       AS balance_actual,
       COALESCE(SUM(CASE
         WHEN t.type='income' AND t.account_to_id=a.id THEN t.amount::numeric
         WHEN t.type='owner_contribution' AND t.account_to_id=a.id THEN t.amount::numeric
+        WHEN t.type='cash_adjustment_in' AND t.account_to_id=a.id THEN t.amount::numeric
         WHEN t.type='expense' AND t.account_from_id=a.id THEN -t.amount::numeric
         WHEN t.type='withdraw' AND t.account_from_id=a.id THEN -t.amount::numeric
         WHEN t.type='owner_withdrawal' AND t.account_from_id=a.id THEN -t.amount::numeric
+        WHEN t.type='cash_adjustment_out' AND t.account_from_id=a.id THEN -t.amount::numeric
         WHEN t.type='transfer' AND t.account_to_id=a.id THEN t.amount::numeric
         WHEN t.type='transfer' AND t.account_from_id=a.id THEN -t.amount::numeric
         ELSE 0
@@ -4918,9 +4929,11 @@ app.get('/api/audit', async (req, res) => {
     SELECT COALESCE(SUM(CASE
       WHEN type='income' THEN amount::numeric
       WHEN type='owner_contribution' THEN amount::numeric
+      WHEN type='cash_adjustment_in' THEN amount::numeric
       WHEN type='expense' THEN -amount::numeric
       WHEN type='withdraw' THEN -amount::numeric
       WHEN type='owner_withdrawal' THEN -amount::numeric
+      WHEN type='cash_adjustment_out' THEN -amount::numeric
       ELSE 0
     END),0) AS total
     FROM transactions

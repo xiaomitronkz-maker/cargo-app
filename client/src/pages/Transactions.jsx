@@ -6,16 +6,18 @@ const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigi
 const today = () => new Date().toISOString().slice(0, 10)
 
 const accountName = (tx) => {
-  if (tx.type === 'income' || tx.type === 'owner_contribution') return tx.account_to_name || '—'
-  if (tx.type === 'expense' || tx.type === 'withdraw' || tx.type === 'owner_withdrawal') return tx.account_from_name || '—'
+  if (tx.type === 'income' || tx.type === 'owner_contribution' || tx.type === 'cash_adjustment_in') return tx.account_to_name || '—'
+  if (tx.type === 'expense' || tx.type === 'withdraw' || tx.type === 'owner_withdrawal' || tx.type === 'cash_adjustment_out') return tx.account_from_name || '—'
   return `${tx.account_from_name || '—'} → ${tx.account_to_name || '—'}`
 }
 
 const OPERATION_TYPES = [
-  { value: 'expense', label: 'Расход', hint: 'Уменьшает кассу и прибыль' },
-  { value: 'owner_contribution', label: 'Пополнение владельцем / пополнение кассы', hint: 'Увеличивает кассу и капитал владельца, не влияет на прибыль' },
-  { value: 'owner_withdrawal', label: 'Снятие владельцем / снятие с кассы', hint: 'Уменьшает кассу и капитал владельца, не влияет на прибыль' },
-  { value: 'transfer', label: 'Перевод между кассами', hint: 'Не влияет на прибыль' },
+  { value: 'expense', label: 'Расход бизнеса', hint: 'Уменьшает кассу и прибыль' },
+  { value: 'owner_contribution', label: 'Пополнение владельцем', hint: 'Увеличивает кассу и капитал владельца' },
+  { value: 'owner_withdrawal', label: 'Снятие владельцем', hint: 'Уменьшает кассу и капитал владельца' },
+  { value: 'cash_adjustment_in', label: 'Пополнение кассы', hint: 'Корректировка кассы. Увеличивает деньги, не влияет на прибыль и капитал владельца' },
+  { value: 'cash_adjustment_out', label: 'Снятие с кассы', hint: 'Корректировка кассы. Уменьшает деньги, не влияет на прибыль и капитал владельца' },
+  { value: 'transfer', label: 'Перевод между кассами', hint: 'Перемещает деньги между кассами, не влияет на прибыль' },
 ]
 
 const EMPTY_FORM = {
@@ -55,16 +57,20 @@ export default function Transactions() {
 
   const setF = (key, value) => setForm(f => ({ ...f, [key]: value }))
   const isTransfer = form.type === 'transfer'
-  const isOutflow = form.type === 'owner_withdrawal' || form.type === 'expense'
-  const isInflow = form.type === 'owner_contribution'
+  const isOutflow = form.type === 'owner_withdrawal' || form.type === 'cash_adjustment_out' || form.type === 'expense'
+  const isInflow = form.type === 'owner_contribution' || form.type === 'cash_adjustment_in'
   const selectedOperationType = OPERATION_TYPES.find(type => type.value === form.type)
   const commentPlaceholder = form.type === 'expense'
     ? 'Например: аренда, упаковка, сервис'
     : form.type === 'owner_contribution'
-      ? 'Например: пополнение кассы владельцем'
+      ? 'Например: пополнение владельцем'
       : form.type === 'owner_withdrawal'
         ? 'Например: снятие владельцем'
-        : 'Например: перевод между кассами'
+        : form.type === 'cash_adjustment_in'
+          ? 'Например: корректировка остатка кассы'
+          : form.type === 'cash_adjustment_out'
+            ? 'Например: убрать лишний остаток кассы'
+            : 'Например: перевод между кассами'
   const selectedAccount = accounts.find(account => String(account.id) === String(form.cash_account_id))
   const remaining = selectedAccount ? toNumber(selectedAccount.balance) - toNumber(form.amount) : 0
 
