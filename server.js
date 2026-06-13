@@ -1815,6 +1815,132 @@ function ledgerNumber(value) {
   return Math.round((+value || 0) * 100) / 100;
 }
 
+// Profit cost should prefer persisted receipt line totals; product averages are only a legacy fallback.
+function salesCostCte(salesWhere = '') {
+  return `
+    WITH sales_base AS (
+      SELECT DISTINCT
+        s.id,
+        s.sales_document_id,
+        COALESCE(sd.date, s.date) AS date,
+        COALESCE(sd.client_id, s.client_id) AS client_id,
+        COALESCE(sd.marking_id, s.marking_id) AS marking_id,
+        s.product_id,
+        s.sale_unit,
+        s.quantity::numeric AS quantity,
+        COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue,
+        s.notes,
+        NULLIF(substring(s.notes FROM 'Google Sheets row ([0-9]+)'), '')::int AS source_row
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      ${salesWhere}
+    ),
+    purchase_lines AS (
+      SELECT
+        p.id,
+        p.date,
+        p.client_id,
+        p.marking_id,
+        p.product_id,
+        p.weight_kg::numeric AS weight_kg,
+        p.quantity_pcs::numeric AS quantity_pcs,
+        p.total_cost::numeric AS total_cost,
+        p.notes,
+        NULLIF(substring(p.notes FROM 'Google Sheets row ([0-9]+)'), '')::int AS source_row
+      FROM purchases p
+    ),
+    source_purchase_matches AS (
+      SELECT
+        sb.id AS sale_id,
+        SUM(CASE
+          WHEN sb.sale_unit='kg' AND COALESCE(pl.weight_kg,0) > 0
+            THEN sb.quantity * pl.total_cost / pl.weight_kg
+          WHEN sb.sale_unit='pcs' AND COALESCE(pl.quantity_pcs,0) > 0
+            THEN sb.quantity * pl.total_cost / pl.quantity_pcs
+          WHEN sb.quantity = 0
+            THEN 0
+          ELSE pl.total_cost
+        END) AS cost
+      FROM sales_base sb
+      JOIN purchase_lines pl ON sb.source_row IS NOT NULL
+        AND pl.source_row = sb.source_row
+        AND pl.product_id = sb.product_id
+        AND pl.date = sb.date
+        AND pl.client_id = sb.client_id
+        AND (pl.marking_id IS NOT DISTINCT FROM sb.marking_id)
+      GROUP BY sb.id
+    ),
+    used_purchase_sources AS (
+      SELECT DISTINCT date, product_id, source_row
+      FROM sales_base
+      WHERE source_row IS NOT NULL
+    ),
+    manual_purchase_candidates AS (
+      SELECT
+        sb.id AS sale_id,
+        pl.id AS purchase_id,
+        CASE
+          WHEN sb.sale_unit='kg' AND COALESCE(pl.weight_kg,0) > 0
+            THEN sb.quantity * pl.total_cost / pl.weight_kg
+          WHEN sb.sale_unit='pcs' AND COALESCE(pl.quantity_pcs,0) > 0
+            THEN sb.quantity * pl.total_cost / pl.quantity_pcs
+          WHEN sb.quantity = 0
+            THEN 0
+          ELSE pl.total_cost
+        END AS cost,
+        COUNT(*) OVER (PARTITION BY sb.id) AS candidate_count
+      FROM sales_base sb
+      JOIN purchase_lines pl ON sb.source_row IS NULL
+        AND pl.date = sb.date
+        AND pl.product_id = sb.product_id
+        AND (
+          (sb.sale_unit='kg' AND pl.weight_kg = sb.quantity)
+          OR (sb.sale_unit='pcs' AND pl.quantity_pcs = sb.quantity)
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM used_purchase_sources ups
+          WHERE ups.date = pl.date
+            AND ups.product_id = pl.product_id
+            AND ups.source_row IS NOT DISTINCT FROM pl.source_row
+        )
+    ),
+    manual_purchase_matches AS (
+      SELECT sale_id, cost
+      FROM manual_purchase_candidates
+      WHERE candidate_count = 1
+    ),
+    purchase_costs AS (
+      SELECT
+        product_id,
+        COALESCE(SUM(total_cost::numeric),0) AS total_cost,
+        COALESCE(SUM(weight_kg::numeric),0) AS total_weight,
+        COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
+      FROM purchases
+      GROUP BY product_id
+    ),
+    sales_costed AS (
+      SELECT
+        sb.*,
+        COALESCE(
+          spm.cost,
+          mpm.cost,
+          CASE
+            WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0
+              THEN sb.quantity * pc.total_cost / pc.total_weight
+            WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0
+              THEN sb.quantity * pc.total_cost / pc.total_quantity
+            ELSE 0
+          END
+        ) AS cost
+      FROM sales_base sb
+      LEFT JOIN source_purchase_matches spm ON spm.sale_id = sb.id
+      LEFT JOIN manual_purchase_matches mpm ON mpm.sale_id = sb.id
+      LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
+    )
+  `;
+}
+
 function buildCounterpartyLedger(type, chargeRows, paymentRows) {
   const groups = new Map();
   const ensureGroup = (row) => {
@@ -2145,43 +2271,16 @@ async function profitSummaryData(filters = {}, client = pool) {
     params.push(dateTo);
     where.push(`COALESCE(sd.date, s.date) <= $${params.length}::date`);
   }
+  const salesWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
   const row = await get(`
-    WITH purchase_costs AS (
-      SELECT
-        product_id,
-        COALESCE(SUM(total_cost::numeric),0) AS total_cost,
-        COALESCE(SUM(weight_kg::numeric),0) AS total_weight,
-        COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
-      FROM purchases
-      GROUP BY product_id
-    ),
-    sales_base AS (
-      SELECT DISTINCT
-        s.id,
-        s.sales_document_id,
-        COALESCE(sd.date, s.date) AS date,
-        s.product_id,
-        s.sale_unit,
-        s.quantity::numeric AS quantity,
-        COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue
-      FROM sales s
-      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
-      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-    )
+    ${salesCostCte(salesWhere)}
     SELECT
-      COALESCE(SUM(sb.revenue),0) AS revenue,
-      COALESCE(SUM(CASE
-        WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0
-          THEN sb.quantity * pc.total_cost / pc.total_weight
-        WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0
-          THEN sb.quantity * pc.total_cost / pc.total_quantity
-        ELSE 0
-      END),0) AS cost
-      ,COUNT(DISTINCT COALESCE(sb.sales_document_id, -sb.id))::int AS sales_count
-      ,COUNT(sb.id)::int AS items_count
-    FROM sales_base sb
-    LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
+      COALESCE(SUM(sc.revenue),0) AS revenue,
+      COALESCE(SUM(sc.cost),0) AS cost,
+      COUNT(DISTINCT COALESCE(sc.sales_document_id, -sc.id))::int AS sales_count,
+      COUNT(sc.id)::int AS items_count
+    FROM sales_costed sc
   `, params, client);
 
   const revenue = +(row?.revenue || 0);
@@ -2239,41 +2338,7 @@ async function analyticsProfitData(period = '', filters = {}) {
   const salesWhere = salesConditions.length ? `WHERE ${salesConditions.join(' AND ')}` : '';
   const purchasesWhere = purchasesConditions.length ? `WHERE ${purchasesConditions.join(' AND ')}` : '';
 
-  const baseCte = `
-    WITH purchase_costs AS (
-      SELECT
-        product_id,
-        COALESCE(SUM(total_cost::numeric),0) AS total_cost,
-        COALESCE(SUM(weight_kg::numeric),0) AS total_weight,
-        COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
-      FROM purchases
-      GROUP BY product_id
-    ),
-    sales_base AS (
-      SELECT DISTINCT
-        s.id,
-        COALESCE(sd.date, s.date) AS date,
-        s.client_id,
-        s.product_id,
-        s.sale_unit,
-        s.quantity::numeric AS quantity,
-        COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue
-      FROM sales s
-      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
-      ${salesWhere}
-    ),
-    sales_costed AS (
-      SELECT
-        sb.*,
-        CASE
-          WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
-          WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
-          ELSE 0
-        END AS cost
-      FROM sales_base sb
-      LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
-    )
-  `;
+  const baseCte = salesCostCte(salesWhere);
 
   const [byClient, byProduct, salesByPeriod, purchasesByPeriod, totals, debts, accounts] = await Promise.all([
     all(`
@@ -4923,73 +4988,27 @@ app.get('/api/analytics/dashboard', async (req, res) => {
   const purchases = await get('SELECT COUNT(*)::int AS count FROM purchases');
   const debts = await debtSummaryData();
   const profitByDate = await all(`
-    WITH purchase_costs AS (
-      SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
-      FROM purchases
-      GROUP BY product_id
-    ),
-    sales_base AS (
-      SELECT DISTINCT
-        id,
-        date,
-        product_id,
-        sale_unit,
-        quantity::numeric AS quantity,
-        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-    )
+    ${salesCostCte()}
     SELECT
-      sb.date::text AS date,
-      COALESCE(SUM(sb.revenue),0) AS sales,
-      COALESCE(SUM(CASE
-        WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
-        WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
-        ELSE 0
-      END),0) AS costs,
-      COALESCE(SUM(sb.revenue),0) - COALESCE(SUM(CASE
-        WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
-        WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
-        ELSE 0
-      END),0) AS profit
-    FROM sales_base sb
-    LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
-    GROUP BY sb.date
-    ORDER BY sb.date
+      sc.date::text AS date,
+      COALESCE(SUM(sc.revenue),0) AS sales,
+      COALESCE(SUM(sc.cost),0) AS costs,
+      COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) AS profit
+    FROM sales_costed sc
+    GROUP BY sc.date
+    ORDER BY sc.date
     LIMIT 30
   `);
   const topClients = await all(`
-    WITH purchase_costs AS (
-      SELECT product_id, COALESCE(SUM(total_cost::numeric),0) AS total_cost, COALESCE(SUM(weight_kg::numeric),0) AS total_weight, COALESCE(SUM(quantity_pcs::numeric),0) AS total_quantity
-      FROM purchases
-      GROUP BY product_id
-    ),
-    sales_base AS (
-      SELECT DISTINCT
-        id,
-        client_id,
-        product_id,
-        sale_unit,
-        quantity::numeric AS quantity,
-        COALESCE(total_amount::numeric, quantity::numeric * price_per_unit::numeric) AS revenue
-      FROM sales
-    )
+    ${salesCostCte()}
     SELECT
       c.name,
-      COALESCE(SUM(sb.revenue),0) AS value,
-      COALESCE(SUM(sb.revenue),0) AS total_sales,
-      COALESCE(SUM(CASE
-        WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
-        WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
-        ELSE 0
-      END),0) AS total_costs,
-      COALESCE(SUM(sb.revenue),0) - COALESCE(SUM(CASE
-        WHEN sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_weight
-        WHEN sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0 THEN sb.quantity * pc.total_cost / pc.total_quantity
-        ELSE 0
-      END),0) AS profit
-    FROM sales_base sb
-    LEFT JOIN clients c ON c.id = sb.client_id
-    LEFT JOIN purchase_costs pc ON pc.product_id = sb.product_id
+      COALESCE(SUM(sc.revenue),0) AS value,
+      COALESCE(SUM(sc.revenue),0) AS total_sales,
+      COALESCE(SUM(sc.cost),0) AS total_costs,
+      COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) AS profit
+    FROM sales_costed sc
+    LEFT JOIN clients c ON c.id = sc.client_id
     GROUP BY c.name
     ORDER BY value DESC
     LIMIT 5
