@@ -255,7 +255,7 @@ async function initDb() {
 
     CREATE TABLE IF NOT EXISTS payments (
       id SERIAL PRIMARY KEY,
-      entity_type TEXT NOT NULL CHECK(entity_type IN ('sale','purchase')),
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('sale','purchase','client_advance')),
       entity_id INTEGER NOT NULL,
       amount NUMERIC NOT NULL,
       date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -380,6 +380,8 @@ async function initDb() {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE SET NULL;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
+    ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_entity_type_check;
+    ALTER TABLE payments ADD CONSTRAINT payments_entity_type_check CHECK(entity_type IN ('sale','purchase','client_advance'));
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL;
     ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
@@ -1637,6 +1639,136 @@ async function payLegacySaleDocument(saleId, { amount, accountToId, date, commen
   };
 }
 
+async function paySalesDocumentAllowClientAdvance(anchorSaleId, { amount, accountToId, date, comment }, client = pool) {
+  const paymentAmount = ledgerNumber(amount);
+  const anchorSale = await get(`
+    SELECT s.*, COALESCE(sd.client_id, s.client_id) AS effective_client_id
+    FROM sales s
+    LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+    WHERE s.id=$1
+  `, [anchorSaleId], client);
+  if (!anchorSale) throw new Error('Продажа не найдена');
+  if (!anchorSale.sales_document_id) throw new Error('Продажа не привязана к документу');
+  const totalRow = await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales WHERE sales_document_id=$1', [+anchorSale.sales_document_id], client);
+  const totalAmount = +(totalRow?.total || 0);
+  const paid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
+  const remaining = ledgerNumber(totalAmount - paid);
+  if (paymentAmount <= remaining + 0.009) {
+    return paySalesDocumentByAnchorSale(anchorSaleId, { amount: paymentAmount, accountToId, date, comment }, client);
+  }
+
+  let applied = null;
+  if (remaining > 0.009) {
+    applied = await paySalesDocumentByAnchorSale(anchorSaleId, { amount: remaining, accountToId, date, comment }, client);
+  }
+  const advance = await createClientAdvancePayment(+anchorSale.effective_client_id, {
+    amount: ledgerNumber(paymentAmount - Math.max(0, remaining)),
+    accountToId,
+    date,
+    comment,
+    debtBefore: remaining,
+    paymentAmount,
+  }, client);
+  const newPaid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
+
+  return {
+    sales_document_id: +anchorSale.sales_document_id,
+    paid_amount: newPaid,
+    debt: await getClientLedgerBalance(+anchorSale.effective_client_id, client),
+    advance_amount: advance?.advance_after || 0,
+    allocations: [applied, advance].filter(Boolean),
+  };
+}
+
+async function payLegacySaleAllowClientAdvance(saleId, { amount, accountToId, date, comment }, client = pool) {
+  const paymentAmount = ledgerNumber(amount);
+  const sale = await get('SELECT * FROM sales WHERE id=$1', [saleId], client);
+  if (!sale) throw new Error('Продажа не найдена');
+  if (sale.sales_document_id) return paySalesDocumentAllowClientAdvance(saleId, { amount: paymentAmount, accountToId, date, comment }, client);
+
+  const totalAmount = +(sale.total_amount || 0);
+  const paidAmount = +(sale.paid_amount || 0);
+  const remaining = ledgerNumber(totalAmount - paidAmount);
+  if (paymentAmount <= remaining + 0.009) {
+    return payLegacySaleDocument(saleId, { amount: paymentAmount, accountToId, date, comment }, client);
+  }
+
+  let applied = null;
+  if (remaining > 0.009) {
+    applied = await payLegacySaleDocument(saleId, { amount: remaining, accountToId, date, comment }, client);
+  }
+  const advance = await createClientAdvancePayment(+sale.client_id, {
+    amount: ledgerNumber(paymentAmount - Math.max(0, remaining)),
+    accountToId,
+    date,
+    comment,
+    debtBefore: remaining,
+    paymentAmount,
+  }, client);
+
+  const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [saleId], client);
+  return {
+    sale_id: saleId,
+    paid_amount: +(updated?.paid_amount || 0),
+    debt: await getClientLedgerBalance(+sale.client_id, client),
+    advance_amount: advance?.advance_after || 0,
+    allocations: [applied, advance].filter(Boolean),
+  };
+}
+
+async function createClientAdvancePayment(clientId, { amount, accountToId, date, comment, debtBefore = null, paymentAmount = null }, client = pool) {
+  const advanceAmount = ledgerNumber(amount);
+  if (!(advanceAmount > 0)) return null;
+  const customer = await get('SELECT id,name FROM clients WHERE id=$1', [clientId], client);
+  if (!customer) throw new Error('Клиент не найден');
+
+  const payment = await get(`
+    INSERT INTO payments(entity_type,entity_id,amount,date,comment)
+    VALUES($1,$2,$3,$4,$5)
+    RETURNING id
+  `, ['client_advance', clientId, advanceAmount, date, comment], client);
+  const transaction = await get(`
+    INSERT INTO transactions(type,amount,account_to_id,date,comment,related_type,related_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7)
+    RETURNING id
+  `, ['income', advanceAmount, accountToId, date, comment, 'client_advance', payment.id], client);
+  await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+
+  const balanceAfter = await getClientLedgerBalance(clientId, client);
+  const advanceAfter = balanceAfter < -0.009 ? ledgerNumber(Math.abs(balanceAfter)) : 0;
+  const overpaymentAmount = debtBefore == null
+    ? advanceAmount
+    : ledgerNumber(Math.max(0, +(paymentAmount || advanceAmount) - Math.max(0, +debtBefore || 0)));
+
+  await logOperation(client, {
+    action: 'client_payment',
+    entity_type: 'client',
+    entity_id: clientId,
+    entity_label: customer.name || `Клиент №${clientId}`,
+    amount: advanceAmount,
+    currency: 'USD',
+    description: 'Аванс клиента',
+    meta: {
+      payment_id: payment.id,
+      transaction_id: transaction.id,
+      account_to_id: accountToId,
+      comment,
+      debt_before: debtBefore,
+      payment_amount: paymentAmount == null ? advanceAmount : paymentAmount,
+      overpayment_amount: overpaymentAmount,
+      advance_after: advanceAfter,
+    },
+  });
+
+  return {
+    payment_id: payment.id,
+    transaction_id: transaction.id,
+    amount: advanceAmount,
+    balance_after: balanceAfter,
+    advance_after: advanceAfter,
+  };
+}
+
 async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
   const rows = await all(`
     WITH receipt_totals AS (
@@ -1698,18 +1830,6 @@ async function getClientOpenDebtDocuments(clientId, client = pool) {
       LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
       WHERE COALESCE(sd.client_id, s.client_id)=$1
       GROUP BY COALESCE(sd.id, -s.id), sd.id, COALESCE(sd.date, s.date), COALESCE(sd.created_at, s.created_at)
-    ),
-    receivable_payments AS (
-      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN sales s2 ON s2.id = t.sale_id
-        WHERE COALESCE(s.id, s2.id) IS NOT NULL
-      ) x
-      GROUP BY x.receivable_group_id
     )
     SELECT
       CASE WHEN rt.sales_document_id IS NULL THEN 'sale' ELSE 'sales_document' END AS document_type,
@@ -1718,21 +1838,33 @@ async function getClientOpenDebtDocuments(clientId, client = pool) {
       rt.date,
       rt.created_at,
       rt.total::numeric AS total,
-      COALESCE(rp.paid::numeric,0) AS paid,
-      rt.total::numeric - COALESCE(rp.paid::numeric,0) AS remaining
+      0::numeric AS paid,
+      rt.total::numeric AS remaining
     FROM receivable_totals rt
-    LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rt.receivable_group_id
-    WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
+    WHERE rt.total::numeric > 0
     ORDER BY rt.date ASC NULLS LAST, rt.created_at ASC NULLS LAST, document_id ASC
   `, [clientId], client);
 
-  return rows.map((row) => ({
+  let remainingPaid = ledgerNumber(await getClientPaymentTotal(clientId, client));
+  const documents = rows.map((row) => {
+    const total = +(row.total || 0);
+    const paid = ledgerNumber(Math.min(total, remainingPaid));
+    remainingPaid = ledgerNumber(Math.max(0, remainingPaid - paid));
+    return {
+      ...row,
+      document_id: +row.document_id,
+      anchor_sale_id: +row.anchor_sale_id,
+      total,
+      paid,
+      remaining: ledgerNumber(total - paid),
+    };
+  });
+
+  return documents.filter((row) => row.remaining > 0.009).map((row) => ({
     ...row,
-    document_id: +row.document_id,
-    anchor_sale_id: +row.anchor_sale_id,
-    total: +(row.total || 0),
-    paid: +(row.paid || 0),
-    remaining: +(row.remaining || 0),
+    total: ledgerNumber(row.total),
+    paid: ledgerNumber(row.paid),
+    remaining: ledgerNumber(row.remaining),
   }));
 }
 
@@ -1745,35 +1877,88 @@ async function validateSale(productId, saleUnit, quantity, pricePerUnit, client 
   if (rule.sale_type === 'kg' && saleUnit === 'pcs') throw new Error('Для этого товара разрешена продажа только по килограммам (kg)');
 }
 
+async function getClientPaymentTotal(clientId, client = pool) {
+  const row = await get(`
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM (
+      SELECT DISTINCT p.id, p.amount::numeric AS amount
+      FROM payments p
+      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN sales s2 ON s2.id = t.sale_id
+      WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id)=$1
+      UNION ALL
+      SELECT p.id, p.amount::numeric AS amount
+      FROM payments p
+      WHERE p.entity_type='client_advance' AND p.entity_id=$1
+    ) x
+  `, [clientId], client);
+  return +(row?.total || 0);
+}
+
+async function getClientLedgerBalance(clientId, client = pool) {
+  const charged = +(await get(`
+    SELECT COALESCE(SUM(s.total_amount::numeric),0) AS total
+    FROM sales s
+    LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+    WHERE COALESCE(sd.client_id, s.client_id)=$1
+  `, [clientId], client))?.total || 0;
+  const paid = await getClientPaymentTotal(clientId, client);
+  return ledgerNumber(charged - paid);
+}
+
 async function debtSummaryData(client = pool) {
-  const receivable = await get(`
-    WITH receivable_totals AS (
+  const clientBalances = await get(`
+    WITH charge_by_client AS (
       SELECT
-        COALESCE(sd.id, -s.id) AS receivable_group_id,
-        COALESCE(SUM(s.total_amount::numeric),0) AS total
+        COALESCE(sd.client_id, s.client_id)::integer AS client_id,
+        COALESCE(SUM(s.total_amount::numeric),0) AS charged
       FROM sales s
       LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
-      GROUP BY COALESCE(sd.id, -s.id)
+      WHERE COALESCE(sd.client_id, s.client_id) IS NOT NULL
+      GROUP BY COALESCE(sd.client_id, s.client_id)
     ),
-    receivable_payments AS (
-      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
+    payment_by_client AS (
+      SELECT client_id, COALESCE(SUM(amount::numeric),0) AS paid
       FROM (
-        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
+        SELECT DISTINCT
+          p.id,
+          COALESCE(s.client_id, s2.client_id)::integer AS client_id,
+          p.amount::numeric AS amount
         FROM payments p
         LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
         LEFT JOIN transactions t ON t.id = p.transaction_id
         LEFT JOIN sales s2 ON s2.id = t.sale_id
-        WHERE COALESCE(s.id, s2.id) IS NOT NULL
+        WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
+        UNION ALL
+        SELECT
+          p.id,
+          p.entity_id::integer AS client_id,
+          p.amount::numeric AS amount
+        FROM payments p
+        WHERE p.entity_type='client_advance'
       ) x
-      GROUP BY x.receivable_group_id
+      GROUP BY client_id
+    ),
+    client_ids AS (
+      SELECT client_id FROM charge_by_client
+      UNION
+      SELECT client_id FROM payment_by_client
+    ),
+    balances AS (
+      SELECT
+        ids.client_id,
+        COALESCE(c.charged,0) - COALESCE(p.paid,0) AS balance
+      FROM client_ids ids
+      LEFT JOIN charge_by_client c ON c.client_id = ids.client_id
+      LEFT JOIN payment_by_client p ON p.client_id = ids.client_id
     )
-    SELECT COUNT(*)::int AS count, COALESCE(SUM(total::numeric - COALESCE(paid::numeric,0)),0) AS total
-    FROM (
-      SELECT rt.receivable_group_id, rt.total, COALESCE(rp.paid,0) AS paid
-      FROM receivable_totals rt
-      LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rt.receivable_group_id
-      WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
-    ) q
+    SELECT
+      COUNT(*) FILTER (WHERE balance > 0.009)::int AS receivable_count,
+      COALESCE(SUM(balance) FILTER (WHERE balance > 0.009),0) AS receivable_total,
+      COUNT(*) FILTER (WHERE balance < -0.009)::int AS advance_count,
+      COALESCE(SUM(-balance) FILTER (WHERE balance < -0.009),0) AS advance_total
+    FROM balances
   `, [], client);
 
   const payable = await get(`
@@ -1804,12 +1989,18 @@ async function debtSummaryData(client = pool) {
   `, [], client);
 
   const totalWithdrawals = await get('SELECT COALESCE(SUM(amount::numeric),0) AS v FROM withdrawals', [], client);
+  const supplierPayableTotal = +(payable?.total || 0);
+  const clientAdvancesTotal = +(clientBalances?.advance_total || 0);
+  const payableTotal = supplierPayableTotal + clientAdvancesTotal;
+  const receivableTotal = +(clientBalances?.receivable_total || 0);
 
   return {
-    receivable: { count: +(receivable?.count || 0), total: +(receivable?.total || 0) },
-    payable: { count: +(payable?.count || 0), total: +(payable?.total || 0) },
+    receivable: { count: +(clientBalances?.receivable_count || 0), total: receivableTotal },
+    payable: { count: +(payable?.count || 0) + +(clientBalances?.advance_count || 0), total: payableTotal },
+    supplier_payable: { count: +(payable?.count || 0), total: supplierPayableTotal },
+    client_advances: { count: +(clientBalances?.advance_count || 0), total: clientAdvancesTotal },
     total_withdrawals: +(totalWithdrawals?.v || 0),
-    balance: +(receivable?.total || 0) - +(payable?.total || 0),
+    balance: receivableTotal - payableTotal,
   };
 }
 
@@ -1981,6 +2172,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
         payments_count: 0,
         last_operation_date: null,
         status: 'closed',
+        advance_amount: 0,
         entries: [],
       });
     }
@@ -2058,11 +2250,15 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
     group.total_charged = ledgerNumber(group.total_charged);
     group.total_paid = ledgerNumber(group.total_paid);
     group.balance = ledgerNumber(group.total_charged - group.total_paid);
+    group.advance_amount = group.balance < -0.009 ? ledgerNumber(Math.abs(group.balance)) : 0;
     group.last_operation_date = group.entries.length ? group.entries[group.entries.length - 1].date : null;
-    group.status = Math.abs(group.balance) < 0.01 ? 'closed' : 'open';
+    group.status = Math.abs(group.balance) < 0.01
+      ? 'closed'
+      : (type === 'customer' && group.balance < 0 ? 'advance' : 'open');
     return group;
   }).sort((a, b) => {
-    if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
+    const statusWeight = { open: 0, advance: 1, closed: 2 };
+    if (a.status !== b.status) return (statusWeight[a.status] ?? 3) - (statusWeight[b.status] ?? 3);
     if (Math.abs(a.balance) !== Math.abs(b.balance)) return Math.abs(b.balance) - Math.abs(a.balance);
     return (a.counterparty_name || '').localeCompare(b.counterparty_name || '');
   });
@@ -2100,24 +2296,41 @@ async function debtsLedgerData(client = pool) {
   `, [], client);
 
   const customerPayments = await all(`
-    SELECT DISTINCT ON (p.id)
+    SELECT * FROM (
+      SELECT DISTINCT ON (p.id)
+        p.id::integer AS source_id,
+        NULL::integer AS document_id,
+        p.date::text AS date,
+        p.created_at::text AS created_at,
+        COALESCE(s.client_id, s2.client_id)::integer AS counterparty_id,
+        c.name::text AS counterparty_name,
+        p.amount::numeric AS payment,
+        'payment'::text AS kind,
+        'Оплата клиента'::text AS description,
+        p.comment::text AS comment
+      FROM payments p
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+      LEFT JOIN sales s2 ON s2.id = t.sale_id
+      LEFT JOIN clients c ON c.id = COALESCE(s.client_id, s2.client_id)
+      WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
+      ORDER BY p.id, p.created_at DESC
+    ) sale_payments
+    UNION ALL
+    SELECT
       p.id::integer AS source_id,
       NULL::integer AS document_id,
       p.date::text AS date,
       p.created_at::text AS created_at,
-      COALESCE(s.client_id, s2.client_id)::integer AS counterparty_id,
+      p.entity_id::integer AS counterparty_id,
       c.name::text AS counterparty_name,
       p.amount::numeric AS payment,
       'payment'::text AS kind,
-      'Оплата клиента'::text AS description,
+      'Аванс клиента'::text AS description,
       p.comment::text AS comment
     FROM payments p
-    LEFT JOIN transactions t ON t.id = p.transaction_id
-    LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-    LEFT JOIN sales s2 ON s2.id = t.sale_id
-    LEFT JOIN clients c ON c.id = COALESCE(s.client_id, s2.client_id)
-    WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
-    ORDER BY p.id, p.created_at DESC
+    LEFT JOIN clients c ON c.id = p.entity_id
+    WHERE p.entity_type='client_advance'
   `, [], client);
 
   const supplierCharges = await all(`
@@ -2188,12 +2401,16 @@ async function debtsLedgerData(client = pool) {
     .filter((row) => Math.abs(row.balance) < 0.01 && (row.total_charged > 0 || row.total_paid > 0))
     .sort((a, b) => (b.last_operation_date || '').localeCompare(a.last_operation_date || ''));
   const receivable = customers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
-  const payable = suppliers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
+  const supplierPayable = suppliers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
+  const clientAdvances = customers.reduce((sum, row) => sum + (row.balance < 0 ? Math.abs(row.balance) : 0), 0);
+  const payable = supplierPayable + clientAdvances;
 
   return {
     summary: {
       receivable: ledgerNumber(receivable),
       payable: ledgerNumber(payable),
+      supplier_payable: ledgerNumber(supplierPayable),
+      client_advances: ledgerNumber(clientAdvances),
       balance: ledgerNumber(receivable - payable),
       customersCount: customers.length,
       suppliersCount: suppliers.length,
@@ -3935,8 +4152,8 @@ app.put('/api/sales-documents/:id/pay', async (req, res) => {
     const anchorSale = await get('SELECT id FROM sales WHERE sales_document_id=$1 ORDER BY id LIMIT 1', [salesDocumentId]);
     if (!anchorSale) return res.status(404).json({ error: 'Документ продажи не найден' });
 
-    const result = await withTx((client) => paySalesDocumentByAnchorSale(anchorSale.id, { amount, accountToId, date, comment }, client));
-    res.json({ success: true, sales_document_id: result.sales_document_id, paid_amount: result.paid_amount, debt: result.debt });
+    const result = await withTx((client) => paySalesDocumentAllowClientAdvance(anchorSale.id, { amount, accountToId, date, comment }, client));
+    res.json({ success: true, sales_document_id: result.sales_document_id, paid_amount: result.paid_amount, debt: result.debt, advance_amount: result.advance_amount || 0 });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -4220,36 +4437,12 @@ app.put('/api/sales/:id/pay', async (req, res) => {
     const sale = await get('SELECT * FROM sales WHERE id=$1', [id]);
     if (!sale) return res.status(404).json({ error: 'Продажа не найдена' });
     if (sale.sales_document_id) {
-      const result = await withTx((client) => paySalesDocumentByAnchorSale(id, { amount, accountToId, date, comment }, client));
-      return res.json({ success: true, sales_document_id: result.sales_document_id, paid_amount: result.paid_amount, debt: result.debt });
+      const result = await withTx((client) => paySalesDocumentAllowClientAdvance(id, { amount, accountToId, date, comment }, client));
+      return res.json({ success: true, sales_document_id: result.sales_document_id, paid_amount: result.paid_amount, debt: result.debt, advance_amount: result.advance_amount || 0 });
     }
 
-    const remaining = +(sale.total_amount || 0) - +(sale.paid_amount || 0);
-    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'income', amount, account_id: accountToId, receipt_id: null, sale_id: id });
-
-    await withTx(async (client) => {
-      const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['sale', id, amount, date, comment], client);
-      const transaction = await get(`
-        INSERT INTO transactions(type,amount,account_to_id,sale_id,date,comment,related_type,related_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-        RETURNING id
-      `, ['income', amount, accountToId, id, date, comment, 'payment', payment.id], client);
-      await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
-      await query('UPDATE sales SET paid_amount = COALESCE(paid_amount,0) + $1 WHERE id=$2', [amount, id], client);
-      await logOperation(client, {
-        action: 'client_payment',
-        entity_type: 'sale',
-        entity_id: id,
-        entity_label: `Реализация №${id}`,
-        amount,
-        currency: 'USD',
-        description: 'Оплата клиента',
-        meta: { payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
-      });
-    });
-
-    const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [id]);
-    res.json({ success: true, paid_amount: +(updated.paid_amount || 0), debt: +(updated.total_amount || 0) - +(updated.paid_amount || 0) });
+    const result = await withTx((client) => payLegacySaleAllowClientAdvance(id, { amount, accountToId, date, comment }, client));
+    res.json({ success: true, paid_amount: result.paid_amount, debt: result.debt, advance_amount: result.advance_amount || 0 });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -4341,9 +4534,9 @@ app.post('/api/debts/pay', async (req, res) => {
       : await getClientOpenDebtDocuments(entityId);
     const totalDebt = ledgerNumber(documents.reduce((sum, document) => sum + +(document.remaining || 0), 0));
 
-    if (!documents.length || totalDebt <= 0.009) return res.status(400).json({ error: 'Открытых документов для оплаты нет' });
-    if (amount > totalDebt + 0.009) {
-      return validationError(res, entityType === 'supplier' ? 'Сумма оплаты превышает общий долг поставщика' : 'Сумма оплаты превышает общий долг клиента', {
+    if (entityType === 'supplier' && (!documents.length || totalDebt <= 0.009)) return res.status(400).json({ error: 'Открытых документов для оплаты нет' });
+    if (entityType === 'supplier' && amount > totalDebt + 0.009) {
+      return validationError(res, 'Сумма оплаты превышает общий долг поставщика', {
         entity_type: entityType,
         entity_id: entityId,
         amount,
@@ -4395,9 +4588,32 @@ app.post('/api/debts/pay', async (req, res) => {
         remainingPayment = ledgerNumber(remainingPayment - part);
       }
 
-      if (remainingPayment > 0.009) throw new Error('Не удалось распределить оплату по открытым документам');
+      if (remainingPayment > 0.009) {
+        if (entityType !== 'client') throw new Error('Не удалось распределить оплату по открытым документам');
+        const advanceResult = await createClientAdvancePayment(entityId, {
+          amount: remainingPayment,
+          accountToId: cashboxId,
+          date,
+          comment,
+          debtBefore: totalDebt,
+          paymentAmount: amount,
+        }, client);
+        allocations.push({
+          document_type: 'client_advance',
+          document_id: null,
+          amount: remainingPayment,
+          paid_amount: advanceResult?.amount || remainingPayment,
+          debt: advanceResult?.balance_after || 0,
+          advance_after: advanceResult?.advance_after || 0,
+        });
+        remainingPayment = 0;
+      }
+
       return allocations;
     });
+    const finalBalance = entityType === 'client'
+      ? await getClientLedgerBalance(entityId)
+      : ledgerNumber(totalDebt - amount);
 
     res.json({
       success: true,
@@ -4405,7 +4621,8 @@ app.post('/api/debts/pay', async (req, res) => {
       entity_id: entityId,
       paid_amount: amount,
       previous_debt: totalDebt,
-      remaining_debt: ledgerNumber(totalDebt - amount),
+      remaining_debt: finalBalance,
+      advance_amount: entityType === 'client' && finalBalance < -0.009 ? ledgerNumber(Math.abs(finalBalance)) : 0,
       allocations: result,
     });
   } catch (e) {
@@ -4581,7 +4798,8 @@ app.get('/api/payments', async (req, res) => {
     LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
     LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
     LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-    LEFT JOIN clients c ON c.id = COALESCE(s.client_id, pu.client_id)
+    LEFT JOIN clients ca ON p.entity_type='client_advance' AND ca.id = p.entity_id
+    LEFT JOIN clients c ON c.id = COALESCE(s.client_id, pu.client_id, ca.id)
     LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, pu.product_id)
     ORDER BY p.date DESC, p.created_at DESC
   `));
@@ -4626,6 +4844,22 @@ app.get('/api/ledger', async (req, res) => {
           LEFT JOIN transactions t ON t.id=p.transaction_id
           LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
           WHERE s.client_id=$1
+          UNION ALL
+          SELECT
+            p.date::text AS date,
+            'payment'::text AS type,
+            p.id::integer AS id,
+            p.amount::numeric AS amount,
+            NULL::numeric AS paid_amount,
+            p.comment::text AS comment,
+            a.name::text AS account_name,
+            t.type::text AS transaction_type,
+            p.created_at::timestamp AS created_at,
+            1::integer AS sort_order
+          FROM payments p
+          LEFT JOIN transactions t ON t.id=p.transaction_id
+          LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
+          WHERE p.entity_type='client_advance' AND p.entity_id=$1
         ) x
         ORDER BY date ASC, created_at ASC, sort_order ASC, id ASC
       `, [entityId])
@@ -4862,52 +5096,25 @@ app.get('/api/audit', async (req, res) => {
   const orphanTransactions = await all(`
     SELECT id,type,amount,comment
     FROM transactions
-    WHERE (type='income' AND sale_id IS NULL AND COALESCE(related_type,'') <> 'manual')
-       OR (type='expense' AND receipt_id IS NULL AND COALESCE(related_type,'') <> 'manual')
+    WHERE (
+      type='income'
+      AND sale_id IS NULL
+      AND COALESCE(related_type,'') NOT IN ('manual','client_advance')
+    )
+       OR (
+      type='expense'
+      AND receipt_id IS NULL
+      AND COALESCE(related_type,'') <> 'manual'
+    )
     ORDER BY id DESC
   `);
 
-  const receivableSystem = +(await get(`
-    WITH receivable_groups AS (
-      SELECT
-        COALESCE(sd.id, -s.id) AS receivable_group_id,
-        COALESCE(SUM(s.total_amount::numeric),0) AS total,
-        COALESCE(SUM(COALESCE(s.paid_amount::numeric,0)),0) AS paid
-      FROM sales s
-      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
-      GROUP BY COALESCE(sd.id, -s.id)
-    )
-    SELECT COALESCE(SUM(total - paid),0) AS total
-    FROM receivable_groups
-  `))?.total || 0;
-  const receivableLedger = +(await get(`
-    WITH receivable_groups AS (
-      SELECT
-        COALESCE(sd.id, -s.id) AS receivable_group_id,
-        COALESCE(SUM(s.total_amount::numeric),0) AS total
-      FROM sales s
-      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
-      GROUP BY COALESCE(sd.id, -s.id)
-    ),
-    receivable_payments AS (
-      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN sales s2 ON s2.id = t.sale_id
-        WHERE COALESCE(s.id, s2.id) IS NOT NULL
-      ) x
-      GROUP BY x.receivable_group_id
-    )
-    SELECT COALESCE(SUM(rg.total - COALESCE(rp.paid,0)),0) AS total
-    FROM receivable_groups rg
-    LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rg.receivable_group_id
-  `))?.total || 0;
   const debtSummary = await debtSummaryData();
+  const debtLedger = await debtsLedgerData();
+  const receivableSystem = +(debtSummary.receivable?.total || 0);
+  const receivableLedger = +(debtLedger.summary?.receivable || 0);
   const payableSystem = debtSummary.payable.total;
-  const payableLedger = payableSystem;
+  const payableLedger = +(debtLedger.summary?.payable || 0);
   const debtsDiff = (receivableSystem - receivableLedger) + (payableSystem - payableLedger);
   const profit = await profitSummaryData();
   const ownerContributionRow = await get(`
@@ -4963,6 +5170,8 @@ app.get('/api/audit', async (req, res) => {
       receivable_ledger: receivableLedger,
       payable_system: payableSystem,
       payable_ledger: payableLedger,
+      supplier_payable_total: +(debtSummary.supplier_payable?.total || 0),
+      client_advances_total: +(debtSummary.client_advances?.total || 0),
       difference: debtsDiff,
       diff: debtsDiff,
       ok: Math.abs(debtsDiff) < 0.01,
@@ -4972,6 +5181,8 @@ app.get('/api/audit', async (req, res) => {
       transactions_total: transactionsTotal,
       receivable_total: +(debtSummary.receivable?.total || 0),
       payable_total: +(debtSummary.payable?.total || 0),
+      supplier_payable_total: +(debtSummary.supplier_payable?.total || 0),
+      client_advances_total: +(debtSummary.client_advances?.total || 0),
       profit_total: +(profit.profit || 0),
       manual_expenses_total: +(profit.manual_expenses || 0),
       owner_contribution_total: ownerContributionTotal,
@@ -4985,6 +5196,7 @@ app.get('/api/audit', async (req, res) => {
     owner_contribution_total: ownerContributionTotal,
     owner_withdrawal_total: ownerWithdrawalTotal,
     owner_capital_total: ownerCapitalTotal,
+    client_advances_total: +(debtSummary.client_advances?.total || 0),
     control_with_owner_ops: controlWithOwnerOps,
   });
 });

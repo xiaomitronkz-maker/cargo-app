@@ -7,6 +7,8 @@ const emptyLedger = {
   summary: {
     receivable: 0,
     payable: 0,
+    client_advances: 0,
+    supplier_payable: 0,
     balance: 0,
     customersCount: 0,
     suppliersCount: 0,
@@ -40,7 +42,7 @@ const typeLabel = (type) => type === 'supplier' ? 'Поставщик' : 'Кли
 function statusLabel(row) {
   const balance = toNumber(row.balance)
   if (Math.abs(balance) < 0.01) return 'Закрыт'
-  if (balance < 0) return 'Переплата'
+  if (row.type === 'customer' && balance < 0) return 'Аванс'
   return row.type === 'supplier' ? 'Мы должны' : 'Должен'
 }
 
@@ -61,12 +63,27 @@ function hasOpenDebt(row) {
   return toNumber(row?.balance) > 0.009
 }
 
+function hasClientAdvance(row) {
+  return row?.type === 'customer' && toNumber(row.balance) < -0.009
+}
+
+function balanceLabel(row) {
+  if (hasClientAdvance(row)) return `Аванс: ${fmt(Math.abs(toNumber(row.balance)))}`
+  return fmt(row?.balance)
+}
+
+function runningBalanceLabel(rowType, value) {
+  const balance = toNumber(value)
+  if (rowType === 'customer' && balance < -0.009) return `Аванс: ${fmt(Math.abs(balance))}`
+  return fmt(balance)
+}
+
 function paymentActionLabel(row) {
   return row?.type === 'supplier' ? 'Оплатить' : 'Принять оплату'
 }
 
 function paymentTitle(row) {
-  return row?.type === 'supplier' ? 'Оплата поставщику' : 'Погашение долга клиента'
+  return row?.type === 'supplier' ? 'Оплата поставщику' : 'Оплата клиента'
 }
 
 function entryDocumentType(entry, rowType) {
@@ -169,11 +186,12 @@ export default function Debts() {
   const paymentAccount = accounts.find(account => String(account.id) === String(paymentForm.account_id))
   const paymentAmount = roundMoney(paymentForm.amount)
   const paymentDebt = roundMoney(paymentTarget?.balance)
+  const paymentAfter = roundMoney(paymentDebt - paymentAmount)
   const paymentDisabled = paymentSaving ||
     !paymentTarget ||
     !paymentForm.account_id ||
     !(paymentAmount > 0) ||
-    paymentAmount > paymentDebt + 0.009 ||
+    (paymentTarget?.type === 'supplier' && paymentAmount > paymentDebt + 0.009) ||
     (paymentTarget?.type === 'supplier' && paymentAccount && paymentAmount > toNumber(paymentAccount.balance) + 0.009)
 
   const openPayment = (row) => {
@@ -221,7 +239,7 @@ export default function Debts() {
       setPaymentError('Сумма должна быть больше 0')
       return
     }
-    if (amount > debt + 0.009) {
+    if (paymentTarget.type === 'supplier' && amount > debt + 0.009) {
       setPaymentError('Сумма оплаты превышает текущий долг')
       return
     }
@@ -273,8 +291,8 @@ export default function Debts() {
         <td className="td-mono">{fmt(row.total_charged)}</td>
         <td className="td-mono">{fmt(row.total_paid)}</td>
         <td>
-          <span className={`badge ${toNumber(row.balance) > 0 ? 'badge-warning' : 'badge-success'}`}>
-            {fmt(row.balance)}
+          <span className={`badge ${hasClientAdvance(row) ? 'badge-primary' : toNumber(row.balance) > 0 ? 'badge-warning' : 'badge-success'}`}>
+            {balanceLabel(row)}
           </span>
         </td>
         {activeTab !== 'history' && <td className="td-mono">{row.documents_count || 0}</td>}
@@ -319,6 +337,10 @@ export default function Debts() {
         <div className="balance-card">
           <div className="balance-card-label">Мы должны</div>
           <div className="balance-card-value" style={{ color: '#fbbf24' }}>{fmt(summary.payable)}</div>
+        </div>
+        <div className="balance-card">
+          <div className="balance-card-label">Авансы клиентов</div>
+          <div className="balance-card-value" style={{ color: '#60a5fa' }}>{fmt(summary.client_advances)}</div>
         </div>
         <div className="balance-card">
           <div className="balance-card-label">Баланс</div>
@@ -409,9 +431,9 @@ export default function Debts() {
               <div className="balance-card-value" style={{ color: 'var(--success)' }}>{fmt(selected.total_paid)}</div>
             </div>
             <div className="balance-card">
-              <div className="balance-card-label">Текущий остаток</div>
-              <div className={`balance-card-value ${toNumber(selected.balance) > 0 ? 'negative' : 'positive'}`}>
-                {fmt(selected.balance)}
+              <div className="balance-card-label">{hasClientAdvance(selected) ? 'Текущий аванс' : 'Текущий остаток'}</div>
+              <div className={`balance-card-value ${hasClientAdvance(selected) ? 'positive' : toNumber(selected.balance) > 0 ? 'negative' : 'positive'}`}>
+                {balanceLabel(selected)}
               </div>
             </div>
             <div className="balance-card">
@@ -452,7 +474,7 @@ export default function Debts() {
                     <td className="td-mono">{fmtPlain(entry.payment)}</td>
                     <td>
                       <span className={`badge ${toNumber(entry.balance_after) > 0 ? 'badge-warning' : 'badge-success'}`}>
-                        {fmt(entry.balance_after)}
+                        {runningBalanceLabel(selected.type, entry.balance_after)}
                       </span>
                     </td>
                     <td className="td-muted">{entry.comment || '—'}</td>
@@ -491,8 +513,10 @@ export default function Debts() {
             </div>
             <div className="balance-card">
               <div className="balance-card-label">После оплаты</div>
-              <div className={`balance-card-value ${paymentDebt - paymentAmount > 0.009 ? 'negative' : 'positive'}`}>
-                {fmt(Math.max(0, paymentDebt - paymentAmount))}
+              <div className={`balance-card-value ${paymentAfter > 0.009 ? 'negative' : 'positive'}`}>
+                {paymentTarget.type === 'customer' && paymentAfter < -0.009
+                  ? `Аванс: ${fmt(Math.abs(paymentAfter))}`
+                  : fmt(Math.max(0, paymentAfter))}
               </div>
             </div>
           </div>
@@ -548,7 +572,9 @@ export default function Debts() {
           </div>
 
           <div className="td-muted" style={{ fontSize: 13, marginTop: 8 }}>
-            Оплата будет автоматически распределена по открытым документам от старых к новым.
+            {paymentTarget.type === 'supplier'
+              ? 'Оплата будет автоматически распределена по открытым документам от старых к новым.'
+              : 'Оплата будет автоматически распределена по открытым документам от старых к новым. Сумма сверх долга станет авансом клиента.'}
           </div>
 
           <div style={{ fontWeight: 700, margin: '16px 0 10px' }}>Открытые документы</div>

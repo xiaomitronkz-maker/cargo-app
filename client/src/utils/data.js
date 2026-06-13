@@ -30,6 +30,8 @@ export const TYPE_LABELS = {
   almaty: 'Алматы',
   receivable: 'Нам должны',
   payable: 'Мы должны',
+  advance: 'Аванс',
+  client_advance: 'Аванс клиента',
   sale: 'Реализация',
   purchase: 'Приход',
   receipt: 'Приход',

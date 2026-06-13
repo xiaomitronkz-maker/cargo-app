@@ -77,6 +77,7 @@ export default function Audit() {
   const ownerCapitalTotal = toNumber(data?.owner_capital_total ?? global.owner_capital_total ?? (ownerContributionTotal - ownerWithdrawalTotal))
   const ownerControl = toNumber(data?.control_with_owner_ops ?? global.control_with_owner_ops)
   const ownerControlOk = global.control_with_owner_ok ?? ok(ownerControl)
+  const clientAdvancesTotal = toNumber(data?.client_advances_total ?? global.client_advances_total ?? debts.client_advances_total)
 
   return (
     <div className="page">
@@ -155,6 +156,7 @@ export default function Audit() {
           </div>
           <AuditBreakdown rows={[
             { label: 'Контроль', value: fmt(ownerControl), tone: ownerControlOk ? 'positive' : 'negative' },
+            { label: 'Авансы клиентов', value: fmt(clientAdvancesTotal) },
             { label: 'Вложения', value: fmt(ownerContributionTotal) },
             { label: 'Снятия', value: fmt(ownerWithdrawalTotal) },
           ]} />
@@ -251,6 +253,7 @@ export default function Audit() {
             {fmt((debts.payable_system || 0) - (debts.payable_ledger || 0))}
           </div>
           <div className="stat-sub">система: {fmt(debts.payable_system)} · оплаты: {fmt(debts.payable_ledger)}</div>
+          <div className="stat-sub">авансы клиентов: {fmt(clientAdvancesTotal)}</div>
         </div>
       </div>
     </div>

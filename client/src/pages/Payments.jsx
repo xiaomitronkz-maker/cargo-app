@@ -7,6 +7,7 @@ const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigi
 const typeMeta = {
   sale: { label: 'Реализация', badge: 'badge-success' },
   purchase: { label: 'Приход', badge: 'badge-warning' },
+  client_advance: { label: 'Аванс клиента', badge: 'badge-primary' },
 }
 
 export default function Payments() {

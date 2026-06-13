@@ -24,6 +24,7 @@ function SectionCard({ title, children }) {
 
 export default function Dashboard() {
   const [accounts, setAccounts] = useState([])
+  const [summary, setSummary] = useState({})
   const [debts, setDebts] = useState([])
   const [sales, setSales] = useState([])
   const [receipts, setReceipts] = useState([])
@@ -35,16 +36,18 @@ export default function Dashboard() {
     const load = async () => {
       setLoading(true)
       try {
-        const [accountsData, debtsData, salesData, receiptsData, profitData, transactionsData] = await Promise.all([
+        const [accountsData, summaryData, debtsData, salesData, receiptsData, profitData, transactionsData] = await Promise.all([
           api.getAccounts(),
+          api.getDebtsSummary(),
           api.getDebts(),
           api.getSales(),
           api.getReceipts(),
           api.getProfitSummary(),
           api.getTransactions(),
         ])
-        console.log('Analytics data:', { accountsData, debtsData, salesData, receiptsData, profitData, transactionsData })
+        console.log('Analytics data:', { accountsData, summaryData, debtsData, salesData, receiptsData, profitData, transactionsData })
         setAccounts(normalizeArray(accountsData))
+        setSummary(summaryData && typeof summaryData === 'object' ? summaryData : {})
         setDebts(normalizeArray(debtsData))
         setSales(normalizeArray(salesData))
         setReceipts(normalizeArray(receiptsData))
@@ -53,6 +56,7 @@ export default function Dashboard() {
       } catch (e) {
         console.log('Analytics data:', null)
         setAccounts([])
+        setSummary({})
         setDebts([])
         setSales([])
         setReceipts([])
@@ -72,8 +76,9 @@ export default function Dashboard() {
   const safeTransactions = normalizeArray(transactions)
 
   const cash = useMemo(() => safeAccounts.reduce((sum, account) => sum + toNumber(account.balance), 0), [safeAccounts])
-  const receivable = useMemo(() => safeDebts.filter((d) => d.type === 'receivable').reduce((sum, debt) => sum + toNumber(debt.debt), 0), [safeDebts])
-  const payable = useMemo(() => safeDebts.filter((d) => d.type === 'payable').reduce((sum, debt) => sum + toNumber(debt.debt), 0), [safeDebts])
+  const receivable = toNumber(summary?.receivable?.total ?? safeDebts.filter((d) => d.type === 'receivable').reduce((sum, debt) => sum + toNumber(debt.debt), 0))
+  const payable = toNumber(summary?.payable?.total ?? safeDebts.filter((d) => d.type === 'payable').reduce((sum, debt) => sum + toNumber(debt.debt), 0))
+  const clientAdvances = toNumber(summary?.client_advances?.total)
   const profit = toNumber(profitSummary?.profit)
   const ownerContribution = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_contribution').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
   const ownerWithdrawal = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_withdrawal').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
@@ -106,6 +111,7 @@ export default function Dashboard() {
         <StatCard label="Деньги" value={cash} tone={cash >= 0 ? 'positive' : 'negative'} />
         <StatCard label="Нам должны" value={receivable} tone="positive" />
         <StatCard label="Мы должны" value={payable} tone="negative" />
+        <StatCard label="Авансы клиентов" value={clientAdvances} tone={clientAdvances > 0 ? 'negative' : ''} />
         <StatCard label="Прибыль" value={profit} tone={profit >= 0 ? 'positive' : 'negative'} />
         <StatCard label="Контроль" value={control} tone={Math.abs(control) < 0.01 ? 'positive' : 'negative'} />
       </div>

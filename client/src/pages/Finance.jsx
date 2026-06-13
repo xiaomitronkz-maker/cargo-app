@@ -99,9 +99,11 @@ export default function Finance() {
   const safeAccounts = normalizeArray(accounts)
   const safeTransactions = normalizeArray(transactions)
   const receivable = toNumber(summary?.receivable?.total)
-  const payable = safeDebts
+  const payable = toNumber(summary?.payable?.total)
+  const supplierPayable = toNumber(summary?.supplier_payable?.total ?? safeDebts
     .filter(debt => debt.type === 'payable')
-    .reduce((sum, debt) => sum + toNumber(debt.debt), 0)
+    .reduce((sum, debt) => sum + toNumber(debt.debt), 0))
+  const clientAdvances = toNumber(summary?.client_advances?.total)
   const balance = receivable - payable
   const profit = toNumber(profitSummary?.profit)
   const cash = safeAccounts.reduce((sum, account) => sum + toNumber(account.balance), 0)
@@ -134,6 +136,7 @@ export default function Finance() {
         <FinanceCard label="💰 Деньги" value={cash} tone={cash >= 0 ? 'positive' : 'negative'} />
         <FinanceCard label="📥 Нам должны" value={receivable} tone="positive" />
         <FinanceCard label="📤 Мы должны" value={payable} tone="negative" />
+        <FinanceCard label="Авансы клиентов" value={clientAdvances} tone={clientAdvances > 0 ? 'negative' : ''} />
         <FinanceCard label="📊 Прибыль" value={profit} tone={profit >= 0 ? 'positive' : 'negative'} />
         <FinanceCard label="Капитал владельца" value={ownerCapital} tone={ownerCapital >= 0 ? 'positive' : 'negative'} />
         <FinanceCard label="🧮 Контроль" value={control} tone={isOk ? 'positive' : 'negative'} />
@@ -143,7 +146,7 @@ export default function Finance() {
         {isOk ? 'Баланс сошелся' : `Ошибка баланса: ${fmt(control)}`}
         {!isOk && (
           <div style={{ marginTop: 8 }}>
-            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)} · капитал владельца: {fmt(ownerCapital)}
+            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · поставщики: {fmt(supplierPayable)} · авансы клиентов: {fmt(clientAdvances)} · прибыль: {fmt(profit)} · капитал владельца: {fmt(ownerCapital)}
           </div>
         )}
       </div>
