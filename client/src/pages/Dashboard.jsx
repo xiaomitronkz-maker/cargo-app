@@ -77,7 +77,8 @@ export default function Dashboard() {
   const profit = toNumber(profitSummary?.profit)
   const ownerContribution = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_contribution').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
   const ownerWithdrawal = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_withdrawal').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
-  const control = cash + receivable - payable - profit - ownerContribution + ownerWithdrawal
+  const ownerCapital = ownerContribution - ownerWithdrawal
+  const control = cash + receivable - payable - profit - ownerCapital
 
   const latestSales = useMemo(() => [...safeSales].slice(0, 5), [safeSales])
   const latestReceipts = useMemo(() => [...safeReceipts].slice(0, 5), [safeReceipts])

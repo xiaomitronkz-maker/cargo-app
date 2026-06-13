@@ -111,9 +111,10 @@ export default function Finance() {
   const ownerWithdrawal = safeTransactions
     .filter(transaction => transaction.type === 'owner_withdrawal')
     .reduce((sum, transaction) => sum + toNumber(transaction.amount), 0)
+  const ownerCapital = ownerContribution - ownerWithdrawal
   const assets = cash + receivable
   const liabilities = payable
-  const control = assets - (liabilities + profit) - ownerContribution + ownerWithdrawal
+  const control = assets - (liabilities + profit) - ownerCapital
   const isOk = Math.abs(control) < 0.01
 
   return (
@@ -134,8 +135,7 @@ export default function Finance() {
         <FinanceCard label="📥 Нам должны" value={receivable} tone="positive" />
         <FinanceCard label="📤 Мы должны" value={payable} tone="negative" />
         <FinanceCard label="📊 Прибыль" value={profit} tone={profit >= 0 ? 'positive' : 'negative'} />
-        <FinanceCard label="Вложения владельца" value={ownerContribution} tone="positive" />
-        <FinanceCard label="Снятия владельца" value={ownerWithdrawal} tone="negative" />
+        <FinanceCard label="Капитал владельца" value={ownerCapital} tone={ownerCapital >= 0 ? 'positive' : 'negative'} />
         <FinanceCard label="🧮 Контроль" value={control} tone={isOk ? 'positive' : 'negative'} />
       </div>
 
@@ -143,7 +143,7 @@ export default function Finance() {
         {isOk ? 'Баланс сошелся' : `Ошибка баланса: ${fmt(control)}`}
         {!isOk && (
           <div style={{ marginTop: 8 }}>
-            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)} · вложения: {fmt(ownerContribution)} · снятия: {fmt(ownerWithdrawal)}
+            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · прибыль: {fmt(profit)} · капитал владельца: {fmt(ownerCapital)}
           </div>
         )}
       </div>
@@ -173,6 +173,7 @@ export default function Finance() {
         <div className="stat-grid">
           <FinanceCard label="Реализация за период" value={toNumber(periodProfit?.revenue)} tone="positive" />
           <FinanceCard label="Себестоимость за период" value={toNumber(periodProfit?.cost)} tone="negative" />
+          <FinanceCard label="Расходы за период" value={toNumber(periodProfit?.manual_expenses ?? periodProfit?.expenses)} tone="negative" />
           <FinanceCard label="Прибыль за период" value={toNumber(periodProfit?.profit)} tone={toNumber(periodProfit?.profit) >= 0 ? 'positive' : 'negative'} />
           <div className="stat-card">
             <div className="stat-label">Реализаций / строк</div>

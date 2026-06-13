@@ -15,7 +15,7 @@ const ACTION_LABELS = {
   cashbox_transfer: 'Перевод между кассами',
   owner_contribution: 'Пополнение владельцем',
   owner_withdrawal: 'Снятие владельцем',
-  income: 'Доход',
+  income: 'Доход (legacy)',
   expense: 'Расход',
   google_sheets_import: 'Импорт Google Sheets',
   counterparty_import: 'Импорт контрагентов',

@@ -12,15 +12,14 @@ const accountName = (tx) => {
 }
 
 const OPERATION_TYPES = [
-  { value: 'transfer', label: 'Перевод между кассами' },
-  { value: 'owner_contribution', label: 'Пополнение владельцем / инвестиция' },
-  { value: 'owner_withdrawal', label: 'Снятие владельцем / вывод прибыли' },
-  { value: 'income', label: 'Доход' },
-  { value: 'expense', label: 'Расход' },
+  { value: 'expense', label: 'Расход', hint: 'Уменьшает кассу и прибыль' },
+  { value: 'owner_contribution', label: 'Пополнение владельцем / пополнение кассы', hint: 'Увеличивает кассу и капитал владельца, не влияет на прибыль' },
+  { value: 'owner_withdrawal', label: 'Снятие владельцем / снятие с кассы', hint: 'Уменьшает кассу и капитал владельца, не влияет на прибыль' },
+  { value: 'transfer', label: 'Перевод между кассами', hint: 'Не влияет на прибыль' },
 ]
 
 const EMPTY_FORM = {
-  type: 'transfer',
+  type: 'expense',
   account_from_id: '',
   account_to_id: '',
   cash_account_id: '',
@@ -57,7 +56,15 @@ export default function Transactions() {
   const setF = (key, value) => setForm(f => ({ ...f, [key]: value }))
   const isTransfer = form.type === 'transfer'
   const isOutflow = form.type === 'owner_withdrawal' || form.type === 'expense'
-  const isInflow = form.type === 'owner_contribution' || form.type === 'income'
+  const isInflow = form.type === 'owner_contribution'
+  const selectedOperationType = OPERATION_TYPES.find(type => type.value === form.type)
+  const commentPlaceholder = form.type === 'expense'
+    ? 'Например: аренда, упаковка, сервис'
+    : form.type === 'owner_contribution'
+      ? 'Например: пополнение кассы владельцем'
+      : form.type === 'owner_withdrawal'
+        ? 'Например: снятие владельцем'
+        : 'Например: перевод между кассами'
   const selectedAccount = accounts.find(account => String(account.id) === String(form.cash_account_id))
   const remaining = selectedAccount ? toNumber(selectedAccount.balance) - toNumber(form.amount) : 0
 
@@ -139,6 +146,9 @@ export default function Transactions() {
             <select className="form-input" value={form.type} onChange={e => setForm({ ...EMPTY_FORM, type: e.target.value, date: form.date || today() })}>
               {OPERATION_TYPES.map(type => <option key={type.value} value={type.value}>{type.label}</option>)}
             </select>
+            {selectedOperationType?.hint && (
+              <div className="td-muted" style={{ fontSize: 12, marginTop: 6 }}>{selectedOperationType.hint}</div>
+            )}
           </div>
 
           <div className="form-grid">
@@ -188,7 +198,7 @@ export default function Transactions() {
           </div>
           <div className="form-group">
             <label className="form-label">Комментарий</label>
-            <input className="form-input" value={form.comment} onChange={e => setF('comment', e.target.value)} placeholder="Например: вложение владельца" />
+            <input className="form-input" value={form.comment} onChange={e => setF('comment', e.target.value)} placeholder={commentPlaceholder} />
           </div>
           {error && <div className="alert alert-error" style={{ marginBottom: 10 }}>{error}</div>}
           <button className="btn btn-primary" onClick={submit} disabled={saving}>

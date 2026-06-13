@@ -19,7 +19,7 @@ export function formatDate(value) {
 
 export const TYPE_LABELS = {
   expense: 'Расход',
-  income: 'Доход',
+  income: 'Доход (legacy)',
   transfer: 'Перевод',
   withdraw: 'Вывод',
   owner_contribution: 'Пополнение владельцем',

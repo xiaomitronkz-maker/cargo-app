@@ -1815,6 +1815,26 @@ function ledgerNumber(value) {
   return Math.round((+value || 0) * 100) / 100;
 }
 
+async function manualExpensesTotal(filters = {}, client = pool) {
+  const params = [];
+  const where = ["type='expense'", "COALESCE(related_type,'')='manual'"];
+  if (filters.date_from) {
+    params.push(filters.date_from);
+    where.push(`date >= $${params.length}::date`);
+  }
+  if (filters.date_to) {
+    params.push(filters.date_to);
+    where.push(`date <= $${params.length}::date`);
+  }
+
+  const row = await get(`
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM transactions
+    WHERE ${where.join(' AND ')}
+  `, params, client);
+  return +(row?.total || 0);
+}
+
 // Profit cost should prefer persisted receipt line totals; product averages are only a legacy fallback.
 function salesCostCte(salesWhere = '') {
   return `
@@ -2285,10 +2305,15 @@ async function profitSummaryData(filters = {}, client = pool) {
 
   const revenue = +(row?.revenue || 0);
   const cost = +(row?.cost || 0);
+  const manualExpenses = await manualExpensesTotal({ date_from: dateFrom, date_to: dateTo }, client);
+  const grossProfit = revenue - cost;
   return {
     revenue,
     cost,
-    profit: revenue - cost,
+    manual_expenses: manualExpenses,
+    expenses: manualExpenses,
+    gross_profit: grossProfit,
+    profit: grossProfit - manualExpenses,
     sales_count: +(row?.sales_count || 0),
     items_count: +(row?.items_count || 0),
     date_from: dateFrom,
@@ -2325,22 +2350,26 @@ async function analyticsProfitData(period = '', filters = {}) {
   const params = [];
   const salesConditions = [];
   const purchasesConditions = [];
+  const expenseConditions = ["t.type='expense'", "COALESCE(t.related_type,'')='manual'"];
   if (startDate) {
     params.push(startDate);
     salesConditions.push(`COALESCE(sd.date, s.date) >= $${params.length}::date`);
     purchasesConditions.push(`p.date >= $${params.length}::date`);
+    expenseConditions.push(`t.date >= $${params.length}::date`);
   }
   if (endDate) {
     params.push(endDate);
     salesConditions.push(`COALESCE(sd.date, s.date) <= $${params.length}::date`);
     purchasesConditions.push(`p.date <= $${params.length}::date`);
+    expenseConditions.push(`t.date <= $${params.length}::date`);
   }
   const salesWhere = salesConditions.length ? `WHERE ${salesConditions.join(' AND ')}` : '';
   const purchasesWhere = purchasesConditions.length ? `WHERE ${purchasesConditions.join(' AND ')}` : '';
+  const expensesWhere = `WHERE ${expenseConditions.join(' AND ')}`;
 
   const baseCte = salesCostCte(salesWhere);
 
-  const [byClient, byProduct, salesByPeriod, purchasesByPeriod, totals, debts, accounts] = await Promise.all([
+  const [byClient, byProduct, salesByPeriod, purchasesByPeriod, expensesByPeriod, expensesTotal, totals, debts, accounts] = await Promise.all([
     all(`
       ${baseCte}
       SELECT
@@ -2383,6 +2412,20 @@ async function analyticsProfitData(period = '', filters = {}) {
       GROUP BY p.date
       ORDER BY p.date
     `, params),
+    all(`
+      SELECT
+        t.date::text AS date,
+        COALESCE(SUM(t.amount::numeric),0) AS total
+      FROM transactions t
+      ${expensesWhere}
+      GROUP BY t.date
+      ORDER BY t.date
+    `, params),
+    get(`
+      SELECT COALESCE(SUM(t.amount::numeric),0) AS total
+      FROM transactions t
+      ${expensesWhere}
+    `, params),
     get(`
       ${baseCte}
       SELECT
@@ -2410,20 +2453,25 @@ async function analyticsProfitData(period = '', filters = {}) {
   const payable = +(debts?.payable?.total || 0);
   const revenue = +(totals?.revenue || 0);
   const cost = +(totals?.cost || 0);
+  const manualExpenses = +(expensesTotal?.total || 0);
 
   return {
     byClient,
     byProduct,
     salesByPeriod,
     purchasesByPeriod,
+    expensesByPeriod,
     assetsByType: [
       { asset_type: 'cash', total: cash },
       { asset_type: 'debtors', total: receivable },
     ],
     totalLiab: payable,
     totalSales: revenue,
-    totalCosts: cost,
-    profit: revenue - cost,
+    totalCosts: cost + manualExpenses,
+    salesCost: cost,
+    manualExpenses,
+    grossProfit: revenue - cost,
+    profit: revenue - cost - manualExpenses,
     date_from: startDate || null,
     date_to: endDate || null,
   };
@@ -4863,6 +4911,7 @@ app.get('/api/audit', async (req, res) => {
   `);
   const ownerContributionTotal = +(ownerContributionRow?.total || 0);
   const ownerWithdrawalTotal = +(ownerWithdrawalRow?.total || 0);
+  const ownerCapitalTotal = ownerContributionTotal - ownerWithdrawalTotal;
 
   const accountsTotal = accounts.reduce((sum, account) => sum + (+account.balance_actual || +account.balance || 0), 0);
   const transactionsTotal = +(await get(`
@@ -4881,8 +4930,7 @@ app.get('/api/audit', async (req, res) => {
     + (+(debtSummary.receivable?.total || 0))
     - (+(debtSummary.payable?.total || 0))
     - (+(profit.profit || 0))
-    - ownerContributionTotal
-    + ownerWithdrawalTotal;
+    - ownerCapitalTotal;
 
   res.json({
     payments_vs_transactions: {
@@ -4912,8 +4960,10 @@ app.get('/api/audit', async (req, res) => {
       receivable_total: +(debtSummary.receivable?.total || 0),
       payable_total: +(debtSummary.payable?.total || 0),
       profit_total: +(profit.profit || 0),
+      manual_expenses_total: +(profit.manual_expenses || 0),
       owner_contribution_total: ownerContributionTotal,
       owner_withdrawal_total: ownerWithdrawalTotal,
+      owner_capital_total: ownerCapitalTotal,
       control_with_owner_ops: controlWithOwnerOps,
       control_with_owner_ok: Math.abs(controlWithOwnerOps) < 0.01,
       diff: globalDiff,
@@ -4921,6 +4971,7 @@ app.get('/api/audit', async (req, res) => {
     },
     owner_contribution_total: ownerContributionTotal,
     owner_withdrawal_total: ownerWithdrawalTotal,
+    owner_capital_total: ownerCapitalTotal,
     control_with_owner_ops: controlWithOwnerOps,
   });
 });
@@ -4993,7 +5044,21 @@ app.get('/api/analytics/dashboard', async (req, res) => {
       sc.date::text AS date,
       COALESCE(SUM(sc.revenue),0) AS sales,
       COALESCE(SUM(sc.cost),0) AS costs,
-      COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) AS profit
+      COALESCE((
+        SELECT SUM(t.amount::numeric)
+        FROM transactions t
+        WHERE t.type='expense'
+          AND COALESCE(t.related_type,'')='manual'
+          AND t.date = sc.date
+      ),0) AS expenses,
+      COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) AS gross_profit,
+      COALESCE(SUM(sc.revenue),0) - COALESCE(SUM(sc.cost),0) - COALESCE((
+        SELECT SUM(t.amount::numeric)
+        FROM transactions t
+        WHERE t.type='expense'
+          AND COALESCE(t.related_type,'')='manual'
+          AND t.date = sc.date
+      ),0) AS profit
     FROM sales_costed sc
     GROUP BY sc.date
     ORDER BY sc.date

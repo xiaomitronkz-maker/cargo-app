@@ -193,16 +193,18 @@ function ProductsTab({ data }) {
 function TimelineTab({ data }) {
   const salesByPeriod = normalizeArray(data?.salesByPeriod).map(row => ({ ...row, total: toNumber(row?.total ?? row?.revenue) }))
   const purchasesByPeriod = normalizeArray(data?.purchasesByPeriod).map(row => ({ ...row, total: toNumber(row?.total ?? row?.cost) }))
-  const dates = [...new Set([...salesByPeriod.map(r => r.date), ...purchasesByPeriod.map(r => r.date)].filter(Boolean))].sort()
+  const expensesByPeriod = normalizeArray(data?.expensesByPeriod).map(row => ({ ...row, total: toNumber(row?.total) }))
+  const dates = [...new Set([...salesByPeriod.map(r => r.date), ...purchasesByPeriod.map(r => r.date), ...expensesByPeriod.map(r => r.date)].filter(Boolean))].sort()
   const combined = dates.map(d => ({
     date: formatDate(d),
     sales: toNumber(salesByPeriod.find(r => r.date === d)?.total),
     costs: toNumber(purchasesByPeriod.find(r => r.date === d)?.total),
+    expenses: toNumber(expensesByPeriod.find(r => r.date === d)?.total),
   }))
   return (
     <div>
       <div className="chart-card">
-        <div className="chart-title">Продажи и затраты по датам</div>
+        <div className="chart-title">Продажи, себестоимость и расходы по датам</div>
         {combined.length === 0 ? (
           <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Нет данных за период</div>
         ) : (
@@ -213,7 +215,8 @@ function TimelineTab({ data }) {
               <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11 }} tickLine={false} axisLine={false} tickFormatter={fmtShort} width={56} />
               <Tooltip content={<CustomTooltip />} />
               <Line name="Продажи" type="monotone" dataKey="sales" stroke="#5e6ad2" strokeWidth={2} dot={false} />
-              <Line name="Затраты" type="monotone" dataKey="costs" stroke="#dc2626" strokeWidth={2} dot={false} strokeDasharray="4 4" />
+              <Line name="Себестоимость" type="monotone" dataKey="costs" stroke="#dc2626" strokeWidth={2} dot={false} strokeDasharray="4 4" />
+              <Line name="Расходы" type="monotone" dataKey="expenses" stroke="#d97706" strokeWidth={2} dot={false} strokeDasharray="2 4" />
             </LineChart>
           </ResponsiveContainer>
         )}
