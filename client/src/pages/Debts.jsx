@@ -225,11 +225,6 @@ export default function Debts() {
       setPaymentError('Сумма оплаты превышает текущий долг')
       return
     }
-    const availableByDocuments = paymentDocuments.reduce((sum, document) => sum + roundMoney(document.remaining), 0)
-    if (amount > availableByDocuments + 0.009) {
-      setPaymentError('Не удалось распределить оплату по документам')
-      return
-    }
     if (paymentTarget.type === 'supplier' && paymentAccount && amount > toNumber(paymentAccount.balance) + 0.009) {
       setPaymentError('Недостаточно средств в кассе')
       return
@@ -238,27 +233,14 @@ export default function Debts() {
     setPaymentSaving(true)
     setPaymentError('')
     try {
-      let rest = amount
-      for (const document of paymentDocuments) {
-        if (rest <= 0.009) break
-        const part = roundMoney(Math.min(rest, roundMoney(document.remaining)))
-        if (!(part > 0)) continue
-        const payload = {
-          amount: part,
-          date: paymentForm.date || todayIso(),
-          comment: paymentForm.comment || null,
-        }
-        if (paymentTarget.type === 'supplier') {
-          payload.account_from_id = paymentForm.account_id
-          if (document.document_type === 'purchase') await api.payPurchase(document.document_id, payload)
-          else await api.payReceipt(document.document_id, payload)
-        } else {
-          payload.account_to_id = paymentForm.account_id
-          if (document.document_type === 'sale') await api.paySale(document.document_id, payload)
-          else await api.paySalesDocument(document.document_id, payload)
-        }
-        rest = roundMoney(rest - part)
-      }
+      await api.payDebt({
+        entity_type: paymentTarget.type === 'supplier' ? 'supplier' : 'client',
+        entity_id: paymentTarget.counterparty_id,
+        cashbox_id: paymentForm.account_id,
+        amount,
+        date: paymentForm.date || todayIso(),
+        comment: paymentForm.comment || null,
+      })
       setPaymentTarget(null)
       setPaymentForm(emptyPaymentForm())
       setPaymentError('')
@@ -563,6 +545,10 @@ export default function Debts() {
               onChange={e => setPaymentField('comment', e.target.value)}
               placeholder={paymentTarget.type === 'supplier' ? 'Оплата поставщику' : 'Оплата клиента'}
             />
+          </div>
+
+          <div className="td-muted" style={{ fontSize: 13, marginTop: 8 }}>
+            Оплата будет автоматически распределена по открытым документам от старых к новым.
           </div>
 
           <div style={{ fontWeight: 700, margin: '16px 0 10px' }}>Открытые документы</div>

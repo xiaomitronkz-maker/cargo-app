@@ -1454,6 +1454,52 @@ async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
   }
 }
 
+async function payReceiptDocument(receiptId, { amount, accountFromId, date, comment }, client = pool) {
+  const paymentAmount = ledgerNumber(amount);
+  const receipt = await get(`
+    SELECT r.*, COALESCE(SUM(p.total_cost::numeric),0) AS total_cost, MIN(p.id) AS anchor_purchase_id
+    FROM receipts r
+    LEFT JOIN purchases p ON p.receipt_id = r.id
+    WHERE r.id=$1
+    GROUP BY r.id
+  `, [receiptId], client);
+  if (!receipt) throw new Error('Приход не найден');
+  if (!receipt.anchor_purchase_id) throw new Error('В документе нет товаров для оплаты');
+
+  const totalAmount = +(receipt.total_cost || 0);
+  const paid = await getReceiptPaidAmount(receiptId, client);
+  const remaining = ledgerNumber(totalAmount - paid);
+  if (paymentAmount > remaining + 0.009) throw new Error('Сумма оплаты превышает остаток долга');
+
+  const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['purchase', +receipt.anchor_purchase_id, paymentAmount, date, comment], client);
+  const transaction = await get(`
+    INSERT INTO transactions(type,amount,account_from_id,receipt_id,date,comment,related_type,related_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    RETURNING id
+  `, ['expense', paymentAmount, accountFromId, receiptId, date, comment, 'payment', payment.id], client);
+  await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+  await rebalanceReceiptPurchasePaidAmounts(receiptId, client);
+  await logOperation(client, {
+    action: 'supplier_payment',
+    entity_type: 'receipt',
+    entity_id: receiptId,
+    entity_label: `Приход №${receiptId}`,
+    amount: paymentAmount,
+    currency: 'USD',
+    description: 'Оплата поставщику',
+    meta: { payment_id: payment.id, transaction_id: transaction.id, account_from_id: accountFromId, comment },
+  });
+
+  const newPaid = await getReceiptPaidAmount(receiptId, client);
+  return {
+    receipt_id: receiptId,
+    paid_amount: newPaid,
+    payable: ledgerNumber(totalAmount - newPaid),
+    payment_id: payment.id,
+    transaction_id: transaction.id,
+  };
+}
+
 async function getSalesDocumentPaidAmount(salesDocumentId, client = pool) {
   const row = await get(`
     SELECT COALESCE(SUM(amount::numeric),0) AS total
@@ -1520,7 +1566,7 @@ async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId,
   const totalAmount = +(totalRow?.total || 0);
   const paid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
   const remaining = totalAmount - paid;
-  if (amount > remaining) throw new Error('Сумма оплаты превышает остаток долга');
+  if (amount > remaining + 0.009) throw new Error('Сумма оплаты превышает остаток долга');
 
   const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['sale', anchorSaleId, amount, date, comment], client);
   const transaction = await get(`
@@ -1547,6 +1593,145 @@ async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId,
     paid_amount: newPaid,
     debt: totalAmount - newPaid,
   };
+}
+
+async function payLegacySaleDocument(saleId, { amount, accountToId, date, comment }, client = pool) {
+  const paymentAmount = ledgerNumber(amount);
+  const sale = await get('SELECT * FROM sales WHERE id=$1', [saleId], client);
+  if (!sale) throw new Error('Продажа не найдена');
+  if (sale.sales_document_id) return paySalesDocumentByAnchorSale(saleId, { amount: paymentAmount, accountToId, date, comment }, client);
+
+  const totalAmount = +(sale.total_amount || 0);
+  const paidAmount = +(sale.paid_amount || 0);
+  const remaining = ledgerNumber(totalAmount - paidAmount);
+  if (paymentAmount > remaining + 0.009) throw new Error('Сумма оплаты превышает остаток долга');
+
+  const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['sale', saleId, paymentAmount, date, comment], client);
+  const transaction = await get(`
+    INSERT INTO transactions(type,amount,account_to_id,sale_id,date,comment,related_type,related_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    RETURNING id
+  `, ['income', paymentAmount, accountToId, saleId, date, comment, 'payment', payment.id], client);
+  await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+  await query('UPDATE sales SET paid_amount = COALESCE(paid_amount,0) + $1 WHERE id=$2', [paymentAmount, saleId], client);
+  await logOperation(client, {
+    action: 'client_payment',
+    entity_type: 'sale',
+    entity_id: saleId,
+    entity_label: `Реализация №${saleId}`,
+    amount: paymentAmount,
+    currency: 'USD',
+    description: 'Оплата клиента',
+    meta: { payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
+  });
+
+  const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [saleId], client);
+  return {
+    sale_id: saleId,
+    paid_amount: +(updated?.paid_amount || 0),
+    debt: ledgerNumber(+(updated?.total_amount || 0) - +(updated?.paid_amount || 0)),
+    payment_id: payment.id,
+    transaction_id: transaction.id,
+  };
+}
+
+async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
+  const rows = await all(`
+    WITH receipt_totals AS (
+      SELECT
+        r.id AS receipt_id,
+        r.date,
+        r.created_at,
+        COALESCE(SUM(p.total_cost::numeric),0) AS total
+      FROM receipts r
+      JOIN purchases p ON p.receipt_id = r.id
+      WHERE r.supplier_id=$1
+      GROUP BY r.id, r.date, r.created_at
+    ),
+    receipt_payments AS (
+      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
+      FROM (
+        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
+        FROM payments p
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
+        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
+      ) x
+      GROUP BY x.receipt_id
+    )
+    SELECT
+      rt.receipt_id AS document_id,
+      'receipt'::text AS document_type,
+      rt.date,
+      rt.created_at,
+      rt.total::numeric AS total,
+      COALESCE(rp.paid::numeric,0) AS paid,
+      rt.total::numeric - COALESCE(rp.paid::numeric,0) AS remaining
+    FROM receipt_totals rt
+    LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.receipt_id
+    WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
+    ORDER BY rt.date ASC NULLS LAST, rt.created_at ASC NULLS LAST, rt.receipt_id ASC
+  `, [supplierId], client);
+
+  return rows.map((row) => ({
+    ...row,
+    document_id: +row.document_id,
+    total: +(row.total || 0),
+    paid: +(row.paid || 0),
+    remaining: +(row.remaining || 0),
+  }));
+}
+
+async function getClientOpenDebtDocuments(clientId, client = pool) {
+  const rows = await all(`
+    WITH receivable_totals AS (
+      SELECT
+        COALESCE(sd.id, -s.id) AS receivable_group_id,
+        sd.id AS sales_document_id,
+        MIN(s.id) AS anchor_sale_id,
+        COALESCE(sd.date, s.date) AS date,
+        COALESCE(sd.created_at, s.created_at) AS created_at,
+        COALESCE(SUM(s.total_amount::numeric),0) AS total
+      FROM sales s
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      WHERE COALESCE(sd.client_id, s.client_id)=$1
+      GROUP BY COALESCE(sd.id, -s.id), sd.id, COALESCE(sd.date, s.date), COALESCE(sd.created_at, s.created_at)
+    ),
+    receivable_payments AS (
+      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
+      FROM (
+        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
+        FROM payments p
+        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+        LEFT JOIN transactions t ON t.id = p.transaction_id
+        LEFT JOIN sales s2 ON s2.id = t.sale_id
+        WHERE COALESCE(s.id, s2.id) IS NOT NULL
+      ) x
+      GROUP BY x.receivable_group_id
+    )
+    SELECT
+      CASE WHEN rt.sales_document_id IS NULL THEN 'sale' ELSE 'sales_document' END AS document_type,
+      CASE WHEN rt.sales_document_id IS NULL THEN rt.anchor_sale_id ELSE rt.sales_document_id END AS document_id,
+      rt.anchor_sale_id,
+      rt.date,
+      rt.created_at,
+      rt.total::numeric AS total,
+      COALESCE(rp.paid::numeric,0) AS paid,
+      rt.total::numeric - COALESCE(rp.paid::numeric,0) AS remaining
+    FROM receivable_totals rt
+    LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rt.receivable_group_id
+    WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
+    ORDER BY rt.date ASC NULLS LAST, rt.created_at ASC NULLS LAST, document_id ASC
+  `, [clientId], client);
+
+  return rows.map((row) => ({
+    ...row,
+    document_id: +row.document_id,
+    anchor_sale_id: +row.anchor_sale_id,
+    total: +(row.total || 0),
+    paid: +(row.paid || 0),
+    remaining: +(row.remaining || 0),
+  }));
 }
 
 async function validateSale(productId, saleUnit, quantity, pricePerUnit, client = pool) {
@@ -3416,45 +3601,10 @@ app.put('/api/receipts/:id/pay', async (req, res) => {
   if (await getAccountBalance(accountFromId) < amount) return validationError(res, 'Недостаточно средств в кассе', { type: 'expense', amount, account_id: accountFromId, receipt_id: id, sale_id: null });
 
   try {
-    const receipt = await get(`
-      SELECT r.*, COALESCE(SUM(p.total_cost::numeric),0) AS total_cost, MIN(p.id) AS anchor_purchase_id
-      FROM receipts r
-      LEFT JOIN purchases p ON p.receipt_id = r.id
-      WHERE r.id=$1
-      GROUP BY r.id
-    `, [id]);
-    if (!receipt) return res.status(404).json({ error: 'Приход не найден' });
-    if (!receipt.anchor_purchase_id) return res.status(400).json({ error: 'В документе нет товаров для оплаты' });
-
-    const paid = await getReceiptPaidAmount(id);
-    const remaining = +(receipt.total_cost || 0) - paid;
-    if (amount > remaining) return validationError(res, 'Сумма оплаты превышает остаток долга', { type: 'expense', amount, account_id: accountFromId, receipt_id: id, sale_id: null });
-
-    await withTx(async (client) => {
-      const payment = await get('INSERT INTO payments(entity_type,entity_id,amount,date,comment) VALUES($1,$2,$3,$4,$5) RETURNING id', ['purchase', +receipt.anchor_purchase_id, amount, date, comment], client);
-      const transaction = await get(`
-        INSERT INTO transactions(type,amount,account_from_id,receipt_id,date,comment,related_type,related_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-        RETURNING id
-      `, ['expense', amount, accountFromId, id, date, comment, 'payment', payment.id], client);
-      await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
-      await rebalanceReceiptPurchasePaidAmounts(id, client);
-      await logOperation(client, {
-        action: 'supplier_payment',
-        entity_type: 'receipt',
-        entity_id: id,
-        entity_label: `Приход №${id}`,
-        amount,
-        currency: 'USD',
-        description: 'Оплата поставщику',
-        meta: { payment_id: payment.id, transaction_id: transaction.id, account_from_id: accountFromId, comment },
-      });
-    });
-
-    const newPaid = await getReceiptPaidAmount(id);
-    res.json({ success: true, receipt_id: id, paid_amount: newPaid, payable: +(receipt.total_cost || 0) - newPaid });
+    const result = await withTx((client) => payReceiptDocument(id, { amount, accountFromId, date, comment }, client));
+    res.json({ success: true, receipt_id: result.receipt_id, paid_amount: result.paid_amount, payable: result.payable });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.message === 'Приход не найден' ? 404 : 400).json({ error: e.message });
   }
 });
 
@@ -4051,6 +4201,98 @@ app.get('/api/debts/ledger', async (req, res) => {
     res.json(await debtsLedgerData());
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/debts/pay', async (req, res) => {
+  const rawEntityType = String(req.body.entity_type || '').trim();
+  const entityType = rawEntityType === 'customer' ? 'client' : rawEntityType;
+  const entityId = +req.body.entity_id;
+  const cashboxId = +req.body.cashbox_id;
+  const amount = ledgerNumber(req.body.amount);
+  const date = req.body.date || new Date().toISOString().slice(0, 10);
+  const comment = req.body.comment || null;
+
+  if (!['supplier', 'client'].includes(entityType)) return validationError(res, 'Тип контрагента должен быть supplier или client', { entity_type: rawEntityType });
+  if (!entityId) return validationError(res, 'Контрагент обязателен', { entity_type: entityType, entity_id: entityId });
+  if (!cashboxId) return validationError(res, 'Касса обязательна', { entity_type: entityType, entity_id: entityId, cashbox_id: cashboxId });
+  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { entity_type: entityType, entity_id: entityId, amount });
+
+  try {
+    const documents = entityType === 'supplier'
+      ? await getSupplierOpenDebtDocuments(entityId)
+      : await getClientOpenDebtDocuments(entityId);
+    const totalDebt = ledgerNumber(documents.reduce((sum, document) => sum + +(document.remaining || 0), 0));
+
+    if (!documents.length || totalDebt <= 0.009) return res.status(400).json({ error: 'Открытых документов для оплаты нет' });
+    if (amount > totalDebt + 0.009) {
+      return validationError(res, entityType === 'supplier' ? 'Сумма оплаты превышает общий долг поставщика' : 'Сумма оплаты превышает общий долг клиента', {
+        entity_type: entityType,
+        entity_id: entityId,
+        amount,
+        total_debt: totalDebt,
+      });
+    }
+    if (entityType === 'supplier' && await getAccountBalance(cashboxId) < amount) {
+      return validationError(res, 'Недостаточно средств в кассе', { entity_type: entityType, entity_id: entityId, amount, cashbox_id: cashboxId });
+    }
+
+    const result = await withTx(async (client) => {
+      let remainingPayment = amount;
+      const allocations = [];
+
+      for (const document of documents) {
+        if (remainingPayment <= 0.009) break;
+        const part = ledgerNumber(Math.min(remainingPayment, +(document.remaining || 0)));
+        if (!(part > 0)) continue;
+
+        if (entityType === 'supplier') {
+          const paymentResult = await payReceiptDocument(document.document_id, { amount: part, accountFromId: cashboxId, date, comment }, client);
+          allocations.push({
+            document_type: 'receipt',
+            document_id: document.document_id,
+            amount: part,
+            paid_amount: paymentResult.paid_amount,
+            debt: paymentResult.payable,
+          });
+        } else if (document.document_type === 'sales_document') {
+          const paymentResult = await paySalesDocumentByAnchorSale(document.anchor_sale_id, { amount: part, accountToId: cashboxId, date, comment }, client);
+          allocations.push({
+            document_type: 'sales_document',
+            document_id: document.document_id,
+            amount: part,
+            paid_amount: paymentResult.paid_amount,
+            debt: paymentResult.debt,
+          });
+        } else {
+          const paymentResult = await payLegacySaleDocument(document.document_id, { amount: part, accountToId: cashboxId, date, comment }, client);
+          allocations.push({
+            document_type: 'sale',
+            document_id: document.document_id,
+            amount: part,
+            paid_amount: paymentResult.paid_amount,
+            debt: paymentResult.debt,
+          });
+        }
+
+        remainingPayment = ledgerNumber(remainingPayment - part);
+      }
+
+      if (remainingPayment > 0.009) throw new Error('Не удалось распределить оплату по открытым документам');
+      return allocations;
+    });
+
+    res.json({
+      success: true,
+      entity_type: entityType,
+      entity_id: entityId,
+      paid_amount: amount,
+      previous_debt: totalDebt,
+      remaining_debt: ledgerNumber(totalDebt - amount),
+      allocations: result,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
 });
 
