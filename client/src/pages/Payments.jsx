@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
-import { formatDate, formatType, normalizeArray } from '../utils/data'
+import Modal from '../components/Modal'
+import { formatDate, formatType, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + (+n || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
@@ -12,14 +13,86 @@ const typeMeta = {
 
 export default function Payments() {
   const [payments, setPayments] = useState([])
+  const [accounts, setAccounts] = useState([])
   const [loading, setLoading] = useState(true)
+  const [editing, setEditing] = useState(null)
+  const [editForm, setEditForm] = useState({ amount: '', cashbox_id: '', date: '', comment: '' })
+  const [editError, setEditError] = useState('')
+  const [saving, setSaving] = useState(false)
 
   const load = () => {
     setLoading(true)
-    api.getPayments().then((rows) => setPayments(normalizeArray(rows))).finally(() => setLoading(false))
+    Promise.all([api.getPayments(), api.getAccounts()])
+      .then(([paymentRows, accountRows]) => {
+        setPayments(normalizeArray(paymentRows))
+        setAccounts(normalizeArray(accountRows))
+      })
+      .finally(() => setLoading(false))
   }
 
   useEffect(() => { load() }, [])
+
+  const openEdit = (payment) => {
+    setEditing(payment)
+    setEditForm({
+      amount: String(payment.amount ?? ''),
+      cashbox_id: payment.cashbox_id ? String(payment.cashbox_id) : '',
+      date: payment.date ? String(payment.date).slice(0, 10) : '',
+      comment: payment.comment || '',
+    })
+    setEditError('')
+  }
+
+  const closeEdit = () => {
+    if (saving) return
+    setEditing(null)
+    setEditForm({ amount: '', cashbox_id: '', date: '', comment: '' })
+    setEditError('')
+  }
+
+  const setEditField = (key, value) => setEditForm(form => ({ ...form, [key]: value }))
+
+  const paymentCounterparty = (payment) => payment?.client_name || payment?.supplier_name || '—'
+  const paymentTypeLabel = (payment) => payment?.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'
+  const selectedAccount = accounts.find(account => String(account.id) === String(editForm.cashbox_id))
+  const isSupplierPayment = editing?.entity_type === 'purchase'
+
+  const saveEdit = async () => {
+    if (!editing) return
+    const amount = toNumber(editForm.amount)
+    if (!(amount > 0)) {
+      setEditError('Сумма должна быть больше 0')
+      return
+    }
+    if (!editForm.cashbox_id) {
+      setEditError('Выберите кассу')
+      return
+    }
+    if (!editForm.date) {
+      setEditError('Укажите дату')
+      return
+    }
+
+    setSaving(true)
+    setEditError('')
+    try {
+      await api.updatePayment(editing.id, {
+        amount,
+        cashbox_id: editForm.cashbox_id,
+        date: editForm.date,
+        comment: editForm.comment || null,
+      })
+      setEditing(null)
+      setEditForm({ amount: '', cashbox_id: '', date: '', comment: '' })
+      setEditError('')
+      await load()
+      alert('Платеж обновлен')
+    } catch (e) {
+      setEditError(e.message || 'Не удалось обновить платеж')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <div className="page">
@@ -51,10 +124,100 @@ export default function Payments() {
                 <span>{formatDate(payment.date)}</span>
                 <strong>{fmt(payment.amount)}</strong>
               </div>
+              <div className="record-meta">
+                <span>Касса</span>
+                <strong>{payment.account_name || '—'}</strong>
+              </div>
               {payment.comment && <div className="record-note">{payment.comment}</div>}
+              <div className="td-actions" style={{ marginTop: 12 }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => openEdit(payment)}>Редактировать</button>
+              </div>
             </div>
           ))}
         </div>
+      )}
+
+      {editing && (
+        <Modal
+          title="Редактировать платеж"
+          onClose={closeEdit}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={closeEdit} disabled={saving}>Отмена</button>
+              <button className="btn btn-primary" onClick={saveEdit} disabled={saving}>
+                {saving ? 'Сохранение...' : 'Сохранить'}
+              </button>
+            </>
+          }
+        >
+          {editError && <div className="alert alert-error">{editError}</div>}
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>Контрагент</span>
+            <strong>{paymentCounterparty(editing)}</strong>
+          </div>
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>Тип</span>
+            <strong>{paymentTypeLabel(editing)}</strong>
+          </div>
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>Текущая сумма</span>
+            <strong>{fmt(editing.amount)}</strong>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Касса <span className="required">*</span></label>
+            <select className="form-select" value={editForm.cashbox_id} onChange={e => setEditField('cashbox_id', e.target.value)}>
+              <option value="">— Выберите кассу —</option>
+              {accounts.map(account => (
+                <option key={account.id} value={String(account.id)}>
+                  {account.name} · {account.currency || 'USD'} · {fmt(account.balance)}
+                </option>
+              ))}
+            </select>
+            {selectedAccount && (
+              <div className="td-muted" style={{ fontSize: 12, marginTop: 6 }}>
+                Текущий остаток кассы: {fmt(selectedAccount.balance)}
+              </div>
+            )}
+          </div>
+
+          <div className="form-row">
+            <div className="form-group">
+              <label className="form-label">Новая сумма оплаты <span className="required">*</span></label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                className="form-input"
+                value={editForm.amount}
+                onChange={e => setEditField('amount', e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Дата <span className="required">*</span></label>
+              <input
+                type="date"
+                className="form-input"
+                value={editForm.date}
+                onChange={e => setEditField('date', e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Комментарий</label>
+            <textarea
+              className="form-textarea"
+              value={editForm.comment}
+              onChange={e => setEditField('comment', e.target.value)}
+              placeholder={isSupplierPayment ? 'Оплата поставщику' : 'Оплата клиента'}
+            />
+          </div>
+
+          <div className="alert alert-info">
+            Если платеж был распределен по нескольким документам, сейчас редактируется только выбранная строка платежа.
+          </div>
+        </Modal>
       )}
     </div>
   )

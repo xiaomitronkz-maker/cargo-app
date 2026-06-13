@@ -130,6 +130,10 @@ export default function Debts() {
   const [paymentForm, setPaymentForm] = useState(emptyPaymentForm())
   const [paymentError, setPaymentError] = useState('')
   const [paymentSaving, setPaymentSaving] = useState(false)
+  const [editPaymentTarget, setEditPaymentTarget] = useState(null)
+  const [editPaymentForm, setEditPaymentForm] = useState(emptyPaymentForm())
+  const [editPaymentError, setEditPaymentError] = useState('')
+  const [editPaymentSaving, setEditPaymentSaving] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -268,6 +272,72 @@ export default function Debts() {
       setPaymentError(e.message || 'Не удалось сохранить оплату')
     } finally {
       setPaymentSaving(false)
+    }
+  }
+
+  const openEditPayment = async (entry) => {
+    if (!entry?.payment_id) return
+    try {
+      const payments = normalizeArray(await api.getPayments())
+      const payment = payments.find(row => String(row.id) === String(entry.payment_id))
+      if (!payment) throw new Error('Платеж не найден')
+      setEditPaymentTarget(payment)
+      setEditPaymentForm({
+        account_id: payment.cashbox_id ? String(payment.cashbox_id) : '',
+        amount: String(payment.amount ?? entry.payment ?? ''),
+        date: payment.date ? String(payment.date).slice(0, 10) : (entry.date || todayIso()),
+        comment: payment.comment || entry.comment || '',
+      })
+      setEditPaymentError('')
+    } catch (e) {
+      alert(e.message || 'Не удалось открыть платеж')
+    }
+  }
+
+  const closeEditPayment = () => {
+    if (editPaymentSaving) return
+    setEditPaymentTarget(null)
+    setEditPaymentForm(emptyPaymentForm())
+    setEditPaymentError('')
+  }
+
+  const setEditPaymentField = (key, value) => {
+    setEditPaymentForm(form => ({ ...form, [key]: value }))
+  }
+
+  const submitEditPayment = async () => {
+    if (!editPaymentTarget) return
+    const amount = roundMoney(editPaymentForm.amount)
+    if (!editPaymentForm.account_id) {
+      setEditPaymentError('Выберите кассу')
+      return
+    }
+    if (!(amount > 0)) {
+      setEditPaymentError('Сумма должна быть больше 0')
+      return
+    }
+    if (!editPaymentForm.date) {
+      setEditPaymentError('Укажите дату')
+      return
+    }
+
+    setEditPaymentSaving(true)
+    setEditPaymentError('')
+    try {
+      await api.updatePayment(editPaymentTarget.id, {
+        amount,
+        cashbox_id: editPaymentForm.account_id,
+        date: editPaymentForm.date,
+        comment: editPaymentForm.comment || null,
+      })
+      setEditPaymentTarget(null)
+      setEditPaymentForm(emptyPaymentForm())
+      await refreshAfterPayment()
+      alert('Платеж обновлен')
+    } catch (e) {
+      setEditPaymentError(e.message || 'Не удалось обновить платеж')
+    } finally {
+      setEditPaymentSaving(false)
     }
   }
 
@@ -454,12 +524,13 @@ export default function Debts() {
                   <th>Оплата</th>
                   <th>Остаток после операции</th>
                   <th>Комментарий</th>
+                  <th>Действия</th>
                 </tr>
               </thead>
               <tbody>
                 {normalizeArray(selected.entries).length === 0 ? (
                   <tr>
-                    <td colSpan={6}>
+                    <td colSpan={7}>
                       <div className="empty-state"><p>Истории нет</p></div>
                     </td>
                   </tr>
@@ -478,6 +549,13 @@ export default function Debts() {
                       </span>
                     </td>
                     <td className="td-muted">{entry.comment || '—'}</td>
+                    <td>
+                      {entry.kind === 'payment' && entry.payment_id ? (
+                        <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)}>
+                          Редактировать
+                        </button>
+                      ) : '—'}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -599,6 +677,84 @@ export default function Debts() {
                 ))}
               </tbody>
             </table>
+          </div>
+        </Modal>
+      )}
+
+      {editPaymentTarget && (
+        <Modal
+          title="Редактировать платеж"
+          onClose={closeEditPayment}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={closeEditPayment} disabled={editPaymentSaving}>Отмена</button>
+              <button className="btn btn-primary" onClick={submitEditPayment} disabled={editPaymentSaving}>
+                {editPaymentSaving ? 'Сохранение...' : 'Сохранить'}
+              </button>
+            </>
+          }
+        >
+          {editPaymentError && <div className="alert alert-error">{editPaymentError}</div>}
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>Контрагент</span>
+            <strong>{selected?.counterparty_name || editPaymentTarget.client_name || editPaymentTarget.supplier_name || '—'}</strong>
+          </div>
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>Тип</span>
+            <strong>{editPaymentTarget.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'}</strong>
+          </div>
+          <div className="record-meta" style={{ marginBottom: 14 }}>
+            <span>Текущая сумма</span>
+            <strong>{fmt(editPaymentTarget.amount)}</strong>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Касса</label>
+            <select className="form-select" value={editPaymentForm.account_id} onChange={e => setEditPaymentField('account_id', e.target.value)}>
+              <option value="">— Выберите кассу —</option>
+              {accounts.map(account => (
+                <option key={account.id} value={String(account.id)}>
+                  {account.name} · {account.currency || 'USD'} · {fmt(account.balance)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="form-row">
+            <div className="form-group">
+              <label className="form-label">Новая сумма оплаты</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                className="form-input"
+                value={editPaymentForm.amount}
+                onChange={e => setEditPaymentField('amount', e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Дата</label>
+              <input
+                type="date"
+                className="form-input"
+                value={editPaymentForm.date}
+                onChange={e => setEditPaymentField('date', e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Комментарий</label>
+            <textarea
+              className="form-textarea"
+              value={editPaymentForm.comment}
+              onChange={e => setEditPaymentField('comment', e.target.value)}
+              placeholder={editPaymentTarget.entity_type === 'purchase' ? 'Оплата поставщику' : 'Оплата клиента'}
+            />
+          </div>
+
+          <div className="alert alert-info">
+            Если платеж был распределен по нескольким документам, сейчас редактируется только выбранная строка платежа.
           </div>
         </Modal>
       )}

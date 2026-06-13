@@ -105,6 +105,7 @@ const api = {
   payReceipt: (id, data) => api.put(`/receipts/${id}/pay`, data),
   payPurchase: (id, data) => api.put(`/purchases/${id}/pay`, data),
   getPayments: () => api.get('/payments'),
+  updatePayment: (id, data) => api.put(`/payments/${id}`, data),
   getOperationLogs: (params) => api.get('/operation-logs', { params }),
   getLedger: (params) => api.get('/ledger', { params }),
   getReconciliationAct: (params) => api.get('/reconciliation-act', { params }),

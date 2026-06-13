@@ -1769,6 +1769,91 @@ async function createClientAdvancePayment(clientId, { amount, accountToId, date,
   };
 }
 
+async function getPaymentTransaction(payment, client = pool) {
+  if (payment.transaction_id) {
+    const byId = await get('SELECT * FROM transactions WHERE id=$1', [+payment.transaction_id], client);
+    if (byId) return byId;
+  }
+  const relatedTypes = payment.entity_type === 'client_advance' ? ['client_advance', 'payment'] : ['payment'];
+  return get(`
+    SELECT *
+    FROM transactions
+    WHERE related_id=$1 AND related_type = ANY($2::text[])
+    ORDER BY id DESC
+    LIMIT 1
+  `, [+payment.id, relatedTypes], client);
+}
+
+async function validatePaymentCashEdit({ direction, oldAccountId, oldAmount, newAccountId, newAmount }, client = pool) {
+  const deltas = new Map();
+  const addDelta = (accountId, delta) => {
+    if (!accountId) return;
+    const key = String(accountId);
+    deltas.set(key, (deltas.get(key) || 0) + delta);
+  };
+
+  if (direction === 'in') {
+    addDelta(oldAccountId, -oldAmount);
+    addDelta(newAccountId, newAmount);
+  } else {
+    addDelta(oldAccountId, oldAmount);
+    addDelta(newAccountId, -newAmount);
+  }
+
+  for (const [accountId, delta] of deltas.entries()) {
+    const currentBalance = await getAccountBalance(+accountId, client);
+    if (currentBalance + delta < -0.009) {
+      throw new Error('Недостаточно средств в кассе');
+    }
+  }
+}
+
+async function getReceiptPaidAmountExcluding(receiptId, paymentId, client = pool) {
+  const row = await get(`
+    SELECT COALESCE(SUM(x.amount),0) AS total
+    FROM (
+      SELECT DISTINCT p.id, p.amount::numeric AS amount
+      FROM payments p
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
+      WHERE COALESCE(t.receipt_id, pu.receipt_id)=$1
+        AND p.id<>$2
+    ) x
+  `, [receiptId, paymentId], client);
+  return +(row?.total || 0);
+}
+
+async function rebalancePaymentDocument(payment, client = pool) {
+  if (payment.entity_type === 'purchase') {
+    const purchase = await get('SELECT id,receipt_id FROM purchases WHERE id=$1', [+payment.entity_id], client);
+    if (purchase?.receipt_id) {
+      await rebalanceReceiptPurchasePaidAmounts(+purchase.receipt_id, client);
+    } else if (purchase) {
+      const paid = +(await get(`
+        SELECT COALESCE(SUM(amount::numeric),0) AS total
+        FROM payments
+        WHERE entity_type='purchase' AND entity_id=$1
+      `, [+purchase.id], client))?.total || 0;
+      await query('UPDATE purchases SET paid_amount=$1 WHERE id=$2', [paid, +purchase.id], client);
+    }
+    return;
+  }
+
+  if (payment.entity_type === 'sale') {
+    const sale = await get('SELECT id,sales_document_id,total_amount FROM sales WHERE id=$1', [+payment.entity_id], client);
+    if (sale?.sales_document_id) {
+      await rebalanceSalesDocumentPaidAmounts(+sale.sales_document_id, client);
+    } else if (sale) {
+      const paid = +(await get(`
+        SELECT COALESCE(SUM(amount::numeric),0) AS total
+        FROM payments
+        WHERE entity_type='sale' AND entity_id=$1
+      `, [+sale.id], client))?.total || 0;
+      await query('UPDATE sales SET paid_amount=$1 WHERE id=$2', [Math.min(+(sale.total_amount || 0), paid), +sale.id], client);
+    }
+  }
+}
+
 async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
   const rows = await all(`
     WITH receipt_totals AS (
@@ -2239,6 +2324,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
         kind: entry.kind,
         document_type: entry.document_type || null,
         document_id: entry.document_id,
+        payment_id: entry.kind === 'payment' ? entry.source_id : null,
         description: entry.description,
         charge: ledgerNumber(entry.charge),
         payment: ledgerNumber(entry.payment),
@@ -4789,9 +4875,11 @@ app.get('/api/payments', async (req, res) => {
       p.comment,
       p.transaction_id,
       t.type,
+      COALESCE(t.account_to_id, t.account_from_id) AS cashbox_id,
       a.name AS account_name,
       p.created_at,
       c.name AS client_name,
+      su.name AS supplier_name,
       pr.name AS product_name
     FROM payments p
     LEFT JOIN transactions t ON t.id = p.transaction_id
@@ -4800,9 +4888,203 @@ app.get('/api/payments', async (req, res) => {
     LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
     LEFT JOIN clients ca ON p.entity_type='client_advance' AND ca.id = p.entity_id
     LEFT JOIN clients c ON c.id = COALESCE(s.client_id, pu.client_id, ca.id)
+    LEFT JOIN suppliers su ON su.id = pu.supplier_id
     LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, pu.product_id)
     ORDER BY p.date DESC, p.created_at DESC
   `));
+});
+
+app.put('/api/payments/:id', async (req, res) => {
+  const paymentId = +req.params.id;
+  const amount = ledgerNumber(req.body.amount);
+  const cashboxId = +(req.body.cashbox_id || req.body.account_id || req.body.account_to_id || req.body.account_from_id);
+  const date = req.body.date || null;
+  const comment = req.body.comment || null;
+
+  if (!paymentId) return validationError(res, 'Платеж не найден', { payment_id: req.params.id });
+  if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { payment_id: paymentId, amount });
+  if (!cashboxId) return validationError(res, 'Касса обязательна', { payment_id: paymentId, cashbox_id: cashboxId });
+  if (!date) return validationError(res, 'Дата обязательна', { payment_id: paymentId, date });
+
+  try {
+    const result = await withTx(async (client) => {
+      const payment = await get('SELECT * FROM payments WHERE id=$1 FOR UPDATE', [paymentId], client);
+      if (!payment) {
+        const error = new Error('Платеж не найден');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const oldAmount = ledgerNumber(payment.amount);
+      const transaction = await getPaymentTransaction(payment, client);
+      const direction = payment.entity_type === 'purchase' ? 'out' : 'in';
+      const oldCashboxId = direction === 'out' ? +(transaction?.account_from_id || 0) : +(transaction?.account_to_id || 0);
+      let transactionType = direction === 'out' ? 'expense' : 'income';
+      let receiptId = transaction?.receipt_id ? +transaction.receipt_id : null;
+      let saleId = transaction?.sale_id ? +transaction.sale_id : null;
+      let entityLabel = `Платеж №${paymentId}`;
+      let description = 'Изменён платеж';
+      let logEntityType = 'payment';
+      let logEntityId = paymentId;
+      let counterpartyName = '';
+
+      if (payment.entity_type === 'purchase') {
+        const purchase = await get(`
+          SELECT p.*, r.id AS receipt_id, COALESCE(r.supplier_id, p.supplier_id) AS effective_supplier_id, s.name AS supplier_name
+          FROM purchases p
+          LEFT JOIN receipts r ON r.id = p.receipt_id
+          LEFT JOIN suppliers s ON s.id = COALESCE(r.supplier_id, p.supplier_id)
+          WHERE p.id=$1
+        `, [+payment.entity_id], client);
+        if (!purchase) throw new Error('Приход для платежа не найден');
+        receiptId = receiptId || (purchase.receipt_id ? +purchase.receipt_id : null);
+        counterpartyName = purchase.supplier_name || 'Поставщик';
+        entityLabel = receiptId ? `Приход №${receiptId}` : `Приход №${payment.entity_id}`;
+        description = `Изменён платеж поставщику ${counterpartyName}`;
+        logEntityType = receiptId ? 'receipt' : 'purchase';
+        logEntityId = receiptId || +payment.entity_id;
+
+        let availableDebt = 0;
+        if (receiptId) {
+          const totalRow = await get('SELECT COALESCE(SUM(total_cost::numeric),0) AS total FROM purchases WHERE receipt_id=$1', [receiptId], client);
+          const paidExcluding = await getReceiptPaidAmountExcluding(receiptId, paymentId, client);
+          availableDebt = ledgerNumber(+(totalRow?.total || 0) - paidExcluding);
+        } else {
+          const paidExcluding = +(await get(`
+            SELECT COALESCE(SUM(amount::numeric),0) AS total
+            FROM payments
+            WHERE entity_type='purchase' AND entity_id=$1 AND id<>$2
+          `, [+payment.entity_id, paymentId], client))?.total || 0;
+          availableDebt = ledgerNumber(+(purchase.total_cost || 0) - paidExcluding);
+        }
+        if (amount > availableDebt + 0.009) throw new Error('Сумма оплаты превышает доступный долг поставщика');
+      } else if (payment.entity_type === 'sale') {
+        const sale = await get(`
+          SELECT s.*, COALESCE(sd.client_id, s.client_id) AS effective_client_id, c.name AS client_name
+          FROM sales s
+          LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+          LEFT JOIN clients c ON c.id = COALESCE(sd.client_id, s.client_id)
+          WHERE s.id=$1
+        `, [+payment.entity_id], client);
+        if (!sale) throw new Error('Реализация для платежа не найдена');
+        saleId = +payment.entity_id;
+        counterpartyName = sale.client_name || 'Клиент';
+        entityLabel = sale.sales_document_id ? `Реализация №${sale.sales_document_id}` : `Реализация №${sale.id}`;
+        description = `Изменён платеж клиента ${counterpartyName}`;
+        logEntityType = sale.sales_document_id ? 'sales_document' : 'sale';
+        logEntityId = sale.sales_document_id ? +sale.sales_document_id : +sale.id;
+      } else if (payment.entity_type === 'client_advance') {
+        const customer = await get('SELECT id,name FROM clients WHERE id=$1', [+payment.entity_id], client);
+        if (!customer) throw new Error('Клиент для аванса не найден');
+        counterpartyName = customer.name || 'Клиент';
+        entityLabel = counterpartyName;
+        description = `Изменён аванс клиента ${counterpartyName}`;
+        logEntityType = 'client';
+        logEntityId = +payment.entity_id;
+      } else {
+        throw new Error('Неподдерживаемый тип платежа');
+      }
+
+      await validatePaymentCashEdit({
+        direction,
+        oldAccountId: oldCashboxId || null,
+        oldAmount: transaction ? oldAmount : 0,
+        newAccountId: cashboxId,
+        newAmount: amount,
+      }, client);
+
+      await query('UPDATE payments SET amount=$1,date=$2,comment=$3 WHERE id=$4', [amount, date, comment, paymentId], client);
+
+      if (transaction) {
+        await query(`
+          UPDATE transactions
+          SET type=$1,
+              amount=$2,
+              account_from_id=$3,
+              account_to_id=$4,
+              receipt_id=$5,
+              sale_id=$6,
+              date=$7,
+              comment=$8,
+              related_type=$9,
+              related_id=$10
+          WHERE id=$11
+        `, [
+          transactionType,
+          amount,
+          direction === 'out' ? cashboxId : null,
+          direction === 'in' ? cashboxId : null,
+          direction === 'out' ? receiptId : null,
+          payment.entity_type === 'sale' ? saleId : null,
+          date,
+          comment,
+          payment.entity_type === 'client_advance' ? 'client_advance' : 'payment',
+          paymentId,
+          transaction.id,
+        ], client);
+        if (!payment.transaction_id) {
+          await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, paymentId], client);
+        }
+      } else {
+        const created = await get(`
+          INSERT INTO transactions(type,amount,account_from_id,account_to_id,receipt_id,sale_id,date,comment,related_type,related_id)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          RETURNING id
+        `, [
+          transactionType,
+          amount,
+          direction === 'out' ? cashboxId : null,
+          direction === 'in' ? cashboxId : null,
+          direction === 'out' ? receiptId : null,
+          payment.entity_type === 'sale' ? saleId : null,
+          date,
+          comment,
+          payment.entity_type === 'client_advance' ? 'client_advance' : 'payment',
+          paymentId,
+        ], client);
+        await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [created.id, paymentId], client);
+      }
+
+      await rebalancePaymentDocument({ ...payment, amount }, client);
+
+      await logOperation(client, {
+        action: 'payment_updated',
+        entity_type: logEntityType,
+        entity_id: logEntityId,
+        entity_label: entityLabel,
+        amount,
+        currency: 'USD',
+        description,
+        meta: {
+          old_amount: oldAmount,
+          new_amount: amount,
+          old_cashbox_id: oldCashboxId || null,
+          new_cashbox_id: cashboxId,
+          old_date: payment.date,
+          new_date: date,
+          old_comment: payment.comment || null,
+          new_comment: comment,
+          entity_type: payment.entity_type,
+          entity_id: +payment.entity_id,
+          payment_id: paymentId,
+        },
+      });
+
+      return {
+        id: paymentId,
+        entity_type: payment.entity_type,
+        entity_id: +payment.entity_id,
+        amount,
+        cashbox_id: cashboxId,
+        date,
+        comment,
+      };
+    });
+
+    res.json({ success: true, payment: result });
+  } catch (e) {
+    res.status(e.statusCode || 400).json({ error: e.message });
+  }
 });
 
 // Ledger
