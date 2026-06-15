@@ -21,6 +21,7 @@ const NAV = [
     { path: '/finance', icon: '▦', label: 'Финансы' },
     { path: '/accounts', icon: '💰', label: 'Кассы' },
     { path: '/transactions', icon: '⇄', label: 'Движение' },
+    { path: '/expenses', icon: '−', label: 'Расходы' },
     { path: '/money-assets', icon: '◇', label: 'Активы' },
     { path: '/liabilities', icon: '◆', label: 'Обязательства' },
     { path: '/debts', icon: '◌', label: 'Долги' },

@@ -5245,6 +5245,85 @@ app.get('/api/transactions', async (req, res) => {
   `));
 });
 
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const params = [];
+    const where = ["t.type='expense'", "COALESCE(t.related_type,'')='manual'"];
+    const dateFrom = req.query.date_from || null;
+    const dateTo = req.query.date_to || null;
+    const cashboxId = req.query.cashbox_id ? +req.query.cashbox_id : null;
+    const search = String(req.query.search || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    if (dateFrom) {
+      if (!isDateParam(dateFrom)) return res.status(400).json({ error: 'date_from должен быть в формате YYYY-MM-DD' });
+      params.push(dateFrom);
+      where.push(`t.date >= $${params.length}::date`);
+    }
+    if (dateTo) {
+      if (!isDateParam(dateTo)) return res.status(400).json({ error: 'date_to должен быть в формате YYYY-MM-DD' });
+      params.push(dateTo);
+      where.push(`t.date <= $${params.length}::date`);
+    }
+    if (cashboxId) {
+      params.push(cashboxId);
+      where.push(`t.account_from_id = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      where.push(`(COALESCE(t.comment,'') ILIKE $${params.length} OR COALESCE(a.name,'') ILIKE $${params.length})`);
+    }
+
+    const whereSql = where.join(' AND ');
+    const summary = await get(`
+      SELECT
+        COUNT(*)::int AS count,
+        COALESCE(SUM(t.amount::numeric),0) AS total_amount
+      FROM transactions t
+      LEFT JOIN accounts a ON a.id = t.account_from_id
+      WHERE ${whereSql}
+    `, params);
+
+    const items = await all(`
+      SELECT
+        t.id,
+        t.date::text AS date,
+        t.created_at::text AS created_at,
+        t.account_from_id AS cashbox_id,
+        a.name AS cashbox_name,
+        t.amount::numeric AS amount,
+        t.comment,
+        COALESCE(NULLIF(t.comment,''), 'Расход бизнеса') AS description,
+        t.type
+      FROM transactions t
+      LEFT JOIN accounts a ON a.id = t.account_from_id
+      WHERE ${whereSql}
+      ORDER BY t.date DESC, t.id DESC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
+    `, [...params, limit, offset]);
+
+    res.json({
+      items: items.map((item) => ({
+        ...item,
+        id: +item.id,
+        cashbox_id: item.cashbox_id == null ? null : +item.cashbox_id,
+        amount: +(item.amount || 0),
+      })),
+      summary: {
+        total_amount: +(summary?.total_amount || 0),
+        count: +(summary?.count || 0),
+      },
+      total: +(summary?.count || 0),
+      limit,
+      offset,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/transactions', async (req, res) => {
   const { type, amount, date, comment, related_type, related_id } = req.body;
   const accountFromId = req.body.account_from_id || req.body.from_account_id || ((type === 'expense' || type === 'withdraw') ? req.body.account_id : null);

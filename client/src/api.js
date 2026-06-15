@@ -114,6 +114,7 @@ const api = {
   getAccounts: () => api.get('/accounts'),
   createAccount: (data) => api.post('/accounts', data),
   getTransactions: () => api.get('/transactions'),
+  getExpenses: (params) => api.get('/expenses', { params }),
   createTransaction: (data) => api.post('/transactions', data),
   createManualTransaction: (data) => api.post('/transactions/manual', data),
   getAudit: () => api.get('/audit'),

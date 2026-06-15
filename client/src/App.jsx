@@ -16,6 +16,7 @@ import Payments from './pages/Payments'
 import Finance from './pages/Finance'
 import Accounts from './pages/Accounts'
 import Transactions from './pages/Transactions'
+import Expenses from './pages/Expenses'
 import Ledger from './pages/Ledger'
 import Audit from './pages/Audit'
 import OperationLogs from './pages/OperationLogs'
@@ -44,6 +45,7 @@ export default function App() {
           <Route path="finance" element={<Finance />} />
           <Route path="accounts" element={<Accounts />} />
           <Route path="transactions" element={<Transactions />} />
+          <Route path="expenses" element={<Expenses />} />
           <Route path="ledger" element={<Ledger />} />
           <Route path="audit" element={<Audit />} />
           <Route path="operation-logs" element={<OperationLogs />} />
