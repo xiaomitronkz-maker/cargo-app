@@ -2512,6 +2512,15 @@ function isDateParam(value) {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
+function isStrictIsoDate(value) {
+  if (!isDateParam(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+}
+
 async function reconciliationActData({ type, id, date_from, date_to }, client = pool) {
   const counterpartyId = +id;
   if (!['customer', 'supplier'].includes(type) || !counterpartyId) {
@@ -4606,15 +4615,24 @@ app.post('/api/debts/pay', async (req, res) => {
   const entityId = +req.body.entity_id;
   const cashboxId = +req.body.cashbox_id;
   const amount = ledgerNumber(req.body.amount);
-  const date = req.body.date || new Date().toISOString().slice(0, 10);
+  const date = String(req.body.date || new Date().toISOString().slice(0, 10)).trim();
   const comment = req.body.comment || null;
 
   if (!['supplier', 'client'].includes(entityType)) return validationError(res, 'Тип контрагента должен быть supplier или client', { entity_type: rawEntityType });
-  if (!entityId) return validationError(res, 'Контрагент обязателен', { entity_type: entityType, entity_id: entityId });
-  if (!cashboxId) return validationError(res, 'Касса обязательна', { entity_type: entityType, entity_id: entityId, cashbox_id: cashboxId });
+  if (!Number.isInteger(entityId) || entityId <= 0) return validationError(res, 'Контрагент обязателен', { entity_type: entityType, entity_id: req.body.entity_id });
+  if (!Number.isInteger(cashboxId) || cashboxId <= 0) return validationError(res, 'Касса обязательна', { entity_type: entityType, entity_id: entityId, cashbox_id: req.body.cashbox_id });
   if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { entity_type: entityType, entity_id: entityId, amount });
+  if (!isStrictIsoDate(date)) return validationError(res, 'Дата должна быть существующей датой в формате YYYY-MM-DD', { entity_type: entityType, entity_id: entityId, date });
 
   try {
+    const cashbox = await get('SELECT id FROM accounts WHERE id=$1', [cashboxId]);
+    if (!cashbox) return validationError(res, 'Касса не найдена', { entity_type: entityType, entity_id: entityId, cashbox_id: cashboxId });
+
+    if (entityType === 'supplier') {
+      const supplier = await get('SELECT id FROM suppliers WHERE id=$1', [entityId]);
+      if (!supplier) return res.status(404).json({ error: 'Поставщик не найден' });
+    }
+
     const documents = entityType === 'supplier'
       ? await getSupplierOpenDebtDocuments(entityId)
       : await getClientOpenDebtDocuments(entityId);
@@ -4629,11 +4647,12 @@ app.post('/api/debts/pay', async (req, res) => {
         total_debt: totalDebt,
       });
     }
-    if (entityType === 'supplier' && await getAccountBalance(cashboxId) < amount) {
-      return validationError(res, 'Недостаточно средств в кассе', { entity_type: entityType, entity_id: entityId, amount, cashbox_id: cashboxId });
-    }
 
     const result = await withTx(async (client) => {
+      if (entityType === 'supplier' && await getAccountBalance(cashboxId, client) < amount) {
+        throw new Error('Недостаточно средств в кассе');
+      }
+
       let remainingPayment = amount;
       const allocations = [];
 
