@@ -1464,7 +1464,7 @@ async function rebalanceReceiptPurchasePaidAmounts(receiptId, client = pool) {
   }
 }
 
-async function payReceiptDocument(receiptId, { amount, accountFromId, date, comment, debtPaymentGroupId = null }, client = pool) {
+async function payReceiptDocument(receiptId, { amount, accountFromId, date, comment, debtPaymentGroupId = null, skipOperationLog = false }, client = pool) {
   const paymentAmount = ledgerNumber(amount);
   const receipt = await get(`
     SELECT r.*, COALESCE(SUM(p.total_cost::numeric),0) AS total_cost, MIN(p.id) AS anchor_purchase_id
@@ -1489,16 +1489,18 @@ async function payReceiptDocument(receiptId, { amount, accountFromId, date, comm
   `, ['expense', paymentAmount, accountFromId, receiptId, date, comment, 'payment', payment.id], client);
   await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
   await rebalanceReceiptPurchasePaidAmounts(receiptId, client);
-  await logOperation(client, {
-    action: 'supplier_payment',
-    entity_type: 'receipt',
-    entity_id: receiptId,
-    entity_label: `Приход №${receiptId}`,
-    amount: paymentAmount,
-    currency: 'USD',
-    description: 'Оплата поставщику',
-    meta: { payment_id: payment.id, transaction_id: transaction.id, account_from_id: accountFromId, comment },
-  });
+  if (!skipOperationLog) {
+    await logOperation(client, {
+      action: 'supplier_payment',
+      entity_type: 'receipt',
+      entity_id: receiptId,
+      entity_label: `Приход №${receiptId}`,
+      amount: paymentAmount,
+      currency: 'USD',
+      description: 'Оплата поставщику',
+      meta: { payment_id: payment.id, transaction_id: transaction.id, account_from_id: accountFromId, comment },
+    });
+  }
 
   const newPaid = await getReceiptPaidAmount(receiptId, client);
   return {
@@ -1568,7 +1570,7 @@ async function createLegacySalesForDocument({ date, clientId, markingId, items, 
   return saleIds;
 }
 
-async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId, date, comment, debtPaymentGroupId = null }, client = pool) {
+async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId, date, comment, debtPaymentGroupId = null, skipOperationLog = false }, client = pool) {
   const anchorSale = await get('SELECT * FROM sales WHERE id=$1', [anchorSaleId], client);
   if (!anchorSale) throw new Error('Продажа не найдена');
   if (!anchorSale.sales_document_id) throw new Error('Продажа не привязана к документу');
@@ -1587,16 +1589,18 @@ async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId,
   `, ['income', amount, accountToId, anchorSaleId, date, comment, 'payment', payment.id], client);
   await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
   await rebalanceSalesDocumentPaidAmounts(+anchorSale.sales_document_id, client);
-  await logOperation(client, {
-    action: 'client_payment',
-    entity_type: 'sales_document',
-    entity_id: +anchorSale.sales_document_id,
-    entity_label: `Реализация №${anchorSale.sales_document_id}`,
-    amount,
-    currency: 'USD',
-    description: 'Оплата клиента',
-    meta: { anchor_sale_id: anchorSaleId, payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
-  });
+  if (!skipOperationLog) {
+    await logOperation(client, {
+      action: 'client_payment',
+      entity_type: 'sales_document',
+      entity_id: +anchorSale.sales_document_id,
+      entity_label: `Реализация №${anchorSale.sales_document_id}`,
+      amount,
+      currency: 'USD',
+      description: 'Оплата клиента',
+      meta: { anchor_sale_id: anchorSaleId, payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
+    });
+  }
 
   const newPaid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
   return {
@@ -1606,11 +1610,11 @@ async function paySalesDocumentByAnchorSale(anchorSaleId, { amount, accountToId,
   };
 }
 
-async function payLegacySaleDocument(saleId, { amount, accountToId, date, comment, debtPaymentGroupId = null }, client = pool) {
+async function payLegacySaleDocument(saleId, { amount, accountToId, date, comment, debtPaymentGroupId = null, skipOperationLog = false }, client = pool) {
   const paymentAmount = ledgerNumber(amount);
   const sale = await get('SELECT * FROM sales WHERE id=$1', [saleId], client);
   if (!sale) throw new Error('Продажа не найдена');
-  if (sale.sales_document_id) return paySalesDocumentByAnchorSale(saleId, { amount: paymentAmount, accountToId, date, comment }, client);
+  if (sale.sales_document_id) return paySalesDocumentByAnchorSale(saleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId, skipOperationLog }, client);
 
   const totalAmount = +(sale.total_amount || 0);
   const paidAmount = +(sale.paid_amount || 0);
@@ -1625,16 +1629,18 @@ async function payLegacySaleDocument(saleId, { amount, accountToId, date, commen
   `, ['income', paymentAmount, accountToId, saleId, date, comment, 'payment', payment.id], client);
   await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
   await query('UPDATE sales SET paid_amount = COALESCE(paid_amount,0) + $1 WHERE id=$2', [paymentAmount, saleId], client);
-  await logOperation(client, {
-    action: 'client_payment',
-    entity_type: 'sale',
-    entity_id: saleId,
-    entity_label: `Реализация №${saleId}`,
-    amount: paymentAmount,
-    currency: 'USD',
-    description: 'Оплата клиента',
-    meta: { payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
-  });
+  if (!skipOperationLog) {
+    await logOperation(client, {
+      action: 'client_payment',
+      entity_type: 'sale',
+      entity_id: saleId,
+      entity_label: `Реализация №${saleId}`,
+      amount: paymentAmount,
+      currency: 'USD',
+      description: 'Оплата клиента',
+      meta: { payment_id: payment.id, transaction_id: transaction.id, account_to_id: accountToId, comment },
+    });
+  }
 
   const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [saleId], client);
   return {
@@ -1646,7 +1652,7 @@ async function payLegacySaleDocument(saleId, { amount, accountToId, date, commen
   };
 }
 
-async function paySalesDocumentAllowClientAdvance(anchorSaleId, { amount, accountToId, date, comment, debtPaymentGroupId = null }, client = pool) {
+async function paySalesDocumentAllowClientAdvance(anchorSaleId, { amount, accountToId, date, comment, debtPaymentGroupId = null, skipOperationLog = false }, client = pool) {
   const paymentAmount = ledgerNumber(amount);
   const anchorSale = await get(`
     SELECT s.*, COALESCE(sd.client_id, s.client_id) AS effective_client_id
@@ -1661,12 +1667,12 @@ async function paySalesDocumentAllowClientAdvance(anchorSaleId, { amount, accoun
   const paid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
   const remaining = ledgerNumber(totalAmount - paid);
   if (paymentAmount <= remaining + 0.009) {
-    return paySalesDocumentByAnchorSale(anchorSaleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId }, client);
+    return paySalesDocumentByAnchorSale(anchorSaleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId, skipOperationLog }, client);
   }
 
   let applied = null;
   if (remaining > 0.009) {
-    applied = await paySalesDocumentByAnchorSale(anchorSaleId, { amount: remaining, accountToId, date, comment, debtPaymentGroupId }, client);
+    applied = await paySalesDocumentByAnchorSale(anchorSaleId, { amount: remaining, accountToId, date, comment, debtPaymentGroupId, skipOperationLog }, client);
   }
   const advance = await createClientAdvancePayment(+anchorSale.effective_client_id, {
     amount: ledgerNumber(paymentAmount - Math.max(0, remaining)),
@@ -1676,6 +1682,7 @@ async function paySalesDocumentAllowClientAdvance(anchorSaleId, { amount, accoun
     debtBefore: remaining,
     paymentAmount,
     debtPaymentGroupId,
+    skipOperationLog,
   }, client);
   const newPaid = await getSalesDocumentPaidAmount(+anchorSale.sales_document_id, client);
 
@@ -1688,22 +1695,22 @@ async function paySalesDocumentAllowClientAdvance(anchorSaleId, { amount, accoun
   };
 }
 
-async function payLegacySaleAllowClientAdvance(saleId, { amount, accountToId, date, comment, debtPaymentGroupId = null }, client = pool) {
+async function payLegacySaleAllowClientAdvance(saleId, { amount, accountToId, date, comment, debtPaymentGroupId = null, skipOperationLog = false }, client = pool) {
   const paymentAmount = ledgerNumber(amount);
   const sale = await get('SELECT * FROM sales WHERE id=$1', [saleId], client);
   if (!sale) throw new Error('Продажа не найдена');
-  if (sale.sales_document_id) return paySalesDocumentAllowClientAdvance(saleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId }, client);
+  if (sale.sales_document_id) return paySalesDocumentAllowClientAdvance(saleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId, skipOperationLog }, client);
 
   const totalAmount = +(sale.total_amount || 0);
   const paidAmount = +(sale.paid_amount || 0);
   const remaining = ledgerNumber(totalAmount - paidAmount);
   if (paymentAmount <= remaining + 0.009) {
-    return payLegacySaleDocument(saleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId }, client);
+    return payLegacySaleDocument(saleId, { amount: paymentAmount, accountToId, date, comment, debtPaymentGroupId, skipOperationLog }, client);
   }
 
   let applied = null;
   if (remaining > 0.009) {
-    applied = await payLegacySaleDocument(saleId, { amount: remaining, accountToId, date, comment, debtPaymentGroupId }, client);
+    applied = await payLegacySaleDocument(saleId, { amount: remaining, accountToId, date, comment, debtPaymentGroupId, skipOperationLog }, client);
   }
   const advance = await createClientAdvancePayment(+sale.client_id, {
     amount: ledgerNumber(paymentAmount - Math.max(0, remaining)),
@@ -1713,6 +1720,7 @@ async function payLegacySaleAllowClientAdvance(saleId, { amount, accountToId, da
     debtBefore: remaining,
     paymentAmount,
     debtPaymentGroupId,
+    skipOperationLog,
   }, client);
 
   const updated = await get('SELECT paid_amount,total_amount FROM sales WHERE id=$1', [saleId], client);
@@ -1725,7 +1733,7 @@ async function payLegacySaleAllowClientAdvance(saleId, { amount, accountToId, da
   };
 }
 
-async function createClientAdvancePayment(clientId, { amount, accountToId, date, comment, debtBefore = null, paymentAmount = null, debtPaymentGroupId = null }, client = pool) {
+async function createClientAdvancePayment(clientId, { amount, accountToId, date, comment, debtBefore = null, paymentAmount = null, debtPaymentGroupId = null, skipOperationLog = false }, client = pool) {
   const advanceAmount = ledgerNumber(amount);
   if (!(advanceAmount > 0)) return null;
   const customer = await get('SELECT id,name FROM clients WHERE id=$1', [clientId], client);
@@ -1749,25 +1757,27 @@ async function createClientAdvancePayment(clientId, { amount, accountToId, date,
     ? advanceAmount
     : ledgerNumber(Math.max(0, +(paymentAmount || advanceAmount) - Math.max(0, +debtBefore || 0)));
 
-  await logOperation(client, {
-    action: 'client_payment',
-    entity_type: 'client',
-    entity_id: clientId,
-    entity_label: customer.name || `Клиент №${clientId}`,
-    amount: advanceAmount,
-    currency: 'USD',
-    description: 'Аванс клиента',
-    meta: {
-      payment_id: payment.id,
-      transaction_id: transaction.id,
-      account_to_id: accountToId,
-      comment,
-      debt_before: debtBefore,
-      payment_amount: paymentAmount == null ? advanceAmount : paymentAmount,
-      overpayment_amount: overpaymentAmount,
-      advance_after: advanceAfter,
-    },
-  });
+  if (!skipOperationLog) {
+    await logOperation(client, {
+      action: 'client_payment',
+      entity_type: 'client',
+      entity_id: clientId,
+      entity_label: customer.name || `Клиент №${clientId}`,
+      amount: advanceAmount,
+      currency: 'USD',
+      description: 'Аванс клиента',
+      meta: {
+        payment_id: payment.id,
+        transaction_id: transaction.id,
+        account_to_id: accountToId,
+        comment,
+        debt_before: debtBefore,
+        payment_amount: paymentAmount == null ? advanceAmount : paymentAmount,
+        overpayment_amount: overpaymentAmount,
+        advance_after: advanceAfter,
+      },
+    });
+  }
 
   return {
     payment_id: payment.id,
@@ -2304,12 +2314,40 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
     });
   }
 
+  const groupedPaymentRows = new Map();
   for (const row of paymentRows) {
+    const groupKey = row.debt_payment_group_id
+      ? `${row.counterparty_id || 0}:${row.debt_payment_group_id}`
+      : `payment:${row.source_id || `${row.counterparty_id || 0}:${row.date || ''}:${row.created_at || ''}`}`;
+    if (!groupedPaymentRows.has(groupKey)) {
+      groupedPaymentRows.set(groupKey, {
+        ...row,
+        payment: 0,
+        active_payment: 0,
+        payment_count: 0,
+        payment_ids: [],
+      });
+    }
+    const grouped = groupedPaymentRows.get(groupKey);
+    const paymentAmount = ledgerNumber(row.payment);
+    grouped.payment = ledgerNumber(+(grouped.payment || 0) + paymentAmount);
+    grouped.active_payment = ledgerNumber(+(grouped.active_payment || 0) + (row.cancelled_at ? 0 : paymentAmount));
+    grouped.payment_count += 1;
+    if (row.source_id != null) {
+      grouped.payment_ids.push(+row.source_id);
+      grouped.source_id = grouped.source_id == null ? +row.source_id : Math.min(+grouped.source_id, +row.source_id);
+    }
+    if (!grouped.comment && row.comment) grouped.comment = row.comment;
+    if (!grouped.cancelled_at && row.cancelled_at) grouped.cancelled_at = row.cancelled_at;
+    if (!grouped.cancelled_reason && row.cancelled_reason) grouped.cancelled_reason = row.cancelled_reason;
+  }
+
+  for (const row of groupedPaymentRows.values()) {
     const group = ensureGroup(row);
     if (!group) continue;
     const amount = ledgerNumber(row.payment);
-    const isCancelled = Boolean(row.cancelled_at);
-    if (!isCancelled) group.total_paid += amount;
+    const activeAmount = ledgerNumber(row.active_payment == null ? (row.cancelled_at ? 0 : amount) : row.active_payment);
+    if (activeAmount) group.total_paid += activeAmount;
     group.payments_count += 1;
     group.entries.push({
       date: row.date || null,
@@ -2318,13 +2356,15 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
       description: row.description || (type === 'customer' ? 'Оплата клиента' : 'Оплата поставщику'),
       charge: 0,
       payment: amount,
-      active_payment: isCancelled ? 0 : amount,
+      active_payment: activeAmount,
       balance_after: 0,
       comment: row.comment || '',
       created_at: row.created_at || null,
       sort_order: 1,
       source_id: row.source_id == null ? null : +row.source_id,
       debt_payment_group_id: row.debt_payment_group_id || null,
+      payment_count: row.payment_count || 1,
+      payment_ids: row.payment_ids || [],
       cancelled_at: row.cancelled_at || null,
       cancelled_reason: row.cancelled_reason || '',
     });
@@ -2352,6 +2392,10 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
         document_id: entry.document_id,
         payment_id: entry.kind === 'payment' ? entry.source_id : null,
         debt_payment_group_id: entry.kind === 'payment' ? entry.debt_payment_group_id : null,
+        group_id: entry.kind === 'payment' ? entry.debt_payment_group_id : null,
+        payment_count: entry.kind === 'payment' ? entry.payment_count || 1 : 0,
+        payment_ids: entry.kind === 'payment' ? entry.payment_ids || [] : [],
+        is_group: entry.kind === 'payment' && Boolean(entry.debt_payment_group_id) && +(entry.payment_count || 1) > 1,
         cancelled_at: entry.cancelled_at,
         cancelled_reason: entry.cancelled_reason || '',
         description: entry.description,
@@ -4711,7 +4755,7 @@ app.post('/api/debts/pay', async (req, res) => {
         if (!(part > 0)) continue;
 
         if (entityType === 'supplier') {
-          const paymentResult = await payReceiptDocument(document.document_id, { amount: part, accountFromId: cashboxId, date, comment, debtPaymentGroupId }, client);
+          const paymentResult = await payReceiptDocument(document.document_id, { amount: part, accountFromId: cashboxId, date, comment, debtPaymentGroupId, skipOperationLog: true }, client);
           allocations.push({
             document_type: 'receipt',
             document_id: document.document_id,
@@ -4720,7 +4764,7 @@ app.post('/api/debts/pay', async (req, res) => {
             debt: paymentResult.payable,
           });
         } else if (document.document_type === 'sales_document') {
-          const paymentResult = await paySalesDocumentByAnchorSale(document.anchor_sale_id, { amount: part, accountToId: cashboxId, date, comment, debtPaymentGroupId }, client);
+          const paymentResult = await paySalesDocumentByAnchorSale(document.anchor_sale_id, { amount: part, accountToId: cashboxId, date, comment, debtPaymentGroupId, skipOperationLog: true }, client);
           allocations.push({
             document_type: 'sales_document',
             document_id: document.document_id,
@@ -4729,7 +4773,7 @@ app.post('/api/debts/pay', async (req, res) => {
             debt: paymentResult.debt,
           });
         } else {
-          const paymentResult = await payLegacySaleDocument(document.document_id, { amount: part, accountToId: cashboxId, date, comment, debtPaymentGroupId }, client);
+          const paymentResult = await payLegacySaleDocument(document.document_id, { amount: part, accountToId: cashboxId, date, comment, debtPaymentGroupId, skipOperationLog: true }, client);
           allocations.push({
             document_type: 'sale',
             document_id: document.document_id,
@@ -4752,6 +4796,7 @@ app.post('/api/debts/pay', async (req, res) => {
           debtBefore: totalDebt,
           paymentAmount: amount,
           debtPaymentGroupId,
+          skipOperationLog: true,
         }, client);
         allocations.push({
           document_type: 'client_advance',
@@ -4763,6 +4808,24 @@ app.post('/api/debts/pay', async (req, res) => {
         });
         remainingPayment = 0;
       }
+
+      await logOperation(client, {
+        action: 'debt_payment_created',
+        entity_type: entityType,
+        entity_id: entityId,
+        entity_label: `${entityType === 'supplier' ? 'Поставщик' : 'Клиент'} №${entityId}`,
+        amount,
+        currency: 'USD',
+        description: entityType === 'supplier' ? 'Групповая оплата поставщику' : 'Групповая оплата клиента',
+        meta: {
+          group_id: debtPaymentGroupId,
+          amount_total: amount,
+          payment_count: allocations.length,
+          cashbox_id: cashboxId,
+          comment,
+          allocations,
+        },
+      });
 
       return { allocations, debt_payment_group_id: debtPaymentGroupId };
     });
@@ -5072,35 +5135,80 @@ app.get('/api/debts/summary', async (req, res) => {
 // Payments
 app.get('/api/payments', async (req, res) => {
   res.json(await all(`
+    WITH payment_base AS (
+      SELECT
+        p.id,
+        CASE
+          WHEN p.debt_payment_group_id IS NOT NULL THEN 'group:' || p.debt_payment_group_id
+          ELSE 'payment:' || p.id::text
+        END AS group_key,
+        p.entity_type,
+        p.entity_id,
+        p.amount::numeric AS amount,
+        p.date,
+        p.comment,
+        p.transaction_id,
+        p.debt_payment_group_id,
+        p.cancelled_at,
+        p.cancelled_reason,
+        p.cancelled_meta,
+        t.type,
+        COALESCE(t.account_to_id, t.account_from_id) AS cashbox_id,
+        a.name AS account_name,
+        p.created_at,
+        c.name AS client_name,
+        su.name AS supplier_name,
+        pr.name AS product_name
+      FROM payments p
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
+      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+      LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
+      LEFT JOIN sales s2 ON s2.id = t.sale_id
+      LEFT JOIN sales_documents sd2 ON sd2.id = s2.sales_document_id
+      LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
+      LEFT JOIN receipts r ON r.id = t.receipt_id
+      LEFT JOIN clients ca ON p.entity_type='client_advance' AND ca.id = p.entity_id
+      LEFT JOIN clients c ON c.id = COALESCE(sd.client_id, s.client_id, sd2.client_id, s2.client_id, pu.client_id, ca.id)
+      LEFT JOIN suppliers su ON su.id = COALESCE(pu.supplier_id, r.supplier_id)
+      LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, s2.product_id, pu.product_id)
+    )
     SELECT
-      p.id,
-      p.entity_type,
-      p.entity_id,
-      p.amount,
-      p.date,
-      p.comment,
-      p.transaction_id,
-      p.debt_payment_group_id,
-      p.cancelled_at,
-      p.cancelled_reason,
-      p.cancelled_meta,
-      t.type,
-      COALESCE(t.account_to_id, t.account_from_id) AS cashbox_id,
-      a.name AS account_name,
-      p.created_at,
-      c.name AS client_name,
-      su.name AS supplier_name,
-      pr.name AS product_name
-    FROM payments p
-    LEFT JOIN transactions t ON t.id = p.transaction_id
-    LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
-    LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-    LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-    LEFT JOIN clients ca ON p.entity_type='client_advance' AND ca.id = p.entity_id
-    LEFT JOIN clients c ON c.id = COALESCE(s.client_id, pu.client_id, ca.id)
-    LEFT JOIN suppliers su ON su.id = pu.supplier_id
-    LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, pu.product_id)
-    ORDER BY p.date DESC, p.id DESC, p.created_at DESC
+      MIN(id)::integer AS id,
+      CASE
+        WHEN BOOL_OR(entity_type='purchase') THEN 'purchase'
+        WHEN BOOL_OR(entity_type='sale') THEN 'sale'
+        WHEN BOOL_OR(entity_type='client_advance') THEN 'client_advance'
+        ELSE MIN(entity_type)
+      END AS entity_type,
+      MIN(entity_id)::integer AS entity_id,
+      SUM(amount::numeric) AS amount,
+      MIN(date)::text AS date,
+      MIN(NULLIF(comment, '')) AS comment,
+      MIN(transaction_id)::integer AS transaction_id,
+      MAX(debt_payment_group_id)::text AS debt_payment_group_id,
+      MAX(debt_payment_group_id)::text AS group_id,
+      COUNT(*)::integer AS payment_count,
+      (MAX(debt_payment_group_id) IS NOT NULL AND COUNT(*) > 1) AS is_group,
+      ARRAY_AGG(id ORDER BY id)::integer[] AS payment_ids,
+      MAX(cancelled_at)::timestamp AS cancelled_at,
+      MAX(cancelled_reason)::text AS cancelled_reason,
+      COALESCE(MAX(cancelled_meta::text), '{}')::jsonb AS cancelled_meta,
+      CASE
+        WHEN BOOL_OR(type='expense') THEN 'expense'
+        WHEN BOOL_OR(type='income') THEN 'income'
+        ELSE MIN(type)
+      END AS type,
+      CASE WHEN COUNT(DISTINCT cashbox_id) = 1 THEN MAX(cashbox_id)::integer ELSE NULL::integer END AS cashbox_id,
+      CASE WHEN COUNT(DISTINCT account_name) = 1 THEN MAX(account_name) ELSE 'Несколько касс' END AS account_name,
+      MIN(created_at)::timestamp AS created_at,
+      MAX(client_name)::text AS client_name,
+      MAX(supplier_name)::text AS supplier_name,
+      CASE WHEN COUNT(*) = 1 THEN MAX(product_name) ELSE NULL::text END AS product_name,
+      COALESCE(MAX(client_name), MAX(supplier_name), '—')::text AS entity_name
+    FROM payment_base
+    GROUP BY group_key
+    ORDER BY MIN(date) DESC, MIN(id) DESC, MIN(created_at) DESC
   `));
 });
 

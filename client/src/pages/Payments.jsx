@@ -53,11 +53,12 @@ export default function Payments() {
 
   const setEditField = (key, value) => setEditForm(form => ({ ...form, [key]: value }))
 
-  const paymentCounterparty = (payment) => payment?.entity_type === 'purchase'
+  const paymentCounterparty = (payment) => payment?.entity_name || (payment?.entity_type === 'purchase'
     ? (payment?.supplier_name || payment?.client_name || '—')
-    : (payment?.client_name || payment?.supplier_name || '—')
+    : (payment?.client_name || payment?.supplier_name || '—'))
   const paymentTypeLabel = (payment) => payment?.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'
   const paymentDocument = (payment) => {
+    if (payment?.is_group) return `Распределён по ${payment.payment_count || 0} документам`
     if (payment?.entity_type === 'client_advance') return 'Аванс клиента'
     return payment?.product_name || `Платеж №${payment?.id}`
   }
@@ -165,6 +166,11 @@ export default function Payments() {
                     <span className={`badge ${typeMeta[payment.entity_type]?.badge || 'badge-neutral'}`}>
                       {typeMeta[payment.entity_type]?.label || formatType(payment.entity_type)}
                     </span>
+                    {payment.is_group && (
+                      <span className="badge badge-primary" style={{ marginLeft: 6 }}>
+                        Групповой
+                      </span>
+                    )}
                   </td>
                   <td>
                     <div>{paymentDocument(payment)}</div>

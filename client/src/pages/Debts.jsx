@@ -88,6 +88,12 @@ function paymentActionLabel(row) {
   return row?.type === 'supplier' ? 'Оплатить' : 'Принять оплату'
 }
 
+function paymentDistributionLabel(entry, rowType) {
+  const count = toNumber(entry?.payment_count)
+  if (!entry?.is_group || count <= 1) return ''
+  return `Распределено по ${count} ${rowType === 'supplier' ? 'приходам' : 'реализациям'}`
+}
+
 function paymentTitle(row) {
   return row?.type === 'supplier' ? 'Оплата поставщику' : 'Оплата клиента'
 }
@@ -568,6 +574,9 @@ export default function Debts() {
                         {operationKind(entry.kind)}
                         {entry.debt_payment_group_id ? ' · Групповое погашение' : ''}
                       </div>
+                      {paymentDistributionLabel(entry, selected.type) && (
+                        <div className="td-muted">{paymentDistributionLabel(entry, selected.type)}</div>
+                      )}
                       {entry.cancelled_at && <span className="badge badge-neutral">Отменён</span>}
                     </td>
                     <td className="td-mono">{fmtPlain(entry.charge)}</td>

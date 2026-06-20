@@ -12,6 +12,7 @@ const ACTION_LABELS = {
   payment_created: 'Создан платёж',
   client_payment: 'Оплата клиента',
   supplier_payment: 'Оплата поставщику',
+  debt_payment_created: 'Групповое погашение долга',
   payment_updated: 'Изменён платеж',
   cashbox_transfer: 'Перевод между кассами',
   owner_contribution: 'Пополнение владельцем',
