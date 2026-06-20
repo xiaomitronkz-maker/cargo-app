@@ -241,6 +241,10 @@ td {
 }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: var(--surface-2); }
+.row-cancelled td {
+  color: var(--text-secondary);
+  background: rgba(255,255,255,0.02);
+}
 .td-actions {
   display: flex;
   gap: 4px;
@@ -534,6 +538,9 @@ tbody tr:hover { background: var(--surface-2); }
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   grid-column: 1 / -1;
+}
+.payments-table table {
+  min-width: 980px;
 }
 
 .dashboard-section-grid {

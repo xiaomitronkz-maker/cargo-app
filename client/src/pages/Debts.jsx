@@ -17,6 +17,7 @@ const emptyLedger = {
   customers: [],
   suppliers: [],
   closed: [],
+  history: [],
 }
 
 const normalizeArray = (data) => Array.isArray(data) ? data : []
@@ -59,6 +60,11 @@ function operationKind(kind) {
   return 'Реализация'
 }
 
+function entryPaymentAmount(entry) {
+  if (entry?.active_payment != null) return roundMoney(entry.active_payment)
+  return entry?.cancelled_at ? 0 : roundMoney(entry?.payment)
+}
+
 function hasOpenDebt(row) {
   return toNumber(row?.balance) > 0.009
 }
@@ -96,7 +102,7 @@ function getOpenDocuments(row) {
   const documents = []
   normalizeArray(row?.entries).forEach((entry) => {
     const charge = roundMoney(entry.charge)
-    const payment = roundMoney(entry.payment)
+    const payment = entryPaymentAmount(entry)
     if (charge > 0 && entry.document_id) {
       documents.push({
         document_id: entry.document_id,
@@ -143,6 +149,7 @@ export default function Debts() {
     customers: normalizeArray(data?.customers),
     suppliers: normalizeArray(data?.suppliers),
     closed: normalizeArray(data?.closed),
+    history: normalizeArray(data?.history),
   })
 
   const load = async () => {
@@ -177,7 +184,7 @@ export default function Debts() {
 
   const rows = useMemo(() => {
     const source = activeTab === 'history'
-      ? ledger.closed
+      ? (ledger.history.length ? ledger.history : [...ledger.customers, ...ledger.suppliers])
       : activeTab === 'suppliers'
         ? ledger.suppliers
         : ledger.customers
@@ -226,7 +233,7 @@ export default function Debts() {
     const nextLedger = await load()
     await loadAccounts()
     if (selected) {
-      const updated = [...nextLedger.customers, ...nextLedger.suppliers, ...nextLedger.closed]
+      const updated = [...nextLedger.customers, ...nextLedger.suppliers, ...nextLedger.closed, ...nextLedger.history]
         .find(row => row.type === selected.type && String(row.counterparty_id) === String(selected.counterparty_id))
       setSelected(updated || null)
     }
@@ -553,24 +560,34 @@ export default function Debts() {
                     </td>
                   </tr>
                 ) : normalizeArray(selected.entries).map((entry, index) => (
-                  <tr key={`${entry.kind}-${entry.document_id || 'payment'}-${index}`}>
+                  <tr key={`${entry.kind}-${entry.document_id || 'payment'}-${index}`} className={entry.cancelled_at ? 'row-cancelled' : ''}>
                     <td className="td-muted td-date">{formatDate(entry.date)}</td>
                     <td>
                       <div style={{ fontWeight: 600 }}>{entry.description || operationKind(entry.kind)}</div>
-                      <div className="td-muted">{operationKind(entry.kind)}</div>
+                      <div className="td-muted">
+                        {operationKind(entry.kind)}
+                        {entry.debt_payment_group_id ? ' · Групповое погашение' : ''}
+                      </div>
+                      {entry.cancelled_at && <span className="badge badge-neutral">Отменён</span>}
                     </td>
                     <td className="td-mono">{fmtPlain(entry.charge)}</td>
-                    <td className="td-mono">{fmtPlain(entry.payment)}</td>
+                    <td className="td-mono">
+                      {fmtPlain(entry.payment)}
+                      {entry.cancelled_at && <div className="td-muted">не влияет на остаток</div>}
+                    </td>
                     <td>
                       <span className={`badge ${toNumber(entry.balance_after) > 0 ? 'badge-warning' : 'badge-success'}`}>
                         {runningBalanceLabel(selected.type, entry.balance_after)}
                       </span>
                     </td>
-                    <td className="td-muted">{entry.comment || '—'}</td>
+                    <td className="td-muted">
+                      {entry.comment || '—'}
+                      {entry.cancelled_reason && <div>Причина отмены: {entry.cancelled_reason}</div>}
+                    </td>
                     <td>
                       {entry.kind === 'payment' && entry.payment_id ? (
                         <div className="td-actions">
-                          <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)} disabled={Boolean(entry.debt_payment_group_id)}>
+                          <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)} disabled={Boolean(entry.debt_payment_group_id || entry.cancelled_at)}>
                             Редактировать
                           </button>
                           {entry.cancelled_at ? (

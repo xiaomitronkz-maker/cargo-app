@@ -2308,7 +2308,8 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
     const group = ensureGroup(row);
     if (!group) continue;
     const amount = ledgerNumber(row.payment);
-    group.total_paid += amount;
+    const isCancelled = Boolean(row.cancelled_at);
+    if (!isCancelled) group.total_paid += amount;
     group.payments_count += 1;
     group.entries.push({
       date: row.date || null,
@@ -2317,6 +2318,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
       description: row.description || (type === 'customer' ? 'Оплата клиента' : 'Оплата поставщику'),
       charge: 0,
       payment: amount,
+      active_payment: isCancelled ? 0 : amount,
       balance_after: 0,
       comment: row.comment || '',
       created_at: row.created_at || null,
@@ -2324,6 +2326,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
       source_id: row.source_id == null ? null : +row.source_id,
       debt_payment_group_id: row.debt_payment_group_id || null,
       cancelled_at: row.cancelled_at || null,
+      cancelled_reason: row.cancelled_reason || '',
     });
   }
 
@@ -2338,7 +2341,10 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
 
     let running = 0;
     group.entries = group.entries.map((entry) => {
-      running = ledgerNumber(running + entry.charge - entry.payment);
+      const activePayment = entry.kind === 'payment'
+        ? ledgerNumber(entry.active_payment == null ? entry.payment : entry.active_payment)
+        : ledgerNumber(entry.payment);
+      running = ledgerNumber(running + entry.charge - activePayment);
       return {
         date: entry.date,
         kind: entry.kind,
@@ -2347,9 +2353,11 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
         payment_id: entry.kind === 'payment' ? entry.source_id : null,
         debt_payment_group_id: entry.kind === 'payment' ? entry.debt_payment_group_id : null,
         cancelled_at: entry.cancelled_at,
+        cancelled_reason: entry.cancelled_reason || '',
         description: entry.description,
         charge: ledgerNumber(entry.charge),
         payment: ledgerNumber(entry.payment),
+        active_payment: activePayment,
         balance_after: running,
         comment: entry.comment,
       };
@@ -2417,14 +2425,14 @@ async function debtsLedgerData(client = pool) {
         'Оплата клиента'::text AS description,
         p.comment::text AS comment,
         p.debt_payment_group_id::text AS debt_payment_group_id,
-        p.cancelled_at::timestamp AS cancelled_at
+        p.cancelled_at::timestamp AS cancelled_at,
+        p.cancelled_reason::text AS cancelled_reason
       FROM payments p
       LEFT JOIN transactions t ON t.id = p.transaction_id
       LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
       LEFT JOIN sales s2 ON s2.id = t.sale_id
       LEFT JOIN clients c ON c.id = COALESCE(s.client_id, s2.client_id)
       WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
-        AND p.cancelled_at IS NULL
       ORDER BY p.id, p.created_at DESC
     ) sale_payments
     UNION ALL
@@ -2440,11 +2448,11 @@ async function debtsLedgerData(client = pool) {
       'Аванс клиента'::text AS description,
       p.comment::text AS comment,
       p.debt_payment_group_id::text AS debt_payment_group_id,
-      p.cancelled_at::timestamp AS cancelled_at
+      p.cancelled_at::timestamp AS cancelled_at,
+      p.cancelled_reason::text AS cancelled_reason
     FROM payments p
     LEFT JOIN clients c ON c.id = p.entity_id
     WHERE p.entity_type='client_advance'
-      AND p.cancelled_at IS NULL
   `, [], client);
 
   const supplierCharges = await all(`
@@ -2501,14 +2509,14 @@ async function debtsLedgerData(client = pool) {
       'Оплата поставщику'::text AS description,
       p.comment::text AS comment,
       p.debt_payment_group_id::text AS debt_payment_group_id,
-      p.cancelled_at::timestamp AS cancelled_at
+      p.cancelled_at::timestamp AS cancelled_at,
+      p.cancelled_reason::text AS cancelled_reason
     FROM payments p
     LEFT JOIN transactions t ON t.id = p.transaction_id
     LEFT JOIN receipts r ON r.id = t.receipt_id
     LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
     LEFT JOIN suppliers s ON s.id = COALESCE(r.supplier_id, pu.supplier_id)
     WHERE p.entity_type='purchase' AND COALESCE(r.supplier_id, pu.supplier_id) IS NOT NULL
-      AND p.cancelled_at IS NULL
     ORDER BY p.id, p.created_at DESC
   `, [], client);
 
@@ -2517,6 +2525,13 @@ async function debtsLedgerData(client = pool) {
   const closed = [...customers, ...suppliers]
     .filter((row) => Math.abs(row.balance) < 0.01 && (row.total_charged > 0 || row.total_paid > 0))
     .sort((a, b) => (b.last_operation_date || '').localeCompare(a.last_operation_date || ''));
+  const history = [...customers, ...suppliers]
+    .filter((row) => row.entries.length > 0)
+    .sort((a, b) => {
+      const dateCompare = (b.last_operation_date || '').localeCompare(a.last_operation_date || '');
+      if (dateCompare) return dateCompare;
+      return (a.counterparty_name || '').localeCompare(b.counterparty_name || '');
+    });
   const receivable = customers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
   const supplierPayable = suppliers.reduce((sum, row) => sum + (row.balance > 0 ? row.balance : 0), 0);
   const clientAdvances = customers.reduce((sum, row) => sum + (row.balance < 0 ? Math.abs(row.balance) : 0), 0);
@@ -2536,6 +2551,7 @@ async function debtsLedgerData(client = pool) {
     customers,
     suppliers,
     closed,
+    history,
   };
 }
 
@@ -5084,7 +5100,7 @@ app.get('/api/payments', async (req, res) => {
     LEFT JOIN clients c ON c.id = COALESCE(s.client_id, pu.client_id, ca.id)
     LEFT JOIN suppliers su ON su.id = pu.supplier_id
     LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, pu.product_id)
-    ORDER BY p.date DESC, p.created_at DESC
+    ORDER BY p.date DESC, p.id DESC, p.created_at DESC
   `));
 });
 

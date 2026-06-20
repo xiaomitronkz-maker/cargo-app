@@ -53,12 +53,25 @@ export default function Payments() {
 
   const setEditField = (key, value) => setEditForm(form => ({ ...form, [key]: value }))
 
-  const paymentCounterparty = (payment) => payment?.client_name || payment?.supplier_name || '—'
+  const paymentCounterparty = (payment) => payment?.entity_type === 'purchase'
+    ? (payment?.supplier_name || payment?.client_name || '—')
+    : (payment?.client_name || payment?.supplier_name || '—')
   const paymentTypeLabel = (payment) => payment?.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'
+  const paymentDocument = (payment) => {
+    if (payment?.entity_type === 'client_advance') return 'Аванс клиента'
+    return payment?.product_name || `Платеж №${payment?.id}`
+  }
+  const paymentStatus = (payment) => {
+    if (payment?.cancelled_at) return 'Отменён'
+    if (payment?.debt_payment_group_id) return 'Групповое погашение'
+    if (isDebtPayment(payment)) return 'Старое погашение'
+    return 'Активен'
+  }
   const selectedAccount = accounts.find(account => String(account.id) === String(editForm.cashbox_id))
   const isSupplierPayment = editing?.entity_type === 'purchase'
   const isDebtPayment = (payment) => ['sale', 'purchase', 'client_advance'].includes(payment?.entity_type)
   const canCancelPayment = (payment) => isDebtPayment(payment) && Boolean(payment?.debt_payment_group_id) && !payment?.cancelled_at
+  const canEditPayment = (payment) => !payment?.cancelled_at && !payment?.debt_payment_group_id
 
   const cancelPayment = async (payment) => {
     if (!canCancelPayment(payment)) return
@@ -123,62 +136,82 @@ export default function Payments() {
       </div>
 
       {loading ? <div className="loading">Загрузка...</div> : (
-        <div className="record-grid">
-          {payments.length === 0 && (
-            <div className="empty-state record-empty"><p>Платежей нет</p></div>
-          )}
-          {payments.map(payment => (
-            <div className="record-card" key={payment.id} style={payment.cancelled_at ? { opacity: 0.62 } : undefined}>
-              <div className="record-card-main">
-                <div>
-                  <div className="record-title">{payment.client_name || 'Без клиента'}</div>
-                  <div className="record-subtitle">{payment.product_name || 'Без товара'}</div>
-                </div>
-                <div className="td-actions">
-                  <span className={`badge ${typeMeta[payment.entity_type]?.badge || 'badge-neutral'}`}>
-                    {typeMeta[payment.entity_type]?.label || formatType(payment.entity_type)}
-                  </span>
-                  {payment.cancelled_at && <span className="badge badge-neutral">Отменён</span>}
-                </div>
-              </div>
-              <div className="record-meta">
-                <span>{formatDate(payment.date)}</span>
-                <strong>{fmt(payment.amount)}</strong>
-              </div>
-              <div className="record-meta">
-                <span>Касса</span>
-                <strong>{payment.account_name || '—'}</strong>
-              </div>
-              {payment.comment && <div className="record-note">{payment.comment}</div>}
-              {payment.cancelled_reason && <div className="record-note">Причина отмены: {payment.cancelled_reason}</div>}
-              <div className="td-actions" style={{ marginTop: 12 }}>
-                <button className="btn btn-secondary btn-sm" onClick={() => openEdit(payment)} disabled={payment.cancelled_at || payment.debt_payment_group_id}>
-                  Редактировать
-                </button>
-                {payment.cancelled_at ? (
-                  <button className="btn btn-secondary btn-sm" disabled>
-                    Отменено
-                  </button>
-                ) : canCancelPayment(payment) ? (
-                  <button
-                    className="btn btn-danger btn-sm"
-                    onClick={() => cancelPayment(payment)}
-                    disabled={cancellingGroupId === payment.debt_payment_group_id}
-                  >
-                    {cancellingGroupId === payment.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
-                  </button>
-                ) : isDebtPayment(payment) && (
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    disabled
-                    title="Старое погашение без группы нельзя отменить автоматически"
-                  >
-                    Старое погашение
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
+        <div className="table-wrapper payments-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Контрагент</th>
+                <th>Тип</th>
+                <th>Документ/товар</th>
+                <th>Сумма</th>
+                <th>Касса</th>
+                <th>Статус</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {payments.length === 0 ? (
+                <tr>
+                  <td colSpan={8}>
+                    <div className="empty-state"><p>Платежей нет</p></div>
+                  </td>
+                </tr>
+              ) : payments.map(payment => (
+                <tr key={payment.id} className={payment.cancelled_at ? 'row-cancelled' : ''}>
+                  <td className="td-muted td-date">{formatDate(payment.date)}</td>
+                  <td>{paymentCounterparty(payment)}</td>
+                  <td>
+                    <span className={`badge ${typeMeta[payment.entity_type]?.badge || 'badge-neutral'}`}>
+                      {typeMeta[payment.entity_type]?.label || formatType(payment.entity_type)}
+                    </span>
+                  </td>
+                  <td>
+                    <div>{paymentDocument(payment)}</div>
+                    {payment.comment && <div className="td-muted">{payment.comment}</div>}
+                    {payment.cancelled_reason && (
+                      <div className="td-muted">Причина отмены: {payment.cancelled_reason}</div>
+                    )}
+                  </td>
+                  <td className="td-mono">{fmt(payment.amount)}</td>
+                  <td>{payment.account_name || '—'}</td>
+                  <td>
+                    <span className={`badge ${payment.cancelled_at ? 'badge-neutral' : payment.debt_payment_group_id ? 'badge-primary' : 'badge-warning'}`}>
+                      {paymentStatus(payment)}
+                    </span>
+                  </td>
+                  <td>
+                    <div className="td-actions">
+                      <button className="btn btn-secondary btn-sm" onClick={() => openEdit(payment)} disabled={!canEditPayment(payment)}>
+                        Редактировать
+                      </button>
+                      {payment.cancelled_at ? (
+                        <button className="btn btn-secondary btn-sm" disabled>
+                          Отменён
+                        </button>
+                      ) : canCancelPayment(payment) ? (
+                        <button
+                          className="btn btn-danger btn-sm"
+                          onClick={() => cancelPayment(payment)}
+                          disabled={cancellingGroupId === payment.debt_payment_group_id}
+                        >
+                          {cancellingGroupId === payment.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
+                        </button>
+                      ) : isDebtPayment(payment) && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          disabled
+                          title="Старое погашение без группы нельзя отменить автоматически"
+                        >
+                          Старое погашение
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 
