@@ -343,11 +343,7 @@ export default function Debts() {
   }
 
   const cancelDebtPayment = async (entry) => {
-    if (!entry?.payment_id) return
-    if (!entry.debt_payment_group_id) {
-      alert('Старое погашение без группы нельзя отменить автоматически')
-      return
-    }
+    if (!canCancelDebtPayment(entry)) return
     if (!window.confirm('Отменить погашение? Касса и долг будут пересчитаны.')) return
     setCancellingGroupId(entry.debt_payment_group_id)
     try {
@@ -360,6 +356,8 @@ export default function Debts() {
       setCancellingGroupId('')
     }
   }
+
+  const canCancelDebtPayment = (entry) => Boolean(entry?.payment_id && entry.debt_payment_group_id && !entry.cancelled_at)
 
   const renderRows = () => {
     if (rows.length === 0) {
@@ -575,13 +573,27 @@ export default function Debts() {
                           <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)} disabled={Boolean(entry.debt_payment_group_id)}>
                             Редактировать
                           </button>
-                          <button
-                            className="btn btn-danger btn-sm"
-                            onClick={() => cancelDebtPayment(entry)}
-                            disabled={cancellingGroupId === entry.debt_payment_group_id}
-                          >
-                            {cancellingGroupId === entry.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
-                          </button>
+                          {entry.cancelled_at ? (
+                            <button className="btn btn-secondary btn-sm" disabled>
+                              Отменено
+                            </button>
+                          ) : canCancelDebtPayment(entry) ? (
+                            <button
+                              className="btn btn-danger btn-sm"
+                              onClick={() => cancelDebtPayment(entry)}
+                              disabled={cancellingGroupId === entry.debt_payment_group_id}
+                            >
+                              {cancellingGroupId === entry.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
+                            </button>
+                          ) : (
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              disabled
+                              title="Старое погашение без группы нельзя отменить автоматически"
+                            >
+                              Старое погашение
+                            </button>
+                          )}
                         </div>
                       ) : '—'}
                     </td>

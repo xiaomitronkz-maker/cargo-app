@@ -57,14 +57,11 @@ export default function Payments() {
   const paymentTypeLabel = (payment) => payment?.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'
   const selectedAccount = accounts.find(account => String(account.id) === String(editForm.cashbox_id))
   const isSupplierPayment = editing?.entity_type === 'purchase'
-  const canCancelPayment = (payment) => ['sale', 'purchase', 'client_advance'].includes(payment?.entity_type) && !payment?.cancelled_at
+  const isDebtPayment = (payment) => ['sale', 'purchase', 'client_advance'].includes(payment?.entity_type)
+  const canCancelPayment = (payment) => isDebtPayment(payment) && Boolean(payment?.debt_payment_group_id) && !payment?.cancelled_at
 
   const cancelPayment = async (payment) => {
     if (!canCancelPayment(payment)) return
-    if (!payment.debt_payment_group_id) {
-      alert('Старое погашение без группы нельзя отменить автоматически')
-      return
-    }
     if (!window.confirm('Отменить погашение? Касса и долг будут пересчитаны.')) return
     setCancellingGroupId(payment.debt_payment_group_id)
     try {
@@ -158,13 +155,25 @@ export default function Payments() {
                 <button className="btn btn-secondary btn-sm" onClick={() => openEdit(payment)} disabled={payment.cancelled_at || payment.debt_payment_group_id}>
                   Редактировать
                 </button>
-                {canCancelPayment(payment) && (
+                {payment.cancelled_at ? (
+                  <button className="btn btn-secondary btn-sm" disabled>
+                    Отменено
+                  </button>
+                ) : canCancelPayment(payment) ? (
                   <button
                     className="btn btn-danger btn-sm"
                     onClick={() => cancelPayment(payment)}
                     disabled={cancellingGroupId === payment.debt_payment_group_id}
                   >
                     {cancellingGroupId === payment.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
+                  </button>
+                ) : isDebtPayment(payment) && (
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    disabled
+                    title="Старое погашение без группы нельзя отменить автоматически"
+                  >
+                    Старое погашение
                   </button>
                 )}
               </div>
