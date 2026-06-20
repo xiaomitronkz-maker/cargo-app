@@ -102,6 +102,7 @@ const api = {
   getDebtsLedger: () => api.get('/debts/ledger'),
   getDebtsBySuppliers: () => api.get('/debts/by-suppliers'),
   payDebt: (data) => api.post('/debts/pay', data),
+  cancelDebtPaymentGroup: (groupId, data = {}) => api.post(`/debts/payments/${groupId}/cancel`, data),
   payReceipt: (id, data) => api.put(`/receipts/${id}/pay`, data),
   payPurchase: (id, data) => api.put(`/purchases/${id}/pay`, data),
   getPayments: () => api.get('/payments'),

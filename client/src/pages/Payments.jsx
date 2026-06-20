@@ -19,6 +19,7 @@ export default function Payments() {
   const [editForm, setEditForm] = useState({ amount: '', cashbox_id: '', date: '', comment: '' })
   const [editError, setEditError] = useState('')
   const [saving, setSaving] = useState(false)
+  const [cancellingGroupId, setCancellingGroupId] = useState('')
 
   const load = () => {
     setLoading(true)
@@ -56,6 +57,26 @@ export default function Payments() {
   const paymentTypeLabel = (payment) => payment?.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'
   const selectedAccount = accounts.find(account => String(account.id) === String(editForm.cashbox_id))
   const isSupplierPayment = editing?.entity_type === 'purchase'
+  const canCancelPayment = (payment) => ['sale', 'purchase', 'client_advance'].includes(payment?.entity_type) && !payment?.cancelled_at
+
+  const cancelPayment = async (payment) => {
+    if (!canCancelPayment(payment)) return
+    if (!payment.debt_payment_group_id) {
+      alert('Старое погашение без группы нельзя отменить автоматически')
+      return
+    }
+    if (!window.confirm('Отменить погашение? Касса и долг будут пересчитаны.')) return
+    setCancellingGroupId(payment.debt_payment_group_id)
+    try {
+      await api.cancelDebtPaymentGroup(payment.debt_payment_group_id)
+      await load()
+      alert('Погашение отменено')
+    } catch (e) {
+      alert(e.message || 'Не удалось отменить погашение')
+    } finally {
+      setCancellingGroupId('')
+    }
+  }
 
   const saveEdit = async () => {
     if (!editing) return
@@ -110,15 +131,18 @@ export default function Payments() {
             <div className="empty-state record-empty"><p>Платежей нет</p></div>
           )}
           {payments.map(payment => (
-            <div className="record-card" key={payment.id}>
+            <div className="record-card" key={payment.id} style={payment.cancelled_at ? { opacity: 0.62 } : undefined}>
               <div className="record-card-main">
                 <div>
                   <div className="record-title">{payment.client_name || 'Без клиента'}</div>
                   <div className="record-subtitle">{payment.product_name || 'Без товара'}</div>
                 </div>
-                <span className={`badge ${typeMeta[payment.entity_type]?.badge || 'badge-neutral'}`}>
-                  {typeMeta[payment.entity_type]?.label || formatType(payment.entity_type)}
-                </span>
+                <div className="td-actions">
+                  <span className={`badge ${typeMeta[payment.entity_type]?.badge || 'badge-neutral'}`}>
+                    {typeMeta[payment.entity_type]?.label || formatType(payment.entity_type)}
+                  </span>
+                  {payment.cancelled_at && <span className="badge badge-neutral">Отменён</span>}
+                </div>
               </div>
               <div className="record-meta">
                 <span>{formatDate(payment.date)}</span>
@@ -129,8 +153,20 @@ export default function Payments() {
                 <strong>{payment.account_name || '—'}</strong>
               </div>
               {payment.comment && <div className="record-note">{payment.comment}</div>}
+              {payment.cancelled_reason && <div className="record-note">Причина отмены: {payment.cancelled_reason}</div>}
               <div className="td-actions" style={{ marginTop: 12 }}>
-                <button className="btn btn-secondary btn-sm" onClick={() => openEdit(payment)}>Редактировать</button>
+                <button className="btn btn-secondary btn-sm" onClick={() => openEdit(payment)} disabled={payment.cancelled_at || payment.debt_payment_group_id}>
+                  Редактировать
+                </button>
+                {canCancelPayment(payment) && (
+                  <button
+                    className="btn btn-danger btn-sm"
+                    onClick={() => cancelPayment(payment)}
+                    disabled={cancellingGroupId === payment.debt_payment_group_id}
+                  >
+                    {cancellingGroupId === payment.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
+                  </button>
+                )}
               </div>
             </div>
           ))}

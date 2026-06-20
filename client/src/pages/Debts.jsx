@@ -134,6 +134,7 @@ export default function Debts() {
   const [editPaymentForm, setEditPaymentForm] = useState(emptyPaymentForm())
   const [editPaymentError, setEditPaymentError] = useState('')
   const [editPaymentSaving, setEditPaymentSaving] = useState(false)
+  const [cancellingGroupId, setCancellingGroupId] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -338,6 +339,25 @@ export default function Debts() {
       setEditPaymentError(e.message || 'Не удалось обновить платеж')
     } finally {
       setEditPaymentSaving(false)
+    }
+  }
+
+  const cancelDebtPayment = async (entry) => {
+    if (!entry?.payment_id) return
+    if (!entry.debt_payment_group_id) {
+      alert('Старое погашение без группы нельзя отменить автоматически')
+      return
+    }
+    if (!window.confirm('Отменить погашение? Касса и долг будут пересчитаны.')) return
+    setCancellingGroupId(entry.debt_payment_group_id)
+    try {
+      await api.cancelDebtPaymentGroup(entry.debt_payment_group_id)
+      await refreshAfterPayment()
+      alert('Погашение отменено')
+    } catch (e) {
+      alert(e.message || 'Не удалось отменить погашение')
+    } finally {
+      setCancellingGroupId('')
     }
   }
 
@@ -551,9 +571,18 @@ export default function Debts() {
                     <td className="td-muted">{entry.comment || '—'}</td>
                     <td>
                       {entry.kind === 'payment' && entry.payment_id ? (
-                        <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)}>
-                          Редактировать
-                        </button>
+                        <div className="td-actions">
+                          <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)} disabled={Boolean(entry.debt_payment_group_id)}>
+                            Редактировать
+                          </button>
+                          <button
+                            className="btn btn-danger btn-sm"
+                            onClick={() => cancelDebtPayment(entry)}
+                            disabled={cancellingGroupId === entry.debt_payment_group_id}
+                          >
+                            {cancellingGroupId === entry.debt_payment_group_id ? 'Отмена...' : 'Отменить'}
+                          </button>
+                        </div>
                       ) : '—'}
                     </td>
                   </tr>
