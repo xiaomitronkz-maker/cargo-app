@@ -491,37 +491,72 @@ function markingCandidateTerms(marking) {
   return Array.from(new Set(terms.map((term) => String(term || '').trim()).filter(Boolean)));
 }
 
-function markingMatchScore(inputMarking, marking) {
+function markingMatchReason(status, matchedKeyword = null) {
+  const keyword = matchedKeyword ? `"${matchedKeyword}"` : 'ключевому слову';
+  if (status === 'exact') return `Точное совпадение по ${keyword}`;
+  if (status === 'keyword') return `Совпадение по ${keyword}`;
+  if (status === 'compact') return `Совпадение без пробелов и знаков по ${keyword}`;
+  return null;
+}
+
+function markingTermMatchScore(inputMarking, term, marking) {
   const input = normalizeMarking(inputMarking);
   if (!input.normal) return null;
 
-  let best = null;
-  for (const term of markingCandidateTerms(marking)) {
-    const normalizedTerm = normalizeMarking(term);
-    if (!normalizedTerm.normal) continue;
+  const normalizedTerm = normalizeMarking(term);
+  if (!normalizedTerm.normal) return null;
 
-    let score = 0;
-    let status = null;
-    if (input.normal === normalizedTerm.normal) {
-      score = 10000 + normalizedTerm.normal.length;
-      status = 'exact';
-    } else if (input.compact === normalizedTerm.compact) {
-      score = 9000 + normalizedTerm.compact.length;
-      status = 'compact';
-    } else if (
-      input.normal.includes(normalizedTerm.normal) ||
-      normalizedTerm.normal.includes(input.normal) ||
-      (normalizedTerm.compact && input.compact.includes(normalizedTerm.compact)) ||
-      (input.compact && normalizedTerm.compact.includes(input.compact))
-    ) {
-      score = 5000 + normalizedTerm.compact.length;
-      status = 'keyword';
-    }
+  const compactLength = normalizedTerm.compact.length;
+  const lengthBonus = Math.min(8, compactLength / 2);
+  let score = 0;
+  let status = null;
 
-    if (score && (!best || score > best.score)) {
-      best = { score, status, matched_keyword: term };
-    }
+  if (input.normal === normalizedTerm.normal) {
+    score = 100 + lengthBonus;
+    status = 'exact';
+  } else if (input.compact === normalizedTerm.compact) {
+    score = 92 + lengthBonus;
+    status = 'compact';
+  } else if (
+    input.normal.includes(normalizedTerm.normal) ||
+    normalizedTerm.normal.includes(input.normal)
+  ) {
+    score = 88 + lengthBonus;
+    status = 'keyword';
+  } else if (
+    (normalizedTerm.compact && input.compact.includes(normalizedTerm.compact)) ||
+    (input.compact && normalizedTerm.compact.includes(input.compact))
+  ) {
+    score = 78 + lengthBonus;
+    status = 'compact';
   }
+
+  if (!score) return null;
+
+  const inputClient = normalizeMarking(inputMarking);
+  const clientName = normalizeMarking(marking.client_name || '');
+  if (clientName.normal && (
+    inputClient.normal.includes(clientName.normal) ||
+    (clientName.compact && inputClient.compact.includes(clientName.compact))
+  )) {
+    score += 6;
+  }
+
+  return {
+    score: Math.round(score * 10) / 10,
+    status,
+    matched_keyword: term,
+    match_reason: markingMatchReason(status, term),
+  };
+}
+
+function markingMatchScore(inputMarking, marking) {
+  const best = markingCandidateTerms(marking).reduce((currentBest, term) => {
+    const match = markingTermMatchScore(inputMarking, term, marking);
+    if (!match) return currentBest;
+    if (!currentBest || match.score > currentBest.score) return match;
+    return currentBest;
+  }, null);
 
   return best;
 }
@@ -537,28 +572,53 @@ function matchMarking(inputMarking, markings = []) {
 
   if (!matches.length) return { status: 'not_found', candidates: [] };
 
-  const topScore = matches[0].score;
-  const topMatches = matches.filter((match) => match.score === topScore);
-  if (topMatches.length > 1) {
+  const best = matches[0];
+  const second = matches[1] || null;
+  const isConfident = best.score >= 80 && (!second || best.score - second.score >= 10);
+  if (second && !isConfident) {
     return {
       status: 'ambiguous',
-      candidates: topMatches.map((match) => ({
+      match_score: best.score,
+      match_reason: 'Несколько близких вариантов',
+      candidates: matches.slice(0, 8).map((match) => ({
         marking_id: match.id,
         marking: match.marking,
         client_id: match.client_id,
         client_name: match.client_name,
         matched_keyword: match.matched_keyword,
+        match_score: match.score,
+        match_reason: match.match_reason,
       })),
     };
   }
 
-  const match = topMatches[0];
   return {
-    status: match.status,
-    marking: match,
-    matched_keyword: match.matched_keyword,
-    candidates: [],
+    status: second ? 'auto_selected' : best.status,
+    marking: best,
+    matched_keyword: best.matched_keyword,
+    match_score: best.score,
+    match_reason: second
+      ? `Автовыбор: лучший score ${best.score}, следующий ${second.score}`
+      : best.match_reason,
+    candidates: matches.slice(0, 8).map((match) => ({
+      marking_id: match.id,
+      marking: match.marking,
+      client_id: match.client_id,
+      client_name: match.client_name,
+      matched_keyword: match.matched_keyword,
+      match_score: match.score,
+      match_reason: match.match_reason,
+    })),
   };
+}
+
+function appendMarkingKeyword(currentKeywords, keyword) {
+  const normalizedKeyword = String(keyword || '').trim();
+  if (!normalizedKeyword) return currentKeywords || '';
+  const existing = splitMarkingKeywords(currentKeywords);
+  const known = new Set(existing.map((term) => normalizeMarking(term).compact).filter(Boolean));
+  if (known.has(normalizeMarking(normalizedKeyword).compact)) return currentKeywords || normalizedKeyword;
+  return [...existing, normalizedKeyword].join(', ');
 }
 
 function isPhoneProduct(productName) {
@@ -3470,6 +3530,7 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
       const sourceRow = sourceRowOffset + rowIndex + 1;
       if (!product) warnings.push('Товар будет создан при импорте');
       if (['keyword', 'compact'].includes(markingMatch.status)) warnings.push(`Маркировка найдена по ключевому слову: ${markingMatch.matched_keyword}`);
+      if (markingMatch.status === 'auto_selected') warnings.push(`Маркировка выбрана автоматически: ${markingMatch.match_reason}`);
       if (saleTariff.missing) warnings.push('Тариф реализации не найден');
       if (deletedReceiptRows.has(sourceRow)) warnings.push('Ранее импортировалось, но приход был удалён');
       if (sheetTotal && Math.abs(sheetTotal - cost.totalCost) > 0.01) warnings.push('TOTAL в таблице отличается от расчёта приложения');
@@ -3487,8 +3548,15 @@ app.post('/api/import/google-sheets/preview', async (req, res) => {
         marking: markingName,
         marking_id: marking?.id || null,
         matched_marking: marking?.marking || null,
+        selected_marking_id: marking?.id || null,
+        selected_marking_name: marking?.marking || null,
         client_id: marking?.client_id || null,
         client_name: marking?.client_name || null,
+        match_status: markingMatch.status,
+        match_reason: markingMatch.match_reason || null,
+        match_score: markingMatch.match_score || null,
+        candidates: markingMatch.candidates || [],
+        needs_manual_selection: markingMatch.status === 'ambiguous',
         marking_match_status: markingMatch.status,
         matched_keyword: markingMatch.matched_keyword || null,
         marking_candidates: markingMatch.candidates || [],
@@ -3640,9 +3708,19 @@ app.post('/api/import/google-sheets/commit', async (req, res) => {
           ...row,
           marking_id: resolvedMarking.id,
           matched_marking: resolvedMarking.marking,
+          selected_marking_id: resolvedMarking.id,
+          selected_marking_name: resolvedMarking.marking,
           client_id: resolvedMarking.client_id,
           client_name: resolvedMarking.client_name,
         };
+
+        if (row.marking_match_status === 'selected' && row.marking?.trim()) {
+          const currentMarking = await get('SELECT keywords FROM markings WHERE id=$1', [+resolvedMarking.id], client);
+          const nextKeywords = appendMarkingKeyword(currentMarking?.keywords || resolvedMarking.keywords || resolvedMarking.marking, row.marking);
+          if (nextKeywords !== (currentMarking?.keywords || '')) {
+            await query('UPDATE markings SET keywords=$1 WHERE id=$2', [nextKeywords, +resolvedMarking.id], client);
+          }
+        }
 
         if (!row.product_name?.trim()) throw new Error('В каждой строке должен быть товар');
         if (createSales && !row.date) throw new Error('Дата обязательна для реализации');

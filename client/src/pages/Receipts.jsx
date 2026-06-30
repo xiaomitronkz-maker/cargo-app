@@ -43,10 +43,17 @@ const MARKING_MATCH_LABELS = {
   exact: 'Точно',
   keyword: 'По ключевому слову',
   compact: 'Без пробелов/знаков',
+  auto_selected: 'Автовыбор',
   ambiguous: 'Несколько вариантов',
   not_found: 'Не найдена',
   selected: 'Выбрано вручную',
   manual_created: 'Создано вручную',
+}
+const markingMatchBadge = (status) => {
+  if (status === 'not_found' || status === 'ambiguous') return 'badge-danger'
+  if (status === 'auto_selected') return 'badge-success'
+  if (status === 'selected' || status === 'manual_created') return 'badge-primary'
+  return 'badge-neutral'
 }
 const statusBadge = (status) => {
   if (status === 'ready') return 'badge-success'
@@ -309,10 +316,15 @@ export default function Receipts() {
           ...row,
           marking_id: marking.id || marking.marking_id,
           matched_marking: markingName,
+          selected_marking_id: marking.id || marking.marking_id,
+          selected_marking_name: markingName,
           client_id: marking.client_id,
           client_name: marking.client_name,
           matched_keyword: matchedKeyword,
           marking_match_status: matchStatus,
+          match_status: matchStatus,
+          match_reason: matchStatus === 'selected' ? 'Выбрано вручную' : row.match_reason,
+          needs_manual_selection: false,
           status: 'ready',
           warnings: normalizeArray(row.warnings).filter(warning => !String(warning).includes('Маркировка')),
         }
@@ -1166,16 +1178,43 @@ export default function Receipts() {
                               </button>
                             </div>
                           ) : (
-                            row.matched_marking || '—'
+                            <div style={{ minWidth: 220 }}>
+                              <div>{row.matched_marking || '—'}</div>
+                              {row.marking_match_status === 'auto_selected' && (
+                                <div style={{ marginTop: 4 }}>
+                                  <span className="badge badge-success">Выбрано автоматически</span>
+                                </div>
+                              )}
+                              {normalizeArray(row.marking_candidates).length > 1 && row.status !== 'already_imported' && (
+                                <select
+                                  className="form-select"
+                                  value={row.marking_id || ''}
+                                  onChange={e => selectImportMarking(rowIndex, e.target.value)}
+                                  style={{ minWidth: 210, marginTop: 6 }}
+                                >
+                                  {normalizeArray(row.marking_candidates).map(candidate => (
+                                    <option key={candidate.marking_id} value={candidate.marking_id}>
+                                      {candidate.marking} · {candidate.client_name}
+                                    </option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
                           )}
                         </td>
                         <td>{row.client_name || '—'}</td>
                         <td>
-                          <span className={`badge ${row.marking_match_status === 'not_found' || row.marking_match_status === 'ambiguous' ? 'badge-danger' : 'badge-neutral'}`}>
+                          <span className={`badge ${markingMatchBadge(row.marking_match_status)}`}>
                             {MARKING_MATCH_LABELS[row.marking_match_status] || row.marking_match_status || '—'}
                           </span>
                           {row.matched_keyword && (
                             <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>{row.matched_keyword}</div>
+                          )}
+                          {row.match_reason && (
+                            <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>{row.match_reason}</div>
+                          )}
+                          {row.match_score != null && (
+                            <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>score: {fmtNum(row.match_score, 1)}</div>
                           )}
                         </td>
                         <td>{row.product_name}</td>
