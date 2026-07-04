@@ -18,6 +18,7 @@ const { randomUUID } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const REQUEST_BODY_LIMIT = '10mb';
 const isProduction = process.env.NODE_ENV === 'production';
 const hasDatabaseUrl = Boolean(process.env.DATABASE_URL);
 let databaseReady = false;
@@ -36,7 +37,8 @@ const pool = hasDatabaseUrl
   : null;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: REQUEST_BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: REQUEST_BODY_LIMIT }));
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
