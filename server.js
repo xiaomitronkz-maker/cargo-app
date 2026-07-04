@@ -5334,23 +5334,18 @@ app.get('/api/debts', async (req, res) => {
 
 app.get('/api/debts/by-suppliers', async (req, res) => {
   res.json(await all(`
-    WITH receipt_totals AS (
+    WITH ${activePaymentAllocationsCte()},
+    receipt_totals AS (
       SELECT r.id, r.supplier_id, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
       GROUP BY r.id, r.supplier_id
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
-          AND p.cancelled_at IS NULL
-      ) x
-      GROUP BY x.receipt_id
+      SELECT document_id AS receipt_id, COALESCE(SUM(amount::numeric),0) AS paid
+      FROM payment_allocations_effective
+      WHERE document_type='receipt'
+      GROUP BY document_id
     )
     SELECT s.id, s.name, COALESCE(SUM(rt.total::numeric - COALESCE(rp.paid::numeric,0)),0) AS debt
     FROM suppliers s
@@ -5803,6 +5798,7 @@ app.get('/api/ledger', async (req, res) => {
 
   const rows = type === 'client'
     ? await all(`
+        WITH ${activePaymentAllocationsCte()}
         SELECT * FROM (
           SELECT
             s.date::text AS date,
@@ -5819,43 +5815,29 @@ app.get('/api/ledger', async (req, res) => {
           WHERE s.client_id=$1
           UNION ALL
           SELECT
-            p.date::text AS date,
+            MIN(pae.payment_date)::text AS date,
             'payment'::text AS type,
-            p.id::integer AS id,
-            p.amount::numeric AS amount,
+            pae.payment_id::integer AS id,
+            COALESCE(SUM(pae.amount::numeric),0) AS amount,
             NULL::numeric AS paid_amount,
-            p.comment::text AS comment,
+            MIN(pae.payment_comment)::text AS comment,
             a.name::text AS account_name,
             t.type::text AS transaction_type,
-            p.created_at::timestamp AS created_at,
+            MIN(pae.payment_created_at)::timestamp AS created_at,
             1::integer AS sort_order
-          FROM payments p
-          JOIN sales s ON p.entity_type='sale' AND s.id=p.entity_id
-          LEFT JOIN transactions t ON t.id=p.transaction_id
+          FROM payment_allocations_effective pae
+          LEFT JOIN sales s ON pae.document_type='sale' AND s.id=pae.document_id
+          LEFT JOIN sales_documents sd ON pae.document_type='sales_document' AND sd.id=pae.document_id
+          LEFT JOIN transactions t ON t.id=pae.transaction_id
           LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
-          WHERE s.client_id=$1
-            AND p.cancelled_at IS NULL
-          UNION ALL
-          SELECT
-            p.date::text AS date,
-            'payment'::text AS type,
-            p.id::integer AS id,
-            p.amount::numeric AS amount,
-            NULL::numeric AS paid_amount,
-            p.comment::text AS comment,
-            a.name::text AS account_name,
-            t.type::text AS transaction_type,
-            p.created_at::timestamp AS created_at,
-            1::integer AS sort_order
-          FROM payments p
-          LEFT JOIN transactions t ON t.id=p.transaction_id
-          LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
-          WHERE p.entity_type='client_advance' AND p.entity_id=$1
-            AND p.cancelled_at IS NULL
+          WHERE pae.document_type IN ('sale','sales_document','client_advance')
+            AND COALESCE(sd.client_id, s.client_id, CASE WHEN pae.document_type='client_advance' THEN pae.document_id ELSE NULL END)=$1
+          GROUP BY pae.payment_id, a.name, t.type
         ) x
         ORDER BY date ASC, created_at ASC, sort_order ASC, id ASC
       `, [entityId])
     : await all(`
+        WITH ${activePaymentAllocationsCte()}
         SELECT * FROM (
           SELECT
             p.date::text AS date,
@@ -5872,22 +5854,24 @@ app.get('/api/ledger', async (req, res) => {
           WHERE p.supplier_id=$1
           UNION ALL
           SELECT
-            pay.date::text AS date,
+            MIN(pae.payment_date)::text AS date,
             'payment'::text AS type,
-            pay.id::integer AS id,
-            pay.amount::numeric AS amount,
+            pae.payment_id::integer AS id,
+            COALESCE(SUM(pae.amount::numeric),0) AS amount,
             NULL::numeric AS paid_amount,
-            pay.comment::text AS comment,
+            MIN(pae.payment_comment)::text AS comment,
             a.name::text AS account_name,
             t.type::text AS transaction_type,
-            pay.created_at::timestamp AS created_at,
+            MIN(pae.payment_created_at)::timestamp AS created_at,
             1::integer AS sort_order
-          FROM payments pay
-          JOIN purchases p ON pay.entity_type='purchase' AND p.id=pay.entity_id
-          LEFT JOIN transactions t ON t.id=pay.transaction_id
+          FROM payment_allocations_effective pae
+          LEFT JOIN receipts r ON pae.document_type='receipt' AND r.id=pae.document_id
+          LEFT JOIN purchases p ON pae.document_type='purchase' AND p.id=pae.document_id
+          LEFT JOIN transactions t ON t.id=pae.transaction_id
           LEFT JOIN accounts a ON a.id=COALESCE(t.account_to_id,t.account_from_id)
-          WHERE p.supplier_id=$1
-            AND pay.cancelled_at IS NULL
+          WHERE pae.document_type IN ('receipt','purchase')
+            AND COALESCE(r.supplier_id, p.supplier_id)=$1
+          GROUP BY pae.payment_id, a.name, t.type
         ) x
         ORDER BY date ASC, created_at ASC, sort_order ASC, id ASC
       `, [entityId]);
