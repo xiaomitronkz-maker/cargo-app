@@ -596,7 +596,7 @@ export default function Debts() {
                     <td>
                       {entry.kind === 'payment' && entry.payment_id ? (
                         <div className="td-actions">
-                          <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)} disabled={Boolean(entry.debt_payment_group_id || entry.cancelled_at)}>
+                          <button className="btn btn-secondary btn-sm" onClick={() => openEditPayment(entry)} disabled={Boolean(entry.cancelled_at)}>
                             Редактировать
                           </button>
                           {entry.cancelled_at ? (

@@ -5311,7 +5311,16 @@ app.put('/api/payments/:id', async (req, res) => {
         throw error;
       }
       if (payment.cancelled_at) throw new Error('Отменённый платеж нельзя редактировать');
-      if (payment.debt_payment_group_id) throw new Error('Групповое погашение нельзя редактировать частично. Отмените погашение целиком и создайте новое.');
+      if (payment.debt_payment_group_id) {
+        const groupCount = await get(
+          'SELECT COUNT(*)::int AS cnt FROM payments WHERE debt_payment_group_id=$1 AND cancelled_at IS NULL',
+          [payment.debt_payment_group_id],
+          client
+        );
+        if (groupCount.cnt > 1) {
+          throw new Error('Групповое погашение из нескольких платежей нельзя редактировать частично. Отмените погашение целиком и создайте новое.');
+        }
+      }
 
       const oldAmount = ledgerNumber(payment.amount);
       const transaction = await getPaymentTransaction(payment, client);
