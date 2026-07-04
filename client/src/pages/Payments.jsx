@@ -9,12 +9,14 @@ const typeMeta = {
   sale: { label: 'Реализация', badge: 'badge-success' },
   purchase: { label: 'Приход', badge: 'badge-warning' },
   client_advance: { label: 'Аванс клиента', badge: 'badge-primary' },
+  client: { label: 'Клиент', badge: 'badge-success' },
+  supplier: { label: 'Поставщик', badge: 'badge-warning' },
 }
 const GROUPED_PAYMENT_EDIT_WARNING = 'Это групповое погашение распределено по нескольким документам. Частичное редактирование недоступно. Отмените погашение целиком и создайте новое.'
 
 const isMultiPaymentGroup = (payment) => {
   const count = toNumber(payment?.payment_count)
-  return Boolean(payment?.is_group || ((payment?.group_id || payment?.debt_payment_group_id) && count > 1))
+  return Boolean((payment?.group_id || payment?.debt_payment_group_id) && count > 1)
 }
 
 export default function Payments() {
@@ -62,9 +64,9 @@ export default function Payments() {
   const paymentCounterparty = (payment) => payment?.entity_name || (payment?.entity_type === 'purchase'
     ? (payment?.supplier_name || payment?.client_name || '—')
     : (payment?.client_name || payment?.supplier_name || '—'))
-  const paymentTypeLabel = (payment) => payment?.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'
+  const paymentTypeLabel = (payment) => ['purchase', 'supplier'].includes(payment?.entity_type) ? 'Поставщик' : 'Клиент'
   const paymentDocument = (payment) => {
-    if (payment?.is_group) return `Распределён по ${payment.payment_count || 0} документам`
+    if (payment?.is_group) return `Распределён по ${payment.allocation_count || payment.payment_count || 0} документам`
     if (payment?.entity_type === 'client_advance') return 'Аванс клиента'
     return payment?.product_name || `Платеж №${payment?.id}`
   }
@@ -75,8 +77,8 @@ export default function Payments() {
     return 'Активен'
   }
   const selectedAccount = accounts.find(account => String(account.id) === String(editForm.cashbox_id))
-  const isSupplierPayment = editing?.entity_type === 'purchase'
-  const isDebtPayment = (payment) => ['sale', 'purchase', 'client_advance'].includes(payment?.entity_type)
+  const isSupplierPayment = ['purchase', 'supplier'].includes(editing?.entity_type)
+  const isDebtPayment = (payment) => ['sale', 'purchase', 'client_advance', 'client', 'supplier'].includes(payment?.entity_type)
   const canCancelPayment = (payment) => isDebtPayment(payment) && Boolean(payment?.debt_payment_group_id) && !payment?.cancelled_at
   const canEditPayment = (payment) => !payment?.cancelled_at
   const editLocked = isMultiPaymentGroup(editing)

@@ -267,6 +267,16 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS payment_allocations (
+      id SERIAL PRIMARY KEY,
+      payment_id INTEGER NOT NULL REFERENCES payments(id),
+      document_type TEXT NOT NULL,
+      document_id INTEGER,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      cancelled_at TIMESTAMP NULL
+    );
+
     CREATE TABLE IF NOT EXISTS accounts (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -388,7 +398,7 @@ async function initDb() {
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS cancelled_reason TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS cancelled_meta JSONB DEFAULT '{}'::jsonb;
     ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_entity_type_check;
-    ALTER TABLE payments ADD CONSTRAINT payments_entity_type_check CHECK(entity_type IN ('sale','purchase','client_advance'));
+    ALTER TABLE payments ADD CONSTRAINT payments_entity_type_check CHECK(entity_type IN ('sale','purchase','client_advance','client','supplier'));
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL;
     ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_type_check;
@@ -403,6 +413,9 @@ async function initDb() {
       AND t.related_type = 'payment'
       AND t.related_id = p.id;
   `);
+
+  await query('CREATE INDEX IF NOT EXISTS idx_payment_allocations_payment_id ON payment_allocations(payment_id)');
+  await query('CREATE INDEX IF NOT EXISTS idx_payment_allocations_document ON payment_allocations(document_type, document_id)');
 
   await query(`
     UPDATE tariffs
@@ -831,17 +844,108 @@ async function getAccountBalance(accountId, client = pool) {
   return +(row?.balance || 0);
 }
 
-async function getReceiptPaidAmount(receiptId, client = pool) {
-  const row = await get(`
-    SELECT COALESCE(SUM(amount::numeric),0) AS total
-    FROM (
-      SELECT DISTINCT p.id, p.amount::numeric AS amount
+function activePaymentAllocationsCte() {
+  return `
+    payment_allocations_effective AS (
+      SELECT
+        p.id::integer AS payment_id,
+        p.entity_type::text AS payment_entity_type,
+        p.entity_id::integer AS payment_entity_id,
+        p.amount::numeric AS payment_amount,
+        p.date::text AS payment_date,
+        p.created_at::timestamp AS payment_created_at,
+        p.comment::text AS payment_comment,
+        p.transaction_id::integer AS transaction_id,
+        p.debt_payment_group_id::text AS debt_payment_group_id,
+        pa.document_type::text AS document_type,
+        pa.document_id::integer AS document_id,
+        pa.amount::numeric AS amount
+      FROM payments p
+      JOIN payment_allocations pa ON pa.payment_id = p.id
+      WHERE p.cancelled_at IS NULL
+        AND pa.cancelled_at IS NULL
+
+      UNION ALL
+
+      SELECT
+        p.id::integer AS payment_id,
+        p.entity_type::text AS payment_entity_type,
+        p.entity_id::integer AS payment_entity_id,
+        p.amount::numeric AS payment_amount,
+        p.date::text AS payment_date,
+        p.created_at::timestamp AS payment_created_at,
+        p.comment::text AS payment_comment,
+        p.transaction_id::integer AS transaction_id,
+        p.debt_payment_group_id::text AS debt_payment_group_id,
+        CASE WHEN s.sales_document_id IS NULL THEN 'sale' ELSE 'sales_document' END::text AS document_type,
+        COALESCE(s.sales_document_id, s.id)::integer AS document_id,
+        p.amount::numeric AS amount
+      FROM payments p
+      JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
+      WHERE p.cancelled_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM payment_allocations pa WHERE pa.payment_id = p.id)
+
+      UNION ALL
+
+      SELECT
+        p.id::integer AS payment_id,
+        p.entity_type::text AS payment_entity_type,
+        p.entity_id::integer AS payment_entity_id,
+        p.amount::numeric AS payment_amount,
+        p.date::text AS payment_date,
+        p.created_at::timestamp AS payment_created_at,
+        p.comment::text AS payment_comment,
+        p.transaction_id::integer AS transaction_id,
+        p.debt_payment_group_id::text AS debt_payment_group_id,
+        CASE WHEN COALESCE(t.receipt_id, pu.receipt_id) IS NULL THEN 'purchase' ELSE 'receipt' END::text AS document_type,
+        COALESCE(t.receipt_id, pu.receipt_id, pu.id)::integer AS document_id,
+        p.amount::numeric AS amount
       FROM payments p
       LEFT JOIN transactions t ON t.id = p.transaction_id
       LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-      WHERE COALESCE(t.receipt_id, pu.receipt_id) = $1
+      WHERE p.entity_type='purchase'
         AND p.cancelled_at IS NULL
-    ) x
+        AND COALESCE(t.receipt_id, pu.receipt_id, pu.id) IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM payment_allocations pa WHERE pa.payment_id = p.id)
+
+      UNION ALL
+
+      SELECT
+        p.id::integer AS payment_id,
+        p.entity_type::text AS payment_entity_type,
+        p.entity_id::integer AS payment_entity_id,
+        p.amount::numeric AS payment_amount,
+        p.date::text AS payment_date,
+        p.created_at::timestamp AS payment_created_at,
+        p.comment::text AS payment_comment,
+        p.transaction_id::integer AS transaction_id,
+        p.debt_payment_group_id::text AS debt_payment_group_id,
+        'client_advance'::text AS document_type,
+        p.entity_id::integer AS document_id,
+        p.amount::numeric AS amount
+      FROM payments p
+      WHERE p.entity_type='client_advance'
+        AND p.cancelled_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM payment_allocations pa WHERE pa.payment_id = p.id)
+    )
+  `;
+}
+
+async function getPaymentAllocations(paymentId, client = pool) {
+  return all(`
+    SELECT id,payment_id,document_type,document_id,amount,created_at,cancelled_at
+    FROM payment_allocations
+    WHERE payment_id=$1
+    ORDER BY id
+  `, [+paymentId], client);
+}
+
+async function getReceiptPaidAmount(receiptId, client = pool) {
+  const row = await get(`
+    WITH ${activePaymentAllocationsCte()}
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM payment_allocations_effective
+    WHERE document_type='receipt' AND document_id=$1
   `, [receiptId], client);
   return +(row?.total || 0);
 }
@@ -1576,18 +1680,10 @@ async function payReceiptDocument(receiptId, { amount, accountFromId, date, comm
 
 async function getSalesDocumentPaidAmount(salesDocumentId, client = pool) {
   const row = await get(`
+    WITH ${activePaymentAllocationsCte()}
     SELECT COALESCE(SUM(amount::numeric),0) AS total
-    FROM (
-      SELECT DISTINCT p.id, p.amount::numeric AS amount
-      FROM payments p
-      LEFT JOIN transactions t ON t.id = p.transaction_id
-      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-      WHERE COALESCE(
-        (SELECT s2.sales_document_id FROM sales s2 WHERE s2.id = t.sale_id),
-        s.sales_document_id
-      ) = $1
-        AND p.cancelled_at IS NULL
-    ) x
+    FROM payment_allocations_effective
+    WHERE document_type='sales_document' AND document_id=$1
   `, [salesDocumentId], client);
   return +(row?.total || 0);
 }
@@ -1891,21 +1987,25 @@ async function validatePaymentCashEdit({ direction, oldAccountId, oldAmount, new
 
 async function getReceiptPaidAmountExcluding(receiptId, paymentId, client = pool) {
   const row = await get(`
-    SELECT COALESCE(SUM(x.amount),0) AS total
-    FROM (
-      SELECT DISTINCT p.id, p.amount::numeric AS amount
-      FROM payments p
-      LEFT JOIN transactions t ON t.id = p.transaction_id
-      LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-      WHERE COALESCE(t.receipt_id, pu.receipt_id)=$1
-        AND p.cancelled_at IS NULL
-        AND p.id<>$2
-    ) x
+    WITH ${activePaymentAllocationsCte()}
+    SELECT COALESCE(SUM(amount::numeric),0) AS total
+    FROM payment_allocations_effective
+    WHERE document_type='receipt'
+      AND document_id=$1
+      AND payment_id<>$2
   `, [receiptId, paymentId], client);
   return +(row?.total || 0);
 }
 
 async function rebalancePaymentDocument(payment, client = pool) {
+  if (payment.entity_type === 'client' || payment.entity_type === 'supplier') {
+    const allocations = await getPaymentAllocations(+payment.id, client);
+    for (const allocation of allocations) {
+      await rebalanceAllocationDocument(allocation.document_type, allocation.document_id, client);
+    }
+    return;
+  }
+
   if (payment.entity_type === 'purchase') {
     const purchase = await get('SELECT id,receipt_id FROM purchases WHERE id=$1', [+payment.entity_id], client);
     if (purchase?.receipt_id) {
@@ -1936,9 +2036,43 @@ async function rebalancePaymentDocument(payment, client = pool) {
   }
 }
 
-async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
+async function rebalanceAllocationDocument(documentType, documentId, client = pool) {
+  if (!documentType || documentId == null) return;
+  if (documentType === 'receipt') {
+    await rebalanceReceiptPurchasePaidAmounts(+documentId, client);
+    return;
+  }
+  if (documentType === 'sales_document') {
+    await rebalanceSalesDocumentPaidAmounts(+documentId, client);
+    return;
+  }
+  if (documentType === 'sale') {
+    const sale = await get('SELECT id,total_amount FROM sales WHERE id=$1', [+documentId], client);
+    if (!sale) return;
+    const paid = +(await get(`
+      WITH ${activePaymentAllocationsCte()}
+      SELECT COALESCE(SUM(amount::numeric),0) AS total
+      FROM payment_allocations_effective
+      WHERE document_type='sale' AND document_id=$1
+    `, [+documentId], client))?.total || 0;
+    await query('UPDATE sales SET paid_amount=$1 WHERE id=$2', [Math.min(+(sale.total_amount || 0), paid), +documentId], client);
+    return;
+  }
+  if (documentType === 'purchase') {
+    const paid = +(await get(`
+      WITH ${activePaymentAllocationsCte()}
+      SELECT COALESCE(SUM(amount::numeric),0) AS total
+      FROM payment_allocations_effective
+      WHERE document_type='purchase' AND document_id=$1
+    `, [+documentId], client))?.total || 0;
+    await query('UPDATE purchases SET paid_amount=$1 WHERE id=$2', [paid, +documentId], client);
+  }
+}
+
+async function getSupplierOpenDebtDocuments(supplierId, client = pool, excludePaymentId = null) {
   const rows = await all(`
-    WITH receipt_totals AS (
+    WITH ${activePaymentAllocationsCte()},
+    receipt_totals AS (
       SELECT
         r.id AS receipt_id,
         r.date,
@@ -1950,16 +2084,11 @@ async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
       GROUP BY r.id, r.date, r.created_at
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
-          AND p.cancelled_at IS NULL
-      ) x
-      GROUP BY x.receipt_id
+      SELECT document_id AS receipt_id, COALESCE(SUM(amount::numeric),0) AS paid
+      FROM payment_allocations_effective
+      WHERE document_type='receipt'
+        AND ($2::integer IS NULL OR payment_id<>$2::integer)
+      GROUP BY document_id
     )
     SELECT
       rt.receipt_id AS document_id,
@@ -1973,7 +2102,7 @@ async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
     LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.receipt_id
     WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
     ORDER BY rt.date ASC NULLS LAST, rt.created_at ASC NULLS LAST, rt.receipt_id ASC
-  `, [supplierId], client);
+  `, [supplierId, excludePaymentId], client);
 
   return rows.map((row) => ({
     ...row,
@@ -1984,7 +2113,7 @@ async function getSupplierOpenDebtDocuments(supplierId, client = pool) {
   }));
 }
 
-async function getClientOpenDebtDocuments(clientId, client = pool) {
+async function getClientOpenDebtDocuments(clientId, client = pool, excludePaymentId = null) {
   const rows = await all(`
     WITH receivable_totals AS (
       SELECT
@@ -2013,7 +2142,7 @@ async function getClientOpenDebtDocuments(clientId, client = pool) {
     ORDER BY rt.date ASC NULLS LAST, rt.created_at ASC NULLS LAST, document_id ASC
   `, [clientId], client);
 
-  let remainingPaid = ledgerNumber(await getClientPaymentTotal(clientId, client));
+  let remainingPaid = ledgerNumber(await getClientPaymentTotal(clientId, client, excludePaymentId));
   const documents = rows.map((row) => {
     const total = +(row.total || 0);
     const paid = ledgerNumber(Math.min(total, remainingPaid));
@@ -2045,24 +2174,25 @@ async function validateSale(productId, saleUnit, quantity, pricePerUnit, client 
   if (rule.sale_type === 'kg' && saleUnit === 'pcs') throw new Error('Для этого товара разрешена продажа только по килограммам (kg)');
 }
 
-async function getClientPaymentTotal(clientId, client = pool) {
+async function getClientPaymentTotal(clientId, client = pool, excludePaymentId = null) {
   const row = await get(`
+    WITH ${activePaymentAllocationsCte()}
     SELECT COALESCE(SUM(amount::numeric),0) AS total
     FROM (
-      SELECT DISTINCT p.id, p.amount::numeric AS amount
-      FROM payments p
-      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-      LEFT JOIN transactions t ON t.id = p.transaction_id
-      LEFT JOIN sales s2 ON s2.id = t.sale_id
-      WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id)=$1
-        AND p.cancelled_at IS NULL
+      SELECT payment_id AS id, amount::numeric AS amount
+      FROM payment_allocations_effective pae
+      LEFT JOIN sales s ON pae.document_type='sale' AND s.id=pae.document_id
+      LEFT JOIN sales_documents sd ON pae.document_type='sales_document' AND sd.id=pae.document_id
+      WHERE COALESCE(sd.client_id, s.client_id)=$1
+        AND ($2::integer IS NULL OR payment_id<>$2::integer)
       UNION ALL
-      SELECT p.id, p.amount::numeric AS amount
-      FROM payments p
-      WHERE p.entity_type='client_advance' AND p.entity_id=$1
-        AND p.cancelled_at IS NULL
+      SELECT payment_id AS id, amount::numeric AS amount
+      FROM payment_allocations_effective
+      WHERE document_type='client_advance'
+        AND document_id=$1
+        AND ($2::integer IS NULL OR payment_id<>$2::integer)
     ) x
-  `, [clientId], client);
+  `, [clientId, excludePaymentId], client);
   return +(row?.total || 0);
 }
 
@@ -2079,7 +2209,8 @@ async function getClientLedgerBalance(clientId, client = pool) {
 
 async function debtSummaryData(client = pool) {
   const clientBalances = await get(`
-    WITH charge_by_client AS (
+    WITH ${activePaymentAllocationsCte()},
+    charge_by_client AS (
       SELECT
         COALESCE(sd.client_id, s.client_id)::integer AS client_id,
         COALESCE(SUM(s.total_amount::numeric),0) AS charged
@@ -2091,24 +2222,22 @@ async function debtSummaryData(client = pool) {
     payment_by_client AS (
       SELECT client_id, COALESCE(SUM(amount::numeric),0) AS paid
       FROM (
-        SELECT DISTINCT
-          p.id,
-          COALESCE(s.client_id, s2.client_id)::integer AS client_id,
-          p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN sales s2 ON s2.id = t.sale_id
-        WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
-          AND p.cancelled_at IS NULL
+        SELECT
+          pae.payment_id AS id,
+          COALESCE(sd.client_id, s.client_id)::integer AS client_id,
+          pae.amount::numeric AS amount
+        FROM payment_allocations_effective pae
+        LEFT JOIN sales s ON pae.document_type='sale' AND s.id=pae.document_id
+        LEFT JOIN sales_documents sd ON pae.document_type='sales_document' AND sd.id=pae.document_id
+        WHERE pae.document_type IN ('sale','sales_document')
+          AND COALESCE(sd.client_id, s.client_id) IS NOT NULL
         UNION ALL
         SELECT
-          p.id,
-          p.entity_id::integer AS client_id,
-          p.amount::numeric AS amount
-        FROM payments p
-        WHERE p.entity_type='client_advance'
-          AND p.cancelled_at IS NULL
+          pae.payment_id AS id,
+          pae.document_id::integer AS client_id,
+          pae.amount::numeric AS amount
+        FROM payment_allocations_effective pae
+        WHERE pae.document_type='client_advance'
       ) x
       GROUP BY client_id
     ),
@@ -2134,23 +2263,18 @@ async function debtSummaryData(client = pool) {
   `, [], client);
 
   const payable = await get(`
-    WITH receipt_totals AS (
+    WITH ${activePaymentAllocationsCte()},
+    receipt_totals AS (
       SELECT r.id, COALESCE(SUM(p.total_cost::numeric),0) AS total
       FROM receipts r
       JOIN purchases p ON p.receipt_id = r.id
       GROUP BY r.id
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id=p.entity_id
-        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
-          AND p.cancelled_at IS NULL
-      ) x
-      GROUP BY x.receipt_id
+      SELECT document_id AS receipt_id, COALESCE(SUM(amount::numeric),0) AS paid
+      FROM payment_allocations_effective
+      WHERE document_type='receipt'
+      GROUP BY document_id
     )
     SELECT COUNT(*)::int AS count, COALESCE(SUM(total::numeric - COALESCE(paid::numeric,0)),0) AS total
     FROM (
@@ -2394,7 +2518,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
     const paymentAmount = ledgerNumber(row.payment);
     grouped.payment = ledgerNumber(+(grouped.payment || 0) + paymentAmount);
     grouped.active_payment = ledgerNumber(+(grouped.active_payment || 0) + (row.cancelled_at ? 0 : paymentAmount));
-    grouped.payment_count += 1;
+    grouped.payment_count += +(row.allocation_count || 1);
     if (row.source_id != null) {
       grouped.payment_ids.push(+row.source_id);
       grouped.source_id = grouped.source_id == null ? +row.source_id : Math.min(+grouped.source_id, +row.source_id);
@@ -2457,7 +2581,7 @@ function buildCounterpartyLedger(type, chargeRows, paymentRows) {
         group_id: entry.kind === 'payment' ? entry.debt_payment_group_id : null,
         payment_count: entry.kind === 'payment' ? entry.payment_count || 1 : 0,
         payment_ids: entry.kind === 'payment' ? entry.payment_ids || [] : [],
-        is_group: entry.kind === 'payment' && Boolean(entry.debt_payment_group_id) && +(entry.payment_count || 1) > 1,
+        is_group: entry.kind === 'payment' && +(entry.payment_count || 1) > 1,
         cancelled_at: entry.cancelled_at,
         cancelled_reason: entry.cancelled_reason || '',
         description: entry.description,
@@ -2518,47 +2642,49 @@ async function debtsLedgerData(client = pool) {
   `, [], client);
 
   const customerPayments = await all(`
-    SELECT * FROM (
-      SELECT DISTINCT ON (p.id)
-        p.id::integer AS source_id,
+    WITH ${activePaymentAllocationsCte()}
+    SELECT
+        pae.payment_id::integer AS source_id,
         NULL::integer AS document_id,
-        p.date::text AS date,
-        p.created_at::text AS created_at,
-        COALESCE(s.client_id, s2.client_id)::integer AS counterparty_id,
-        c.name::text AS counterparty_name,
-        p.amount::numeric AS payment,
+        MIN(pae.payment_date)::text AS date,
+        MIN(pae.payment_created_at)::text AS created_at,
+        COALESCE(sd.client_id, s.client_id)::integer AS counterparty_id,
+        MAX(c.name)::text AS counterparty_name,
+        COALESCE(SUM(pae.amount::numeric),0) AS payment,
+        COUNT(*)::integer AS allocation_count,
         'payment'::text AS kind,
         'Оплата клиента'::text AS description,
-        p.comment::text AS comment,
-        p.debt_payment_group_id::text AS debt_payment_group_id,
-        p.cancelled_at::timestamp AS cancelled_at,
-        p.cancelled_reason::text AS cancelled_reason
-      FROM payments p
-      LEFT JOIN transactions t ON t.id = p.transaction_id
-      LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-      LEFT JOIN sales s2 ON s2.id = t.sale_id
-      LEFT JOIN clients c ON c.id = COALESCE(s.client_id, s2.client_id)
-      WHERE p.entity_type='sale' AND COALESCE(s.client_id, s2.client_id) IS NOT NULL
-      ORDER BY p.id, p.created_at DESC
-    ) sale_payments
+        MIN(pae.payment_comment)::text AS comment,
+        MAX(pae.debt_payment_group_id)::text AS debt_payment_group_id,
+        NULL::timestamp AS cancelled_at,
+        NULL::text AS cancelled_reason
+      FROM payment_allocations_effective pae
+      LEFT JOIN sales s ON pae.document_type='sale' AND s.id=pae.document_id
+      LEFT JOIN sales_documents sd ON pae.document_type='sales_document' AND sd.id=pae.document_id
+      LEFT JOIN clients c ON c.id = COALESCE(sd.client_id, s.client_id)
+      WHERE pae.document_type IN ('sale','sales_document')
+        AND COALESCE(sd.client_id, s.client_id) IS NOT NULL
+      GROUP BY pae.payment_id, COALESCE(sd.client_id, s.client_id)
     UNION ALL
     SELECT
-      p.id::integer AS source_id,
+      pae.payment_id::integer AS source_id,
       NULL::integer AS document_id,
-      p.date::text AS date,
-      p.created_at::text AS created_at,
-      p.entity_id::integer AS counterparty_id,
-      c.name::text AS counterparty_name,
-      p.amount::numeric AS payment,
+      MIN(pae.payment_date)::text AS date,
+      MIN(pae.payment_created_at)::text AS created_at,
+      pae.document_id::integer AS counterparty_id,
+      MAX(c.name)::text AS counterparty_name,
+      COALESCE(SUM(pae.amount::numeric),0) AS payment,
+      COUNT(*)::integer AS allocation_count,
       'payment'::text AS kind,
       'Аванс клиента'::text AS description,
-      p.comment::text AS comment,
-      p.debt_payment_group_id::text AS debt_payment_group_id,
-      p.cancelled_at::timestamp AS cancelled_at,
-      p.cancelled_reason::text AS cancelled_reason
-    FROM payments p
-    LEFT JOIN clients c ON c.id = p.entity_id
-    WHERE p.entity_type='client_advance'
+      MIN(pae.payment_comment)::text AS comment,
+      MAX(pae.debt_payment_group_id)::text AS debt_payment_group_id,
+      NULL::timestamp AS cancelled_at,
+      NULL::text AS cancelled_reason
+    FROM payment_allocations_effective pae
+    LEFT JOIN clients c ON c.id = pae.document_id
+    WHERE pae.document_type='client_advance'
+    GROUP BY pae.payment_id, pae.document_id
   `, [], client);
 
   const supplierCharges = await all(`
@@ -2603,27 +2729,29 @@ async function debtsLedgerData(client = pool) {
   `, [], client);
 
   const supplierPayments = await all(`
-    SELECT DISTINCT ON (p.id)
-      p.id::integer AS source_id,
+    WITH ${activePaymentAllocationsCte()}
+    SELECT
+      pae.payment_id::integer AS source_id,
       NULL::integer AS document_id,
-      p.date::text AS date,
-      p.created_at::text AS created_at,
+      MIN(pae.payment_date)::text AS date,
+      MIN(pae.payment_created_at)::text AS created_at,
       COALESCE(r.supplier_id, pu.supplier_id)::integer AS counterparty_id,
-      s.name::text AS counterparty_name,
-      p.amount::numeric AS payment,
+      MAX(s.name)::text AS counterparty_name,
+      COALESCE(SUM(pae.amount::numeric),0) AS payment,
+      COUNT(*)::integer AS allocation_count,
       'payment'::text AS kind,
       'Оплата поставщику'::text AS description,
-      p.comment::text AS comment,
-      p.debt_payment_group_id::text AS debt_payment_group_id,
-      p.cancelled_at::timestamp AS cancelled_at,
-      p.cancelled_reason::text AS cancelled_reason
-    FROM payments p
-    LEFT JOIN transactions t ON t.id = p.transaction_id
-    LEFT JOIN receipts r ON r.id = t.receipt_id
-    LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
+      MIN(pae.payment_comment)::text AS comment,
+      MAX(pae.debt_payment_group_id)::text AS debt_payment_group_id,
+      NULL::timestamp AS cancelled_at,
+      NULL::text AS cancelled_reason
+    FROM payment_allocations_effective pae
+    LEFT JOIN receipts r ON pae.document_type='receipt' AND r.id=pae.document_id
+    LEFT JOIN purchases pu ON pae.document_type='purchase' AND pu.id=pae.document_id
     LEFT JOIN suppliers s ON s.id = COALESCE(r.supplier_id, pu.supplier_id)
-    WHERE p.entity_type='purchase' AND COALESCE(r.supplier_id, pu.supplier_id) IS NOT NULL
-    ORDER BY p.id, p.created_at DESC
+    WHERE pae.document_type IN ('receipt','purchase')
+      AND COALESCE(r.supplier_id, pu.supplier_id) IS NOT NULL
+    GROUP BY pae.payment_id, COALESCE(r.supplier_id, pu.supplier_id)
   `, [], client);
 
   const customers = buildCounterpartyLedger('customer', customerCharges, customerPayments);
@@ -4437,7 +4565,8 @@ app.get('/api/sales', async (req, res) => {
   if (product_id) { params.push(+product_id); having.push(`BOOL_OR(product_id=$${params.length})`); }
 
   res.json(await all(`
-    WITH sales_base AS (
+    WITH ${activePaymentAllocationsCte()},
+    sales_base AS (
       SELECT
         s.id,
         COALESCE(s.sales_document_id, -s.id) AS group_id,
@@ -4490,20 +4619,12 @@ app.get('/api/sales', async (req, res) => {
       HAVING ${having.length ? having.join(' AND ') : '1=1'}
     ),
     receivable_payments AS (
-      SELECT x.group_id, COALESCE(SUM(x.amount::numeric),0) AS paid_amount
-      FROM (
-        SELECT DISTINCT
-          p.id,
-          COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS group_id,
-          p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN sales s2 ON s2.id = t.sale_id
-        WHERE COALESCE(s.id, s2.id) IS NOT NULL
-          AND p.cancelled_at IS NULL
-      ) x
-      GROUP BY x.group_id
+      SELECT
+        CASE WHEN document_type='sales_document' THEN document_id ELSE -document_id END AS group_id,
+        COALESCE(SUM(amount::numeric),0) AS paid_amount
+      FROM payment_allocations_effective
+      WHERE document_type IN ('sale','sales_document')
+      GROUP BY CASE WHEN document_type='sales_document' THEN document_id ELSE -document_id END
     )
     SELECT
       d.anchor_sale_id AS id,
@@ -4826,6 +4947,27 @@ app.post('/api/debts/pay', async (req, res) => {
       }
 
       const debtPaymentGroupId = randomUUID();
+      const payment = await get(`
+        INSERT INTO payments(entity_type,entity_id,amount,date,comment,debt_payment_group_id)
+        VALUES($1,$2,$3,$4,$5,$6)
+        RETURNING id
+      `, [entityType, entityId, amount, date, comment, debtPaymentGroupId], client);
+      const transaction = await get(`
+        INSERT INTO transactions(type,amount,account_from_id,account_to_id,date,comment,related_type,related_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING id
+      `, [
+        entityType === 'supplier' ? 'expense' : 'income',
+        amount,
+        entityType === 'supplier' ? cashboxId : null,
+        entityType === 'client' ? cashboxId : null,
+        date,
+        comment,
+        'payment',
+        payment.id,
+      ], client);
+      await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, payment.id], client);
+
       let remainingPayment = amount;
       const allocations = [];
 
@@ -4835,31 +4977,40 @@ app.post('/api/debts/pay', async (req, res) => {
         if (!(part > 0)) continue;
 
         if (entityType === 'supplier') {
-          const paymentResult = await payReceiptDocument(document.document_id, { amount: part, accountFromId: cashboxId, date, comment, debtPaymentGroupId, skipOperationLog: true }, client);
+          await query(`
+            INSERT INTO payment_allocations(payment_id,document_type,document_id,amount)
+            VALUES($1,$2,$3,$4)
+          `, [payment.id, 'receipt', document.document_id, part], client);
           allocations.push({
             document_type: 'receipt',
             document_id: document.document_id,
             amount: part,
-            paid_amount: paymentResult.paid_amount,
-            debt: paymentResult.payable,
+            paid_amount: ledgerNumber(+(document.paid || 0) + part),
+            debt: ledgerNumber(+(document.remaining || 0) - part),
           });
         } else if (document.document_type === 'sales_document') {
-          const paymentResult = await paySalesDocumentByAnchorSale(document.anchor_sale_id, { amount: part, accountToId: cashboxId, date, comment, debtPaymentGroupId, skipOperationLog: true }, client);
+          await query(`
+            INSERT INTO payment_allocations(payment_id,document_type,document_id,amount)
+            VALUES($1,$2,$3,$4)
+          `, [payment.id, 'sales_document', document.document_id, part], client);
           allocations.push({
             document_type: 'sales_document',
             document_id: document.document_id,
             amount: part,
-            paid_amount: paymentResult.paid_amount,
-            debt: paymentResult.debt,
+            paid_amount: ledgerNumber(+(document.paid || 0) + part),
+            debt: ledgerNumber(+(document.remaining || 0) - part),
           });
         } else {
-          const paymentResult = await payLegacySaleDocument(document.document_id, { amount: part, accountToId: cashboxId, date, comment, debtPaymentGroupId, skipOperationLog: true }, client);
+          await query(`
+            INSERT INTO payment_allocations(payment_id,document_type,document_id,amount)
+            VALUES($1,$2,$3,$4)
+          `, [payment.id, 'sale', document.document_id, part], client);
           allocations.push({
             document_type: 'sale',
             document_id: document.document_id,
             amount: part,
-            paid_amount: paymentResult.paid_amount,
-            debt: paymentResult.debt,
+            paid_amount: ledgerNumber(+(document.paid || 0) + part),
+            debt: ledgerNumber(+(document.remaining || 0) - part),
           });
         }
 
@@ -4868,25 +5019,24 @@ app.post('/api/debts/pay', async (req, res) => {
 
       if (remainingPayment > 0.009) {
         if (entityType !== 'client') throw new Error('Не удалось распределить оплату по открытым документам');
-        const advanceResult = await createClientAdvancePayment(entityId, {
-          amount: remainingPayment,
-          accountToId: cashboxId,
-          date,
-          comment,
-          debtBefore: totalDebt,
-          paymentAmount: amount,
-          debtPaymentGroupId,
-          skipOperationLog: true,
-        }, client);
+        await query(`
+          INSERT INTO payment_allocations(payment_id,document_type,document_id,amount)
+          VALUES($1,$2,$3,$4)
+        `, [payment.id, 'client_advance', entityId, remainingPayment], client);
+        const balanceAfter = ledgerNumber(totalDebt - amount);
         allocations.push({
           document_type: 'client_advance',
-          document_id: null,
+          document_id: entityId,
           amount: remainingPayment,
-          paid_amount: advanceResult?.amount || remainingPayment,
-          debt: advanceResult?.balance_after || 0,
-          advance_after: advanceResult?.advance_after || 0,
+          paid_amount: remainingPayment,
+          debt: balanceAfter,
+          advance_after: balanceAfter < -0.009 ? ledgerNumber(Math.abs(balanceAfter)) : 0,
         });
         remainingPayment = 0;
+      }
+
+      for (const allocation of allocations) {
+        await rebalanceAllocationDocument(allocation.document_type, allocation.document_id, client);
       }
 
       await logOperation(client, {
@@ -4898,16 +5048,20 @@ app.post('/api/debts/pay', async (req, res) => {
         currency: 'USD',
         description: entityType === 'supplier' ? 'Групповая оплата поставщику' : 'Групповая оплата клиента',
         meta: {
+          payment_id: payment.id,
+          transaction_id: transaction.id,
           group_id: debtPaymentGroupId,
+          entity_type: entityType,
+          entity_id: entityId,
           amount_total: amount,
-          payment_count: allocations.length,
+          allocation_count: allocations.length,
           cashbox_id: cashboxId,
           comment,
           allocations,
         },
       });
 
-      return { allocations, debt_payment_group_id: debtPaymentGroupId };
+      return { allocations, debt_payment_group_id: debtPaymentGroupId, payment_id: payment.id, transaction_id: transaction.id };
     });
     const finalBalance = entityType === 'client'
       ? await getClientLedgerBalance(entityId)
@@ -4921,6 +5075,8 @@ app.post('/api/debts/pay', async (req, res) => {
       previous_debt: totalDebt,
       remaining_debt: finalBalance,
       advance_amount: entityType === 'client' && finalBalance < -0.009 ? ledgerNumber(Math.abs(finalBalance)) : 0,
+      payment_id: result.payment_id,
+      transaction_id: result.transaction_id,
       debt_payment_group_id: result.debt_payment_group_id,
       allocations: result.allocations,
     });
@@ -4971,13 +5127,13 @@ app.post('/api/debts/payments/:groupId/cancel', async (req, res) => {
         throw new Error('Погашение уже отменено');
       }
 
-      const unsupported = payments.find((payment) => !['sale', 'purchase', 'client_advance'].includes(payment.entity_type));
+      const unsupported = payments.find((payment) => !['sale', 'purchase', 'client_advance', 'client', 'supplier'].includes(payment.entity_type));
       if (unsupported) throw new Error('Этот тип платежа нельзя отменить как погашение долга');
 
       const refundByAccount = new Map();
       for (const payment of payments) {
         const amount = ledgerNumber(payment.amount);
-        const isClientPayment = payment.entity_type === 'sale' || payment.entity_type === 'client_advance';
+        const isClientPayment = payment.entity_type === 'sale' || payment.entity_type === 'client_advance' || payment.entity_type === 'client';
         const accountId = isClientPayment ? +(payment.account_to_id || 0) : +(payment.account_from_id || 0);
         if (!accountId) throw new Error('Платеж без кассовой операции нельзя отменить автоматически');
         if (isClientPayment) {
@@ -4994,7 +5150,7 @@ app.post('/api/debts/payments/:groupId/cancel', async (req, res) => {
       const reverseTransactionIds = [];
       for (const payment of payments) {
         const amount = ledgerNumber(payment.amount);
-        const isClientPayment = payment.entity_type === 'sale' || payment.entity_type === 'client_advance';
+        const isClientPayment = payment.entity_type === 'sale' || payment.entity_type === 'client_advance' || payment.entity_type === 'client';
         const accountId = isClientPayment ? +(payment.account_to_id || 0) : +(payment.account_from_id || 0);
         const reverse = await get(`
           INSERT INTO transactions(type,amount,account_from_id,account_to_id,receipt_id,sale_id,date,comment,related_type,related_id)
@@ -5026,6 +5182,14 @@ app.post('/api/debts/payments/:groupId/cancel', async (req, res) => {
         reason,
         JSON.stringify({ reverse_transaction_ids: reverseTransactionIds, cancelled_date: date }),
       ], client);
+
+      await query(`
+        UPDATE payment_allocations pa
+        SET cancelled_at=CURRENT_TIMESTAMP
+        FROM payments p
+        WHERE pa.payment_id=p.id
+          AND p.debt_payment_group_id=$1
+      `, [groupId], client);
 
       for (const payment of payments) {
         await rebalancePaymentDocument(payment, client);
@@ -5064,7 +5228,8 @@ app.post('/api/debts/payments/:groupId/cancel', async (req, res) => {
 
 app.get('/api/debts', async (req, res) => {
   const debts = await all(`
-    WITH receivable_totals AS (
+    WITH ${activePaymentAllocationsCte()},
+    receivable_totals AS (
       SELECT
         COALESCE(sd.id, -s.id) AS receivable_group_id,
         sd.id AS sales_document_id,
@@ -5084,17 +5249,12 @@ app.get('/api/debts', async (req, res) => {
       GROUP BY COALESCE(sd.id, -s.id), sd.id, COALESCE(sd.date, s.date), COALESCE(sd.created_at, s.created_at), COALESCE(sd.client_id, s.client_id), COALESCE(sd.marking_id, s.marking_id), c.name, m.marking
     ),
     receivable_payments AS (
-      SELECT x.receivable_group_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(s.sales_document_id, s2.sales_document_id, -COALESCE(s.id, s2.id)) AS receivable_group_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN sales s2 ON s2.id = t.sale_id
-        WHERE COALESCE(s.id, s2.id) IS NOT NULL
-          AND p.cancelled_at IS NULL
-      ) x
-      GROUP BY x.receivable_group_id
+      SELECT
+        CASE WHEN pae.document_type='sales_document' THEN pae.document_id ELSE -pae.document_id END AS receivable_group_id,
+        COALESCE(SUM(pae.amount::numeric),0) AS paid
+      FROM payment_allocations_effective pae
+      WHERE pae.document_type IN ('sale','sales_document')
+      GROUP BY CASE WHEN pae.document_type='sales_document' THEN pae.document_id ELSE -pae.document_id END
     ),
     receipt_totals AS (
       SELECT r.id AS receipt_id, r.date, r.created_at, r.supplier_id, s.name AS supplier_name, COALESCE(SUM(p.total_cost::numeric),0) AS total
@@ -5104,16 +5264,10 @@ app.get('/api/debts', async (req, res) => {
       GROUP BY r.id, r.date, r.created_at, r.supplier_id, s.name
     ),
     receipt_payments AS (
-      SELECT x.receipt_id, COALESCE(SUM(x.amount::numeric),0) AS paid
-      FROM (
-        SELECT DISTINCT p.id, COALESCE(t.receipt_id, pu.receipt_id) AS receipt_id, p.amount::numeric AS amount
-        FROM payments p
-        LEFT JOIN transactions t ON t.id = p.transaction_id
-        LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
-        WHERE COALESCE(t.receipt_id, pu.receipt_id) IS NOT NULL
-          AND p.cancelled_at IS NULL
-      ) x
-      GROUP BY x.receipt_id
+      SELECT document_id AS receipt_id, COALESCE(SUM(amount::numeric),0) AS paid
+      FROM payment_allocations_effective
+      WHERE document_type='receipt'
+      GROUP BY document_id
     )
     SELECT *
     FROM (
@@ -5229,6 +5383,7 @@ app.get('/api/payments', async (req, res) => {
         p.comment,
         p.transaction_id,
         p.debt_payment_group_id,
+        COALESCE(pa_alloc.allocation_count, 0)::integer AS allocation_count,
         p.cancelled_at,
         p.cancelled_reason,
         p.cancelled_meta,
@@ -5236,10 +5391,16 @@ app.get('/api/payments', async (req, res) => {
         COALESCE(t.account_to_id, t.account_from_id) AS cashbox_id,
         a.name AS account_name,
         p.created_at,
-        c.name AS client_name,
-        su.name AS supplier_name,
+        COALESCE(c.name, cp.name) AS client_name,
+        COALESCE(su.name, sp.name) AS supplier_name,
         pr.name AS product_name
       FROM payments p
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::integer AS allocation_count
+        FROM payment_allocations pa
+        WHERE pa.payment_id = p.id
+          AND pa.cancelled_at IS NULL
+      ) pa_alloc ON TRUE
       LEFT JOIN transactions t ON t.id = p.transaction_id
       LEFT JOIN accounts a ON a.id = COALESCE(t.account_to_id, t.account_from_id)
       LEFT JOIN sales s ON p.entity_type='sale' AND s.id = p.entity_id
@@ -5249,6 +5410,8 @@ app.get('/api/payments', async (req, res) => {
       LEFT JOIN purchases pu ON p.entity_type='purchase' AND pu.id = p.entity_id
       LEFT JOIN receipts r ON r.id = t.receipt_id
       LEFT JOIN clients ca ON p.entity_type='client_advance' AND ca.id = p.entity_id
+      LEFT JOIN clients cp ON p.entity_type='client' AND cp.id = p.entity_id
+      LEFT JOIN suppliers sp ON p.entity_type='supplier' AND sp.id = p.entity_id
       LEFT JOIN clients c ON c.id = COALESCE(sd.client_id, s.client_id, sd2.client_id, s2.client_id, pu.client_id, ca.id)
       LEFT JOIN suppliers su ON su.id = COALESCE(pu.supplier_id, r.supplier_id)
       LEFT JOIN products pr ON pr.id = COALESCE(s.product_id, s2.product_id, pu.product_id)
@@ -5269,7 +5432,8 @@ app.get('/api/payments', async (req, res) => {
       MAX(debt_payment_group_id)::text AS debt_payment_group_id,
       MAX(debt_payment_group_id)::text AS group_id,
       COUNT(*)::integer AS payment_count,
-      (MAX(debt_payment_group_id) IS NOT NULL AND COUNT(*) > 1) AS is_group,
+      MAX(allocation_count)::integer AS allocation_count,
+      ((MAX(debt_payment_group_id) IS NOT NULL AND COUNT(*) > 1) OR MAX(allocation_count) > 1) AS is_group,
       ARRAY_AGG(id ORDER BY id)::integer[] AS payment_ids,
       MAX(cancelled_at)::timestamp AS cancelled_at,
       MAX(cancelled_reason)::text AS cancelled_reason,
@@ -5326,7 +5490,7 @@ app.put('/api/payments/:id', async (req, res) => {
 
       const oldAmount = ledgerNumber(payment.amount);
       const transaction = await getPaymentTransaction(payment, client);
-      const direction = payment.entity_type === 'purchase' ? 'out' : 'in';
+      const direction = ['purchase', 'supplier'].includes(payment.entity_type) ? 'out' : 'in';
       const oldCashboxId = direction === 'out' ? +(transaction?.account_from_id || 0) : +(transaction?.account_to_id || 0);
       let transactionType = direction === 'out' ? 'expense' : 'income';
       let receiptId = transaction?.receipt_id ? +transaction.receipt_id : null;
@@ -5336,6 +5500,141 @@ app.put('/api/payments/:id', async (req, res) => {
       let logEntityType = 'payment';
       let logEntityId = paymentId;
       let counterpartyName = '';
+
+      if (payment.entity_type === 'client' || payment.entity_type === 'supplier') {
+        const isSupplier = payment.entity_type === 'supplier';
+        const counterparty = isSupplier
+          ? await get('SELECT id,name FROM suppliers WHERE id=$1', [+payment.entity_id], client)
+          : await get('SELECT id,name FROM clients WHERE id=$1', [+payment.entity_id], client);
+        if (!counterparty) throw new Error(isSupplier ? 'Поставщик для платежа не найден' : 'Клиент для платежа не найден');
+
+        const oldAllocations = await all('SELECT document_type,document_id FROM payment_allocations WHERE payment_id=$1', [paymentId], client);
+        const documents = isSupplier
+          ? await getSupplierOpenDebtDocuments(+payment.entity_id, client, paymentId)
+          : await getClientOpenDebtDocuments(+payment.entity_id, client, paymentId);
+        const totalDebt = ledgerNumber(documents.reduce((sum, document) => sum + +(document.remaining || 0), 0));
+        if (isSupplier && amount > totalDebt + 0.009) throw new Error('Сумма оплаты превышает общий долг поставщика');
+
+        await validatePaymentCashEdit({
+          direction,
+          oldAccountId: oldCashboxId || null,
+          oldAmount: transaction ? oldAmount : 0,
+          newAccountId: cashboxId,
+          newAmount: amount,
+        }, client);
+
+        await query('DELETE FROM payment_allocations WHERE payment_id=$1', [paymentId], client);
+
+        let remainingPayment = amount;
+        const newAllocations = [];
+        for (const document of documents) {
+          if (remainingPayment <= 0.009) break;
+          const part = ledgerNumber(Math.min(remainingPayment, +(document.remaining || 0)));
+          if (!(part > 0)) continue;
+          const documentType = isSupplier
+            ? 'receipt'
+            : (document.document_type === 'sales_document' ? 'sales_document' : 'sale');
+          await query(`
+            INSERT INTO payment_allocations(payment_id,document_type,document_id,amount)
+            VALUES($1,$2,$3,$4)
+          `, [paymentId, documentType, document.document_id, part], client);
+          newAllocations.push({ document_type: documentType, document_id: document.document_id, amount: part });
+          remainingPayment = ledgerNumber(remainingPayment - part);
+        }
+
+        if (remainingPayment > 0.009) {
+          if (isSupplier) throw new Error('Не удалось распределить оплату по открытым документам');
+          await query(`
+            INSERT INTO payment_allocations(payment_id,document_type,document_id,amount)
+            VALUES($1,$2,$3,$4)
+          `, [paymentId, 'client_advance', +payment.entity_id, remainingPayment], client);
+          newAllocations.push({ document_type: 'client_advance', document_id: +payment.entity_id, amount: remainingPayment });
+        }
+
+        await query('UPDATE payments SET amount=$1,date=$2,comment=$3 WHERE id=$4', [amount, date, comment, paymentId], client);
+        if (transaction) {
+          await query(`
+            UPDATE transactions
+            SET type=$1,
+                amount=$2,
+                account_from_id=$3,
+                account_to_id=$4,
+                receipt_id=NULL,
+                sale_id=NULL,
+                date=$5,
+                comment=$6,
+                related_type='payment',
+                related_id=$7
+            WHERE id=$8
+          `, [
+            transactionType,
+            amount,
+            isSupplier ? cashboxId : null,
+            isSupplier ? null : cashboxId,
+            date,
+            comment,
+            paymentId,
+            transaction.id,
+          ], client);
+          if (!payment.transaction_id) {
+            await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [transaction.id, paymentId], client);
+          }
+        } else {
+          const created = await get(`
+            INSERT INTO transactions(type,amount,account_from_id,account_to_id,date,comment,related_type,related_id)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+            RETURNING id
+          `, [
+            transactionType,
+            amount,
+            isSupplier ? cashboxId : null,
+            isSupplier ? null : cashboxId,
+            date,
+            comment,
+            'payment',
+            paymentId,
+          ], client);
+          await query('UPDATE payments SET transaction_id=$1 WHERE id=$2', [created.id, paymentId], client);
+        }
+
+        for (const allocation of [...oldAllocations, ...newAllocations]) {
+          await rebalanceAllocationDocument(allocation.document_type, allocation.document_id, client);
+        }
+
+        await logOperation(client, {
+          action: 'payment_updated',
+          entity_type: payment.entity_type,
+          entity_id: +payment.entity_id,
+          entity_label: counterparty.name || (isSupplier ? `Поставщик №${payment.entity_id}` : `Клиент №${payment.entity_id}`),
+          amount,
+          currency: 'USD',
+          description: isSupplier ? `Изменён платеж поставщику ${counterparty.name || ''}` : `Изменён платеж клиента ${counterparty.name || ''}`,
+          meta: {
+            old_amount: oldAmount,
+            new_amount: amount,
+            old_cashbox_id: oldCashboxId || null,
+            new_cashbox_id: cashboxId,
+            old_date: payment.date,
+            new_date: date,
+            old_comment: payment.comment || null,
+            new_comment: comment,
+            entity_type: payment.entity_type,
+            entity_id: +payment.entity_id,
+            payment_id: paymentId,
+            allocation_count: newAllocations.length,
+          },
+        });
+
+        return {
+          id: paymentId,
+          entity_type: payment.entity_type,
+          entity_id: +payment.entity_id,
+          amount,
+          cashbox_id: cashboxId,
+          date,
+          comment,
+        };
+      }
 
       if (payment.entity_type === 'purchase') {
         const purchase = await get(`

@@ -98,7 +98,7 @@ const GROUPED_PAYMENT_EDIT_WARNING = 'Это групповое погашени
 
 function isMultiPaymentGroup(payment) {
   const count = toNumber(payment?.payment_count)
-  return Boolean(payment?.is_group || ((payment?.group_id || payment?.debt_payment_group_id) && count > 1))
+  return Boolean((payment?.group_id || payment?.debt_payment_group_id) && count > 1)
 }
 
 function paymentTitle(row) {
@@ -799,7 +799,7 @@ export default function Debts() {
           </div>
           <div className="record-meta" style={{ marginBottom: 14 }}>
             <span>Тип</span>
-            <strong>{editPaymentTarget.entity_type === 'purchase' ? 'Поставщик' : 'Клиент'}</strong>
+            <strong>{['purchase', 'supplier'].includes(editPaymentTarget.entity_type) ? 'Поставщик' : 'Клиент'}</strong>
           </div>
           <div className="record-meta" style={{ marginBottom: 14 }}>
             <span>Текущая сумма</span>
@@ -849,7 +849,7 @@ export default function Debts() {
               className="form-textarea"
               value={editPaymentForm.comment}
               onChange={e => setEditPaymentField('comment', e.target.value)}
-              placeholder={editPaymentTarget.entity_type === 'purchase' ? 'Оплата поставщику' : 'Оплата клиента'}
+              placeholder={['purchase', 'supplier'].includes(editPaymentTarget.entity_type) ? 'Оплата поставщику' : 'Оплата клиента'}
               disabled={editPaymentLocked}
             />
           </div>
