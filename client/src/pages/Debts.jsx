@@ -94,6 +94,13 @@ function paymentDistributionLabel(entry, rowType) {
   return `Распределено по ${count} ${rowType === 'supplier' ? 'приходам' : 'реализациям'}`
 }
 
+const GROUPED_PAYMENT_EDIT_WARNING = 'Это групповое погашение распределено по нескольким документам. Частичное редактирование недоступно. Отмените погашение целиком и создайте новое.'
+
+function isMultiPaymentGroup(payment) {
+  const count = toNumber(payment?.payment_count)
+  return Boolean(payment?.is_group || ((payment?.group_id || payment?.debt_payment_group_id) && count > 1))
+}
+
 function paymentTitle(row) {
   return row?.type === 'supplier' ? 'Оплата поставщику' : 'Оплата клиента'
 }
@@ -321,6 +328,10 @@ export default function Debts() {
 
   const submitEditPayment = async () => {
     if (!editPaymentTarget) return
+    if (isMultiPaymentGroup(editPaymentTarget)) {
+      setEditPaymentError(GROUPED_PAYMENT_EDIT_WARNING)
+      return
+    }
     const amount = roundMoney(editPaymentForm.amount)
     if (!editPaymentForm.account_id) {
       setEditPaymentError('Выберите кассу')
@@ -362,6 +373,11 @@ export default function Debts() {
     try {
       await api.cancelDebtPaymentGroup(entry.debt_payment_group_id)
       await refreshAfterPayment()
+      if (editPaymentTarget?.debt_payment_group_id === entry.debt_payment_group_id) {
+        setEditPaymentTarget(null)
+        setEditPaymentForm(emptyPaymentForm())
+        setEditPaymentError('')
+      }
       alert('Погашение отменено')
     } catch (e) {
       alert(e.message || 'Не удалось отменить погашение')
@@ -370,7 +386,8 @@ export default function Debts() {
     }
   }
 
-  const canCancelDebtPayment = (entry) => Boolean(entry?.payment_id && entry.debt_payment_group_id && !entry.cancelled_at)
+  const canCancelDebtPayment = (entry) => Boolean((entry?.payment_id || entry?.id) && entry.debt_payment_group_id && !entry.cancelled_at)
+  const editPaymentLocked = isMultiPaymentGroup(editPaymentTarget)
 
   const renderRows = () => {
     if (rows.length === 0) {
@@ -754,14 +771,28 @@ export default function Debts() {
           onClose={closeEditPayment}
           footer={
             <>
-              <button className="btn btn-secondary" onClick={closeEditPayment} disabled={editPaymentSaving}>Отмена</button>
-              <button className="btn btn-primary" onClick={submitEditPayment} disabled={editPaymentSaving}>
-                {editPaymentSaving ? 'Сохранение...' : 'Сохранить'}
+              {editPaymentLocked && canCancelDebtPayment(editPaymentTarget) && (
+                <button
+                  className="btn btn-danger"
+                  onClick={() => cancelDebtPayment(editPaymentTarget)}
+                  disabled={editPaymentSaving || cancellingGroupId === editPaymentTarget.debt_payment_group_id}
+                >
+                  {cancellingGroupId === editPaymentTarget.debt_payment_group_id ? 'Отмена...' : 'Отменить погашение целиком'}
+                </button>
+              )}
+              <button className="btn btn-secondary" onClick={closeEditPayment} disabled={editPaymentSaving}>
+                {editPaymentLocked ? 'Закрыть' : 'Отмена'}
               </button>
+              {!editPaymentLocked && (
+                <button className="btn btn-primary" onClick={submitEditPayment} disabled={editPaymentSaving}>
+                  {editPaymentSaving ? 'Сохранение...' : 'Сохранить'}
+                </button>
+              )}
             </>
           }
         >
           {editPaymentError && <div className="alert alert-error">{editPaymentError}</div>}
+          {editPaymentLocked && <div className="alert alert-info">{GROUPED_PAYMENT_EDIT_WARNING}</div>}
           <div className="record-meta" style={{ marginBottom: 14 }}>
             <span>Контрагент</span>
             <strong>{selected?.counterparty_name || editPaymentTarget.client_name || editPaymentTarget.supplier_name || '—'}</strong>
@@ -777,7 +808,7 @@ export default function Debts() {
 
           <div className="form-group">
             <label className="form-label">Касса</label>
-            <select className="form-select" value={editPaymentForm.account_id} onChange={e => setEditPaymentField('account_id', e.target.value)}>
+            <select className="form-select" value={editPaymentForm.account_id} onChange={e => setEditPaymentField('account_id', e.target.value)} disabled={editPaymentLocked}>
               <option value="">— Выберите кассу —</option>
               {accounts.map(account => (
                 <option key={account.id} value={String(account.id)}>
@@ -797,6 +828,7 @@ export default function Debts() {
                 className="form-input"
                 value={editPaymentForm.amount}
                 onChange={e => setEditPaymentField('amount', e.target.value)}
+                disabled={editPaymentLocked}
               />
             </div>
             <div className="form-group">
@@ -806,6 +838,7 @@ export default function Debts() {
                 className="form-input"
                 value={editPaymentForm.date}
                 onChange={e => setEditPaymentField('date', e.target.value)}
+                disabled={editPaymentLocked}
               />
             </div>
           </div>
@@ -817,12 +850,15 @@ export default function Debts() {
               value={editPaymentForm.comment}
               onChange={e => setEditPaymentField('comment', e.target.value)}
               placeholder={editPaymentTarget.entity_type === 'purchase' ? 'Оплата поставщику' : 'Оплата клиента'}
+              disabled={editPaymentLocked}
             />
           </div>
 
-          <div className="alert alert-info">
-            Если платеж был распределен по нескольким документам, сейчас редактируется только выбранная строка платежа.
-          </div>
+          {!editPaymentLocked && (
+            <div className="alert alert-info">
+              Можно изменить кассу, сумму, дату и комментарий выбранного платежа.
+            </div>
+          )}
         </Modal>
       )}
     </div>
