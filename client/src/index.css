@@ -371,6 +371,54 @@ tbody tr:hover { background: var(--surface-2); }
 }
 .modal-wide { max-width: 720px; }
 
+.modal.google-sheets-import-modal {
+  width: min(1400px, 96vw);
+  max-width: 96vw;
+  max-height: 92vh;
+}
+.google-sheets-import-modal .modal-body {
+  overflow: auto;
+}
+.google-sheets-import-modal .modal-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--surface);
+}
+.google-sheets-summary-wrapper,
+.google-sheets-preview-wrapper {
+  overflow-x: auto;
+}
+.google-sheets-summary-table {
+  min-width: 1100px;
+}
+.google-sheets-preview-table {
+  min-width: 1280px;
+  table-layout: fixed;
+}
+.google-sheets-preview-table th,
+.google-sheets-preview-table td {
+  vertical-align: top;
+}
+.google-sheets-preview-table .gs-col-date { width: 92px; }
+.google-sheets-preview-table .gs-col-marking { width: 190px; }
+.google-sheets-preview-table .gs-col-found { width: 300px; }
+.google-sheets-preview-table .gs-col-client { width: 180px; }
+.google-sheets-preview-table .gs-col-match { width: 220px; }
+.google-sheets-preview-table .gs-col-product { width: 180px; }
+.google-sheets-preview-table .gs-col-compact { width: 82px; }
+.google-sheets-preview-table .gs-col-tariff { width: 160px; }
+.google-sheets-preview-table .gs-col-money { width: 118px; }
+.google-sheets-preview-table .gs-col-status { width: 170px; }
+.google-sheets-marking-picker {
+  min-width: 280px;
+}
+.google-sheets-marking-select {
+  min-width: 280px;
+  width: 100%;
+  margin-bottom: 6px;
+}
+
 /* ─── Alerts ────────────────────────────────────────────────────────────── */
 .alert {
   padding: 10px 14px;
@@ -758,6 +806,14 @@ tbody tr:hover { background: var(--surface-2); }
     max-width: calc(100vw - 24px);
     max-height: 90vh;
     margin: auto 0;
+  }
+  .modal.google-sheets-import-modal {
+    width: 96vw;
+    max-width: 96vw;
+    max-height: 92vh;
+  }
+  .google-sheets-preview-table {
+    min-width: 1180px;
   }
   .modal-header {
     padding: 14px 14px 12px;

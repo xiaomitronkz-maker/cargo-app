@@ -839,6 +839,7 @@ export default function Receipts() {
       {importOpen && (
         <Modal
           wide
+          className="google-sheets-import-modal"
           title="Импорт из Google Sheets"
           onClose={() => setImportOpen(false)}
           footer={
@@ -1059,8 +1060,8 @@ export default function Receipts() {
               )}
 
               <div style={{ fontWeight: 700, margin: '18px 0 10px' }}>Сводка будущих приходов</div>
-              <div className="table-wrapper">
-                <table>
+              <div className="table-wrapper google-sheets-summary-wrapper">
+                <table className="google-sheets-summary-table">
                   <thead>
                     <tr>
                       <th>Дата</th>
@@ -1101,45 +1102,44 @@ export default function Receipts() {
               </div>
 
               <div style={{ fontWeight: 700, margin: '18px 0 10px' }}>Строки из Google Sheets</div>
-              <div className="table-wrapper">
-                <table>
+              <div className="table-wrapper google-sheets-preview-wrapper">
+                <table className="google-sheets-preview-table">
                   <thead>
                     <tr>
-                      <th>Дата</th>
-                      <th>Маркировка из таблицы</th>
-                      <th>Найдена</th>
-                      <th>Клиент</th>
-                      <th>Подбор</th>
-                      <th>Товар</th>
-                      <th>PCS</th>
-                      <th>KG</th>
-                      <th>CLASS</th>
-                      <th>Тариф</th>
-                      <th>DXB $/кг</th>
-                      <th>ALA</th>
-                      <th>ALA ед.</th>
-                      <th>Себест. app</th>
-                      <th>TOTAL sheet</th>
-                      {importWithSale && <th>Тариф реализации</th>}
-                      {importWithSale && <th>Ед. реал.</th>}
-                      {importWithSale && <th>Цена реал.</th>}
-                      {importWithSale && <th>Итого реал.</th>}
-                      <th>Статус</th>
+                      <th className="gs-col-date">Дата</th>
+                      <th className="gs-col-marking">Маркировка из таблицы</th>
+                      <th className="gs-col-found">Найдена</th>
+                      <th className="gs-col-client">Клиент</th>
+                      <th className="gs-col-match">Подбор</th>
+                      <th className="gs-col-product">Товар</th>
+                      <th className="gs-col-compact">PCS</th>
+                      <th className="gs-col-compact">KG</th>
+                      <th className="gs-col-compact">CLASS</th>
+                      <th className="gs-col-tariff">Тариф</th>
+                      <th className="gs-col-money">DXB $/кг</th>
+                      <th className="gs-col-money">ALA</th>
+                      <th className="gs-col-compact">ALA ед.</th>
+                      <th className="gs-col-money">Себест. app</th>
+                      <th className="gs-col-money">TOTAL sheet</th>
+                      {importWithSale && <th className="gs-col-tariff">Тариф реализации</th>}
+                      {importWithSale && <th className="gs-col-compact">Ед. реал.</th>}
+                      {importWithSale && <th className="gs-col-money">Цена реал.</th>}
+                      {importWithSale && <th className="gs-col-money">Итого реал.</th>}
+                      <th className="gs-col-status">Статус</th>
                     </tr>
                   </thead>
                   <tbody>
                     {previewRows.map((row, rowIndex) => (
                       <tr key={`${row.spreadsheet_id}-${row.gid}-${row.source_row}`}>
-                        <td className="td-date">{formatDate(row.date)}</td>
-                        <td>{row.marking}</td>
-                        <td>
+                        <td className="td-date gs-col-date">{formatDate(row.date)}</td>
+                        <td className="gs-col-marking">{row.marking}</td>
+                        <td className="gs-col-found">
                           {row.status === 'marking_ambiguous' ? (
                             <>
                               <select
-                                className="form-select"
+                                className="form-select google-sheets-marking-select"
                                 value=""
                                 onChange={e => selectImportMarking(rowIndex, e.target.value)}
-                                style={{ minWidth: 210 }}
                               >
                                 <option value="">— Выберите маркировку —</option>
                                 {normalizeArray(row.marking_candidates).map(candidate => (
@@ -1155,12 +1155,11 @@ export default function Receipts() {
                               ))}
                             </>
                           ) : row.status === 'marking_not_found' ? (
-                            <div style={{ minWidth: 240 }}>
+                            <div className="google-sheets-marking-picker">
                               <select
-                                className="form-select"
+                                className="form-select google-sheets-marking-select"
                                 value=""
                                 onChange={e => selectExistingImportMarking(rowIndex, e.target.value)}
-                                style={{ minWidth: 220, marginBottom: 6 }}
                               >
                                 <option value="">— Выбрать из справочника —</option>
                                 {markings.map(marking => (
@@ -1178,7 +1177,7 @@ export default function Receipts() {
                               </button>
                             </div>
                           ) : (
-                            <div style={{ minWidth: 220 }}>
+                            <div className="google-sheets-marking-picker">
                               <div>{row.matched_marking || '—'}</div>
                               {row.marking_match_status === 'auto_selected' && (
                                 <div style={{ marginTop: 4 }}>
@@ -1187,10 +1186,9 @@ export default function Receipts() {
                               )}
                               {normalizeArray(row.marking_candidates).length > 1 && row.status !== 'already_imported' && (
                                 <select
-                                  className="form-select"
+                                  className="form-select google-sheets-marking-select"
                                   value={row.marking_id || ''}
                                   onChange={e => selectImportMarking(rowIndex, e.target.value)}
-                                  style={{ minWidth: 210, marginTop: 6 }}
                                 >
                                   {normalizeArray(row.marking_candidates).map(candidate => (
                                     <option key={candidate.marking_id} value={candidate.marking_id}>
@@ -1202,8 +1200,8 @@ export default function Receipts() {
                             </div>
                           )}
                         </td>
-                        <td>{row.client_name || '—'}</td>
-                        <td>
+                        <td className="gs-col-client">{row.client_name || '—'}</td>
+                        <td className="gs-col-match">
                           <span className={`badge ${markingMatchBadge(row.marking_match_status)}`}>
                             {MARKING_MATCH_LABELS[row.marking_match_status] || row.marking_match_status || '—'}
                           </span>
@@ -1217,24 +1215,24 @@ export default function Receipts() {
                             <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>score: {fmtNum(row.match_score, 1)}</div>
                           )}
                         </td>
-                        <td>{row.product_name}</td>
-                        <td className="td-mono">{fmtNum(row.quantity_pcs, 0)}</td>
-                        <td className="td-mono">{fmtNum(row.weight_kg, 3)}</td>
-                        <td>{row.class || '—'}</td>
-                        <td>{row.tariff_name}</td>
-                        <td className="td-mono">
+                        <td className="gs-col-product">{row.product_name}</td>
+                        <td className="td-mono gs-col-compact">{fmtNum(row.quantity_pcs, 0)}</td>
+                        <td className="td-mono gs-col-compact">{fmtNum(row.weight_kg, 3)}</td>
+                        <td className="gs-col-compact">{row.class || '—'}</td>
+                        <td className="gs-col-tariff">{row.tariff_name}</td>
+                        <td className="td-mono gs-col-money">
                           <div>{fmtMoney(row.app_dxb_rate)}</div>
                           <div className="td-muted" style={{ fontSize: 11 }}>sheet: {fmtMoney(row.sheet_dxb_rate)}</div>
                         </td>
-                        <td className="td-mono">
+                        <td className="td-mono gs-col-money">
                           <div>{fmtMoney(row.app_ala_rate)}</div>
                           <div className="td-muted" style={{ fontSize: 11 }}>sheet: {fmtMoney(row.sheet_ala_rate)}</div>
                         </td>
-                        <td><span className="badge badge-neutral">{row.app_ala_unit === 'pcs' ? 'шт' : 'кг'}</span></td>
-                        <td><span className="badge badge-warning">{fmtMoney(row.app_total)}</span></td>
-                        <td className="td-mono">{fmtMoney(row.sheet_total)}</td>
+                        <td className="gs-col-compact"><span className="badge badge-neutral">{row.app_ala_unit === 'pcs' ? 'шт' : 'кг'}</span></td>
+                        <td className="gs-col-money"><span className="badge badge-warning">{fmtMoney(row.app_total)}</span></td>
+                        <td className="td-mono gs-col-money">{fmtMoney(row.sheet_total)}</td>
                         {importWithSale && (
-                          <td>
+                          <td className="gs-col-tariff">
                             <div>{row.sale_tariff_name || '—'}</div>
                             {row.sale_tariff_client_id && (
                               <div style={{ marginTop: 4 }}>
@@ -1252,7 +1250,7 @@ export default function Receipts() {
                           </td>
                         )}
                         {importWithSale && (
-                          <td>
+                          <td className="gs-col-compact">
                             <select
                               className="form-select"
                               value={row.sale_unit || defaultSaleUnit(row)}
@@ -1266,7 +1264,7 @@ export default function Receipts() {
                           </td>
                         )}
                         {importWithSale && (
-                          <td>
+                          <td className="gs-col-money">
                             <input
                               type="number"
                               min="0"
@@ -1280,7 +1278,7 @@ export default function Receipts() {
                           </td>
                         )}
                         {importWithSale && (
-                          <td>
+                          <td className="gs-col-money">
                             <span className="badge badge-success">{fmtMoney(importSaleTotal(row))}</span>
                             {importRowWillImport(row) && importSaleBase(row) === 0 && (
                               <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
@@ -1289,7 +1287,7 @@ export default function Receipts() {
                             )}
                           </td>
                         )}
-                        <td>
+                        <td className="gs-col-status">
                           <span className={`badge ${statusBadge(row.status)}`}>{STATUS_LABELS[row.status] || row.status}</span>
                           {normalizeArray(row.warnings).map(warning => (
                             <div key={warning} className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>{warning}</div>
