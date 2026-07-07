@@ -4,6 +4,12 @@ import { formatType, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const ok = (n) => Math.abs(toNumber(n)) < 0.01
+const COST_METHOD_LABELS = {
+  actual_receipt_cost: 'Точная связь с приходом',
+  legacy_fallback: 'Legacy fallback',
+  product_average: 'Средняя по товару',
+  unknown: 'Неизвестно',
+}
 
 function Status({ difference }) {
   return ok(difference)
@@ -56,6 +62,9 @@ export default function Audit() {
   const orphanTransactions = normalizeArray(data?.orphan_transactions)
   const debts = data?.debts_check || {}
   const global = data?.global_check || {}
+  const profitReconciliation = data?.profit_reconciliation || {}
+  const costMethodSummary = normalizeArray(data?.cost_method_summary)
+  const supplierReconciliation = data?.supplier_reconciliation || {}
   const accountFactTotal = accounts.reduce((sum, account) => sum + toNumber(account.balance_actual ?? account.balance), 0)
   const accountCalculatedTotal = accounts.reduce((sum, account) => sum + toNumber(account.balance_calculated ?? account.recalculated_balance), 0)
   const accountDifference = accountFactTotal - accountCalculatedTotal
@@ -78,6 +87,11 @@ export default function Audit() {
   const ownerControl = toNumber(data?.control_with_owner_ops ?? global.control_with_owner_ops)
   const ownerControlOk = global.control_with_owner_ok ?? ok(ownerControl)
   const clientAdvancesTotal = toNumber(data?.client_advances_total ?? global.client_advances_total ?? debts.client_advances_total)
+  const profitDifference = toNumber(profitReconciliation.profit_difference)
+  const profitReconciliationOk = profitReconciliation.status === 'ok' || ok(profitDifference)
+  const supplierDifference = toNumber(supplierReconciliation.ledger_difference ?? ((debts.supplier_payable_total || 0) - (debts.supplier_payable_ledger_total || 0)))
+  const supplierBySuppliersDifference = toNumber(supplierReconciliation.by_suppliers_difference)
+  const supplierOk = supplierReconciliation.status === 'ok' || (ok(supplierDifference) && ok(supplierBySuppliersDifference))
 
   return (
     <div className="page">
@@ -109,7 +123,7 @@ export default function Audit() {
           <div className={`stat-value ${orphanTransactions.length === 0 ? 'positive' : 'negative'}`}>
             {orphanTransactions.length}
           </div>
-          <div className="stat-sub">доход без продажи · расход без прихода</div>
+          <div className="stat-sub">подозрительные операции без допустимой связи</div>
           <StatusText isOk={orphanTransactions.length === 0} />
         </div>
 
@@ -174,6 +188,80 @@ export default function Audit() {
           ]} />
           <Status difference={legacyDebtsDifference} />
         </div>
+      </div>
+
+      <div className="stat-grid" style={{ marginTop: 20 }}>
+        <div className="stat-card">
+          <div className="stat-label">Сверка прибыли</div>
+          <div className={`stat-value ${profitReconciliationOk ? 'positive' : 'negative'}`}>
+            Разница: {fmt(profitDifference)}
+          </div>
+          <AuditBreakdown rows={[
+            { label: 'Прибыль по отчету', value: fmt(profitReconciliation.reported_profit) },
+            { label: 'Прибыль по балансу', value: fmt(profitReconciliation.implied_profit) },
+            { label: 'Формула', value: profitReconciliation.formula || 'cash + receivable - payable - owner_capital' },
+          ]} />
+          <StatusText isOk={profitReconciliationOk} />
+        </div>
+
+        <div className="stat-card">
+          <div className="stat-label">Поставщики</div>
+          <div className={`stat-value ${supplierOk ? 'positive' : 'negative'}`}>
+            Расхождение: {fmt(supplierDifference)}
+          </div>
+          <AuditBreakdown rows={[
+            { label: 'Debts summary', value: fmt(supplierReconciliation.summary_total ?? debts.supplier_payable_total) },
+            { label: 'Ledger', value: fmt(supplierReconciliation.ledger_total ?? debts.supplier_payable_ledger_total) },
+            { label: 'By suppliers', value: fmt(supplierReconciliation.by_suppliers_total) },
+            ...(!ok(supplierBySuppliersDifference) ? [{ label: 'By suppliers diff', value: fmt(supplierBySuppliersDifference), tone: 'negative' }] : []),
+          ]} />
+          <StatusText isOk={supplierOk} />
+        </div>
+      </div>
+
+      {!profitReconciliationOk && (
+        <div className="alert alert-info" style={{ marginTop: 20 }}>
+          {profitReconciliation.note || 'Прибыль по P&L отличается от балансной прибыли. Частая причина — продажи со средней/legacy себестоимостью без точной связи с приходом.'}
+        </div>
+      )}
+
+      <div className="table-wrapper" style={{ marginTop: 20 }}>
+        <table>
+          <thead>
+            <tr>
+              <th>Метод</th>
+              <th>Строк</th>
+              <th>Выручка</th>
+              <th>Себестоимость</th>
+              <th>Прибыль</th>
+              <th>Статус</th>
+            </tr>
+          </thead>
+          <tbody>
+            {costMethodSummary.length === 0 && (
+              <tr><td colSpan={6}>
+                <div className="empty-state"><p>Данных по методам себестоимости нет</p></div>
+              </td></tr>
+            )}
+            {costMethodSummary.map(row => {
+              const isWarning = row.status === 'warning'
+              return (
+                <tr key={row.method}>
+                  <td style={{ fontWeight: 600 }}>{COST_METHOD_LABELS[row.method] || row.method || 'Неизвестно'}</td>
+                  <td className="td-mono">{toNumber(row.count).toLocaleString('ru-RU')}</td>
+                  <td className="td-mono">{fmt(row.revenue)}</td>
+                  <td className="td-mono">{fmt(row.cost)}</td>
+                  <td className="td-mono">{fmt(row.profit)}</td>
+                  <td>
+                    <span className={`badge ${isWarning ? 'badge-warning' : 'badge-success'}`}>
+                      {isWarning ? 'Проверить' : 'OK'}
+                    </span>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
       </div>
 
       <div className="table-wrapper">
@@ -249,10 +337,10 @@ export default function Audit() {
 
         <div className="stat-card">
           <div className="stat-label">Поставщики</div>
-          <div className={`stat-value ${ok((debts.payable_system || 0) - (debts.payable_ledger || 0)) ? 'positive' : 'negative'}`}>
-            {fmt((debts.payable_system || 0) - (debts.payable_ledger || 0))}
+          <div className={`stat-value ${supplierOk ? 'positive' : 'negative'}`}>
+            {fmt(supplierDifference)}
           </div>
-          <div className="stat-sub">система: {fmt(debts.payable_system)} · оплаты: {fmt(debts.payable_ledger)}</div>
+          <div className="stat-sub">summary: {fmt(supplierReconciliation.summary_total ?? debts.supplier_payable_total)} · ledger: {fmt(supplierReconciliation.ledger_total ?? debts.supplier_payable_ledger_total)}</div>
           <div className="stat-sub">авансы клиентов: {fmt(clientAdvancesTotal)}</div>
         </div>
       </div>

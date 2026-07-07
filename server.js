@@ -2442,7 +2442,16 @@ function salesCostCte(salesWhere = '') {
               THEN sb.quantity * pc.total_cost / pc.total_quantity
             ELSE 0
           END
-        ) AS cost
+        ) AS cost,
+        CASE
+          WHEN spm.cost IS NOT NULL THEN 'actual_receipt_cost'
+          WHEN mpm.cost IS NOT NULL THEN 'legacy_fallback'
+          WHEN (
+            (sb.sale_unit='kg' AND COALESCE(pc.total_weight,0) > 0)
+            OR (sb.sale_unit='pcs' AND COALESCE(pc.total_quantity,0) > 0)
+          ) THEN 'product_average'
+          ELSE 'unknown'
+        END AS cost_method
       FROM sales_base sb
       LEFT JOIN source_purchase_matches spm ON spm.sale_id = sb.id
       LEFT JOIN manual_purchase_matches mpm ON mpm.sale_id = sb.id
@@ -6155,12 +6164,12 @@ app.get('/api/audit', async (req, res) => {
     WHERE (
       type='income'
       AND sale_id IS NULL
-      AND COALESCE(related_type,'') NOT IN ('manual','client_advance')
+      AND COALESCE(related_type,'') NOT IN ('manual','client_advance','payment')
     )
        OR (
       type='expense'
       AND receipt_id IS NULL
-      AND COALESCE(related_type,'') <> 'manual'
+      AND COALESCE(related_type,'') NOT IN ('manual','payment','debt_payment_cancel')
     )
     ORDER BY id DESC
   `);
@@ -6173,6 +6182,28 @@ app.get('/api/audit', async (req, res) => {
   const payableLedger = +(debtLedger.summary?.payable || 0);
   const debtsDiff = (receivableSystem - receivableLedger) + (payableSystem - payableLedger);
   const profit = await profitSummaryData();
+  const costMethodSummary = await all(`
+    ${salesCostCte()}
+    SELECT
+      cost_method AS method,
+      COUNT(*)::int AS count,
+      COALESCE(SUM(revenue::numeric),0) AS revenue,
+      COALESCE(SUM(cost::numeric),0) AS cost,
+      COALESCE(SUM(revenue::numeric - cost::numeric),0) AS profit,
+      CASE
+        WHEN cost_method IN ('product_average','legacy_fallback','unknown') THEN 'warning'
+        ELSE 'ok'
+      END AS status
+    FROM sales_costed
+    GROUP BY cost_method
+    ORDER BY
+      CASE
+        WHEN cost_method='actual_receipt_cost' THEN 1
+        WHEN cost_method='legacy_fallback' THEN 2
+        WHEN cost_method='product_average' THEN 3
+        ELSE 4
+      END
+  `);
   const ownerContributionRow = await get(`
     SELECT COALESCE(SUM(amount::numeric),0) AS total
     FROM transactions
@@ -6186,6 +6217,31 @@ app.get('/api/audit', async (req, res) => {
   const ownerContributionTotal = +(ownerContributionRow?.total || 0);
   const ownerWithdrawalTotal = +(ownerWithdrawalRow?.total || 0);
   const ownerCapitalTotal = ownerContributionTotal - ownerWithdrawalTotal;
+  const supplierBySuppliers = await get(`
+    WITH ${activePaymentAllocationsCte()},
+    receipt_totals AS (
+      SELECT r.id, r.supplier_id, COALESCE(SUM(p.total_cost::numeric),0) AS total
+      FROM receipts r
+      JOIN purchases p ON p.receipt_id = r.id
+      GROUP BY r.id, r.supplier_id
+    ),
+    receipt_payments AS (
+      SELECT document_id AS receipt_id, COALESCE(SUM(amount::numeric),0) AS paid
+      FROM payment_allocations_effective
+      WHERE document_type='receipt'
+      GROUP BY document_id
+    ),
+    supplier_debts AS (
+      SELECT s.id, COALESCE(SUM(rt.total::numeric - COALESCE(rp.paid::numeric,0)),0) AS debt
+      FROM suppliers s
+      LEFT JOIN receipt_totals rt ON rt.supplier_id = s.id
+      LEFT JOIN receipt_payments rp ON rp.receipt_id = rt.id
+      GROUP BY s.id
+      HAVING COALESCE(SUM(rt.total::numeric - COALESCE(rp.paid::numeric,0)),0) > 0
+    )
+    SELECT COALESCE(SUM(debt::numeric),0) AS total
+    FROM supplier_debts
+  `);
 
   const accountsTotal = accounts.reduce((sum, account) => sum + (+account.balance_actual || +account.balance || 0), 0);
   const transactionsTotal = +(await get(`
@@ -6207,6 +6263,17 @@ app.get('/api/audit', async (req, res) => {
     - (+(debtSummary.payable?.total || 0))
     - (+(profit.profit || 0))
     - ownerCapitalTotal;
+  const impliedProfit = accountsTotal
+    + (+(debtSummary.receivable?.total || 0))
+    - (+(debtSummary.payable?.total || 0))
+    - ownerCapitalTotal;
+  const reportedProfit = +(profit.profit || 0);
+  const profitDifference = reportedProfit - impliedProfit;
+  const supplierSummaryTotal = +(debtSummary.supplier_payable?.total || 0);
+  const supplierLedgerTotal = +(debtLedger.summary?.supplier_payable || 0);
+  const supplierBySuppliersTotal = +(supplierBySuppliers?.total || 0);
+  const supplierLedgerDifference = supplierSummaryTotal - supplierLedgerTotal;
+  const supplierBySuppliersDifference = supplierSummaryTotal - supplierBySuppliersTotal;
 
   res.json({
     payments_vs_transactions: {
@@ -6227,11 +6294,41 @@ app.get('/api/audit', async (req, res) => {
       payable_system: payableSystem,
       payable_ledger: payableLedger,
       supplier_payable_total: +(debtSummary.supplier_payable?.total || 0),
+      supplier_payable_ledger_total: +(debtLedger.summary?.supplier_payable || 0),
       client_advances_total: +(debtSummary.client_advances?.total || 0),
       difference: debtsDiff,
       diff: debtsDiff,
       ok: Math.abs(debtsDiff) < 0.01,
     },
+    supplier_reconciliation: {
+      summary_total: supplierSummaryTotal,
+      ledger_total: supplierLedgerTotal,
+      by_suppliers_total: supplierBySuppliersTotal,
+      ledger_difference: supplierLedgerDifference,
+      by_suppliers_difference: supplierBySuppliersDifference,
+      status: Math.abs(supplierLedgerDifference) < 0.01 && Math.abs(supplierBySuppliersDifference) < 0.01 ? 'ok' : 'warning',
+      note: Math.abs(supplierLedgerDifference) < 0.01 && Math.abs(supplierBySuppliersDifference) < 0.01
+        ? 'Поставщики сходятся между audit, ledger и /api/debts/by-suppliers.'
+        : 'Проверьте legacy payments, cancelled payments или allocation-aware расчёт поставщиков.',
+    },
+    profit_reconciliation: {
+      reported_profit: reportedProfit,
+      implied_profit: impliedProfit,
+      profit_difference: profitDifference,
+      formula: 'cash + receivable - payable - owner_capital',
+      status: Math.abs(profitDifference) <= 0.05 ? 'ok' : 'warning',
+      note: Math.abs(profitDifference) <= 0.05
+        ? 'Прибыль по P&L сходится с балансной прибылью.'
+        : 'Прибыль по P&L отличается от балансной прибыли. Возможная причина — legacy/fallback себестоимость или продажи без точной связи с приходом.',
+    },
+    cost_method_summary: costMethodSummary.map((row) => ({
+      method: row.method || 'unknown',
+      count: +(row.count || 0),
+      revenue: +(row.revenue || 0),
+      cost: +(row.cost || 0),
+      profit: +(row.profit || 0),
+      status: row.status || 'warning',
+    })),
     global_check: {
       accounts_total: accountsTotal,
       transactions_total: transactionsTotal,
