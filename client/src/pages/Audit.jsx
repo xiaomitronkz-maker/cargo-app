@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
+import Modal from '../components/Modal'
 import api from '../api'
 import { formatType, normalizeArray, toNumber } from '../utils/data'
 
 const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const ok = (n) => Math.abs(toNumber(n)) < 0.01
 const COST_METHOD_LABELS = {
+  manual_override: 'Ручная себестоимость',
   actual_receipt_cost: 'Точная связь с приходом',
   legacy_fallback: 'Legacy fallback',
   product_average: 'Средняя по товару',
@@ -43,6 +45,10 @@ function AuditBreakdown({ rows }) {
 export default function Audit() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [costModal, setCostModal] = useState(null)
+  const [costForm, setCostForm] = useState({ cost: '', reason: '' })
+  const [costSaving, setCostSaving] = useState(false)
+  const [costError, setCostError] = useState('')
 
   const load = () => {
     setLoading(true)
@@ -59,6 +65,36 @@ export default function Audit() {
   }
 
   useEffect(() => { load() }, [])
+
+  const openCostModal = (row) => {
+    setCostModal(row)
+    setCostForm({ cost: String(toNumber(row.cost)), reason: '' })
+    setCostError('')
+  }
+
+  const closeCostModal = () => {
+    setCostModal(null)
+    setCostForm({ cost: '', reason: '' })
+    setCostError('')
+  }
+
+  const saveManualCost = async () => {
+    if (!costModal?.sale_id) return
+    setCostSaving(true)
+    setCostError('')
+    try {
+      await api.put(`/sales/${costModal.sale_id}/manual-cost`, {
+        cost: costForm.cost,
+        reason: costForm.reason,
+      })
+      closeCostModal()
+      await load()
+    } catch (e) {
+      setCostError(e.message || 'Не удалось сохранить себестоимость')
+    } finally {
+      setCostSaving(false)
+    }
+  }
 
   if (loading) return <div className="loading">Загрузка...</div>
 
@@ -251,6 +287,7 @@ export default function Audit() {
             )}
             {costMethodSummary.map(row => {
               const isWarning = row.status === 'warning'
+              const statusText = row.status === 'manual' ? 'Вручную' : (isWarning ? 'Проверить' : 'OK')
               return (
                 <tr key={row.method}>
                   <td style={{ fontWeight: 600 }}>{COST_METHOD_LABELS[row.method] || row.method || 'Неизвестно'}</td>
@@ -260,7 +297,7 @@ export default function Audit() {
                   <td className="td-mono">{fmt(row.profit)}</td>
                   <td>
                     <span className={`badge ${isWarning ? 'badge-warning' : 'badge-success'}`}>
-                      {isWarning ? 'Проверить' : 'OK'}
+                      {statusText}
                     </span>
                   </td>
                 </tr>
@@ -287,6 +324,7 @@ export default function Audit() {
                   <th>Себестоимость</th>
                   <th>Прибыль</th>
                   <th>Причина</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
@@ -312,6 +350,11 @@ export default function Audit() {
                           {row.sales_document_id ? ` · Документ #${row.sales_document_id}` : ''}
                           {row.source_row ? ` · source row ${row.source_row}` : ''}
                         </div>
+                      </td>
+                      <td>
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => openCostModal(row)}>
+                          Исправить себестоимость
+                        </button>
                       </td>
                     </tr>
                   )
@@ -402,6 +445,51 @@ export default function Audit() {
           <div className="stat-sub">авансы клиентов: {fmt(clientAdvancesTotal)}</div>
         </div>
       </div>
+
+      {costModal && (
+        <Modal
+          title="Исправить себестоимость"
+          onClose={closeCostModal}
+          footer={
+            <>
+              <button className="btn btn-secondary" onClick={closeCostModal} disabled={costSaving}>Отмена</button>
+              <button className="btn btn-primary" onClick={saveManualCost} disabled={costSaving}>
+                {costSaving ? 'Сохранение...' : 'Сохранить'}
+              </button>
+            </>
+          }
+        >
+          {costError && <div className="alert alert-error">{costError}</div>}
+          <div className="stat-sub audit-breakdown" style={{ marginBottom: 14 }}>
+            <div>Дата: <strong>{fmtDate(costModal.sale_date || costModal.document_date)}</strong></div>
+            <div>Клиент: <strong>{costModal.client_name || '—'}</strong></div>
+            <div>Товар: <strong>{costModal.product_name || '—'}</strong></div>
+            <div>Маркировка: <strong>{costModal.marking_name || '—'}</strong></div>
+            <div>Выручка: <strong>{fmt(costModal.revenue)}</strong></div>
+            <div>Текущая себестоимость: <strong>{fmt(costModal.cost)}</strong></div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Новая себестоимость</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className="form-input"
+              value={costForm.cost}
+              onChange={e => setCostForm(form => ({ ...form, cost: e.target.value }))}
+            />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Причина / комментарий</label>
+            <textarea
+              className="form-textarea"
+              value={costForm.reason}
+              onChange={e => setCostForm(form => ({ ...form, reason: e.target.value }))}
+              placeholder="Например: сверено вручную по исходному приходу"
+            />
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }

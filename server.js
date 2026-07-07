@@ -234,6 +234,9 @@ async function initDb() {
       price_per_unit NUMERIC DEFAULT 0,
       total_amount NUMERIC DEFAULT 0,
       paid_amount NUMERIC DEFAULT 0,
+      manual_cost NUMERIC,
+      manual_cost_reason TEXT,
+      manual_cost_updated_at TIMESTAMP,
       notes TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -391,6 +394,9 @@ async function initDb() {
     ALTER TABLE tariffs ALTER COLUMN dxb_rate SET DEFAULT 5;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_document_id INTEGER REFERENCES sales_documents(id) ON DELETE SET NULL;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS manual_cost NUMERIC;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS manual_cost_reason TEXT;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS manual_cost_updated_at TIMESTAMP;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS debt_payment_group_id TEXT;
@@ -2339,6 +2345,9 @@ function salesCostCte(salesWhere = '') {
         s.sale_unit,
         s.quantity::numeric AS quantity,
         COALESCE(s.total_amount::numeric, s.quantity::numeric * s.price_per_unit::numeric) AS revenue,
+        s.manual_cost::numeric AS manual_cost,
+        s.manual_cost_reason::text AS manual_cost_reason,
+        s.manual_cost_updated_at::text AS manual_cost_updated_at,
         s.notes,
         NULLIF(substring(s.notes FROM 'Google Sheets row ([0-9]+)'), '')::int AS source_row
       FROM sales s
@@ -2433,6 +2442,7 @@ function salesCostCte(salesWhere = '') {
       SELECT
         sb.*,
         COALESCE(
+          sb.manual_cost,
           spm.cost,
           mpm.cost,
           CASE
@@ -2444,6 +2454,7 @@ function salesCostCte(salesWhere = '') {
           END
         ) AS cost,
         CASE
+          WHEN sb.manual_cost IS NOT NULL THEN 'manual_override'
           WHEN spm.cost IS NOT NULL THEN 'actual_receipt_cost'
           WHEN mpm.cost IS NOT NULL THEN 'legacy_fallback'
           WHEN (
@@ -4689,6 +4700,70 @@ app.post('/api/sales', async (req, res) => {
   }
 });
 
+app.put('/api/sales/:id/manual-cost', async (req, res) => {
+  const saleId = +req.params.id;
+  const costValue = req.body?.cost;
+  const cost = Number(req.body?.cost);
+  const reason = String(req.body?.reason || '').trim();
+  if (!Number.isInteger(saleId) || saleId <= 0) return validationError(res, 'Продажа не найдена', { sale_id: req.params.id });
+  if (costValue == null || costValue === '' || !Number.isFinite(cost) || cost < 0) {
+    return validationError(res, 'Себестоимость должна быть числом 0 или больше', { sale_id: saleId, cost: req.body?.cost });
+  }
+
+  try {
+    const result = await withTx(async (client) => {
+      const sale = await get('SELECT id,total_amount FROM sales WHERE id=$1', [saleId], client);
+      if (!sale) throw new Error('Продажа не найдена');
+      const oldCostRow = await get(`
+        ${salesCostCte('WHERE s.id=$1')}
+        SELECT cost,cost_method
+        FROM sales_costed
+        WHERE id=$1
+      `, [saleId], client);
+      await query(`
+        UPDATE sales
+        SET manual_cost=$1, manual_cost_reason=$2, manual_cost_updated_at=CURRENT_TIMESTAMP
+        WHERE id=$3
+      `, [cost, reason || null, saleId], client);
+      const newCostRow = await get(`
+        ${salesCostCte('WHERE s.id=$1')}
+        SELECT cost,cost_method
+        FROM sales_costed
+        WHERE id=$1
+      `, [saleId], client);
+      await logOperation(client, {
+        action: 'sale_cost_manual_override',
+        entity_type: 'sale',
+        entity_id: saleId,
+        entity_label: `Реализация №${saleId}`,
+        amount: cost,
+        currency: 'USD',
+        description: 'Ручная корректировка себестоимости продажи',
+        meta: {
+          sale_id: saleId,
+          old_cost: +(oldCostRow?.cost || 0),
+          old_cost_method: oldCostRow?.cost_method || null,
+          new_cost: +(newCostRow?.cost || cost),
+          new_cost_method: newCostRow?.cost_method || 'manual_override',
+          reason: reason || null,
+        },
+      });
+      return {
+        sale_id: saleId,
+        revenue: +(sale.total_amount || 0),
+        old_cost: +(oldCostRow?.cost || 0),
+        old_cost_method: oldCostRow?.cost_method || null,
+        new_cost: +(newCostRow?.cost || cost),
+        new_cost_method: newCostRow?.cost_method || 'manual_override',
+        manual_cost_reason: reason || null,
+      };
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 app.put('/api/sales/:id', async (req, res) => {
   const body = req.body;
   const documentItems = Array.isArray(body.items) ? body.items : null;
@@ -6192,16 +6267,18 @@ app.get('/api/audit', async (req, res) => {
       COALESCE(SUM(revenue::numeric - cost::numeric),0) AS profit,
       CASE
         WHEN cost_method IN ('product_average','legacy_fallback','unknown') THEN 'warning'
+        WHEN cost_method='manual_override' THEN 'manual'
         ELSE 'ok'
       END AS status
     FROM sales_costed
     GROUP BY cost_method
     ORDER BY
       CASE
-        WHEN cost_method='actual_receipt_cost' THEN 1
-        WHEN cost_method='legacy_fallback' THEN 2
-        WHEN cost_method='product_average' THEN 3
-        ELSE 4
+        WHEN cost_method='manual_override' THEN 1
+        WHEN cost_method='actual_receipt_cost' THEN 2
+        WHEN cost_method='legacy_fallback' THEN 3
+        WHEN cost_method='product_average' THEN 4
+        ELSE 5
       END
   `);
   const costMethodDetails = await all(`
