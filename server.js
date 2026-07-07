@@ -2197,7 +2197,8 @@ async function getSupplierOpenDebtDocuments(supplierId, client = pool, excludePa
 
 async function getClientOpenDebtDocuments(clientId, client = pool, excludePaymentId = null) {
   const rows = await all(`
-    WITH receivable_totals AS (
+    WITH ${activePaymentAllocationsCte()},
+    receivable_totals AS (
       SELECT
         COALESCE(sd.id, -s.id) AS receivable_group_id,
         sd.id AS sales_document_id,
@@ -2209,6 +2210,18 @@ async function getClientOpenDebtDocuments(clientId, client = pool, excludePaymen
       LEFT JOIN sales_documents sd ON sd.id = s.sales_document_id
       WHERE COALESCE(sd.client_id, s.client_id)=$1
       GROUP BY COALESCE(sd.id, -s.id), sd.id, COALESCE(sd.date, s.date), COALESCE(sd.created_at, s.created_at)
+    ),
+    receivable_payments AS (
+      SELECT
+        CASE WHEN pae.document_type='sales_document' THEN pae.document_id ELSE -pae.document_id END AS receivable_group_id,
+        COALESCE(SUM(pae.amount::numeric),0) AS paid
+      FROM payment_allocations_effective pae
+      LEFT JOIN sales s ON pae.document_type='sale' AND s.id=pae.document_id
+      LEFT JOIN sales_documents sd ON pae.document_type='sales_document' AND sd.id=pae.document_id
+      WHERE pae.document_type IN ('sale','sales_document')
+        AND COALESCE(sd.client_id, s.client_id)=$1
+        AND ($2::integer IS NULL OR pae.payment_id<>$2::integer)
+      GROUP BY CASE WHEN pae.document_type='sales_document' THEN pae.document_id ELSE -pae.document_id END
     )
     SELECT
       CASE WHEN rt.sales_document_id IS NULL THEN 'sale' ELSE 'sales_document' END AS document_type,
@@ -2217,34 +2230,22 @@ async function getClientOpenDebtDocuments(clientId, client = pool, excludePaymen
       rt.date,
       rt.created_at,
       rt.total::numeric AS total,
-      0::numeric AS paid,
-      rt.total::numeric AS remaining
+      COALESCE(rp.paid::numeric,0) AS paid,
+      rt.total::numeric - COALESCE(rp.paid::numeric,0) AS remaining
     FROM receivable_totals rt
-    WHERE rt.total::numeric > 0
+    LEFT JOIN receivable_payments rp ON rp.receivable_group_id = rt.receivable_group_id
+    WHERE rt.total::numeric - COALESCE(rp.paid::numeric,0) > 0
     ORDER BY rt.date ASC NULLS LAST, rt.created_at ASC NULLS LAST, document_id ASC
-  `, [clientId], client);
+  `, [clientId, excludePaymentId], client);
 
-  let remainingPaid = ledgerNumber(await getClientPaymentTotal(clientId, client, excludePaymentId));
-  const documents = rows.map((row) => {
-    const total = +(row.total || 0);
-    const paid = ledgerNumber(Math.min(total, remainingPaid));
-    remainingPaid = ledgerNumber(Math.max(0, remainingPaid - paid));
-    return {
-      ...row,
-      document_id: +row.document_id,
-      anchor_sale_id: +row.anchor_sale_id,
-      total,
-      paid,
-      remaining: ledgerNumber(total - paid),
-    };
-  });
-
-  return documents.filter((row) => row.remaining > 0.009).map((row) => ({
+  return rows.map((row) => ({
     ...row,
+    document_id: +row.document_id,
+    anchor_sale_id: +row.anchor_sale_id,
     total: ledgerNumber(row.total),
     paid: ledgerNumber(row.paid),
     remaining: ledgerNumber(row.remaining),
-  }));
+  })).filter((row) => row.remaining > 0.009);
 }
 
 async function validateSale(productId, saleUnit, quantity, pricePerUnit, client = pool) {
