@@ -58,6 +58,12 @@ function validationError(res, message, context = {}) {
   return res.status(400).json({ error: message });
 }
 
+function httpError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
 function clampLimit(value, defaultValue = 100, maxValue = 500) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
@@ -944,6 +950,76 @@ async function getPaymentAllocations(paymentId, client = pool) {
     WHERE payment_id=$1
     ORDER BY id
   `, [+paymentId], client);
+}
+
+function normalizeIntegerIds(values) {
+  const input = Array.isArray(values) ? values : [values];
+  return [...new Set(input.map((value) => +value).filter((value) => Number.isInteger(value) && value > 0))];
+}
+
+async function getActivePaymentAllocationForDocuments({
+  saleIds = [],
+  salesDocumentIds = [],
+  purchaseIds = [],
+  receiptIds = [],
+} = {}, client = pool) {
+  const normalizedSaleIds = normalizeIntegerIds(saleIds);
+  const normalizedSalesDocumentIds = normalizeIntegerIds(salesDocumentIds);
+  const normalizedPurchaseIds = normalizeIntegerIds(purchaseIds);
+  const normalizedReceiptIds = normalizeIntegerIds(receiptIds);
+
+  if (!normalizedSaleIds.length && !normalizedSalesDocumentIds.length && !normalizedPurchaseIds.length && !normalizedReceiptIds.length) return null;
+
+  return get(`
+    SELECT pa.id,pa.payment_id,pa.document_type,pa.document_id,pa.amount
+    FROM payment_allocations pa
+    JOIN payments p ON p.id = pa.payment_id
+    WHERE pa.cancelled_at IS NULL
+      AND p.cancelled_at IS NULL
+      AND (
+        (pa.document_type='sale' AND pa.document_id = ANY($1::int[]))
+        OR (pa.document_type='sales_document' AND pa.document_id = ANY($2::int[]))
+        OR (pa.document_type='purchase' AND pa.document_id = ANY($3::int[]))
+        OR (pa.document_type='receipt' AND pa.document_id = ANY($4::int[]))
+      )
+    LIMIT 1
+  `, [normalizedSaleIds, normalizedSalesDocumentIds, normalizedPurchaseIds, normalizedReceiptIds], client);
+}
+
+async function getActiveEffectivePurchasePayment(purchaseId, receiptId, client = pool) {
+  return get(`
+    WITH ${activePaymentAllocationsCte()}
+    SELECT payment_id,document_type,document_id,amount
+    FROM payment_allocations_effective
+    WHERE (document_type='purchase' AND document_id=$1)
+      OR ($2::integer IS NOT NULL AND document_type='receipt' AND document_id=$2)
+    LIMIT 1
+  `, [+purchaseId, receiptId ? +receiptId : null], client);
+}
+
+async function getSaleUsingPurchaseAsExactCostSource(purchase, client = pool) {
+  const sourceRow = purchase?.source_row == null ? null : +purchase.source_row;
+  if (!Number.isInteger(sourceRow)) return null;
+
+  return get(`
+    ${salesCostCte(`
+      WHERE NULLIF(substring(s.notes FROM 'Google Sheets row ([0-9]+)'), '')::int=$1
+        AND s.product_id=$2
+        AND COALESCE(sd.date, s.date)=$3::date
+        AND COALESCE(sd.client_id, s.client_id) IS NOT DISTINCT FROM $4::integer
+        AND COALESCE(sd.marking_id, s.marking_id) IS NOT DISTINCT FROM $5::integer
+    `)}
+    SELECT id,sales_document_id
+    FROM sales_costed
+    WHERE cost_method='actual_receipt_cost'
+    LIMIT 1
+  `, [
+    sourceRow,
+    +purchase.product_id,
+    purchase.date,
+    purchase.client_id == null ? null : +purchase.client_id,
+    purchase.marking_id == null ? null : +purchase.marking_id,
+  ], client);
 }
 
 async function getReceiptPaidAmount(receiptId, client = pool) {
@@ -4493,8 +4569,50 @@ app.put('/api/purchases/:id/pay', async (req, res) => {
 });
 
 app.delete('/api/purchases/:id', async (req, res) => {
-  await query('DELETE FROM purchases WHERE id=$1', [+req.params.id]);
-  res.json({ success: true });
+  const id = +req.params.id;
+  try {
+    await withTx(async (client) => {
+      const purchase = await get(`
+        SELECT p.*, NULLIF(substring(p.notes FROM 'Google Sheets row ([0-9]+)'), '')::int AS source_row
+        FROM purchases p
+        WHERE p.id=$1
+        FOR UPDATE
+      `, [id], client);
+      if (!purchase) throw httpError('Приход не найден', 404);
+
+      const exactCostSale = await getSaleUsingPurchaseAsExactCostSource(purchase, client);
+      if (exactCostSale) {
+        throw httpError('Нельзя удалить приход: он используется как точный источник себестоимости продажи. Сначала удалите или исправьте связанную реализацию.');
+      }
+
+      const activePayment = await getActiveEffectivePurchasePayment(id, purchase.receipt_id, client);
+      if (activePayment) {
+        throw httpError('Нельзя удалить приход: по нему есть активные оплаты. Сначала отмените или отредактируйте оплату.');
+      }
+
+      await query('DELETE FROM purchases WHERE id=$1', [id], client);
+      if (purchase.receipt_id) await rebalanceReceiptPurchasePaidAmounts(+purchase.receipt_id, client);
+      await logOperation(client, {
+        action: 'purchase_deleted',
+        entity_type: 'purchase',
+        entity_id: id,
+        entity_label: `Приход №${id}`,
+        amount: +(purchase.total_cost || 0),
+        currency: 'USD',
+        description: 'Удалён приход',
+        meta: {
+          receipt_id: purchase.receipt_id || null,
+          supplier_id: purchase.supplier_id || null,
+          client_id: purchase.client_id || null,
+          marking_id: purchase.marking_id || null,
+          product_id: purchase.product_id || null,
+        },
+      });
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(e.statusCode || 400).json({ error: e.message });
+  }
 });
 
 app.post('/api/sales-documents', async (req, res) => {
@@ -4924,12 +5042,19 @@ app.delete('/api/sales/:id', async (req, res) => {
   const id = +req.params.id;
   try {
     await withTx(async (client) => {
-      const sale = await get('SELECT * FROM sales WHERE id=$1', [id], client);
+      const sale = await get('SELECT * FROM sales WHERE id=$1 FOR UPDATE', [id], client);
       if (!sale) return;
 
       if (sale.sales_document_id) {
-        const saleRows = await all('SELECT id FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
+        const saleRows = await all('SELECT id FROM sales WHERE sales_document_id=$1 FOR UPDATE', [+sale.sales_document_id], client);
         const saleIds = saleRows.map((row) => +row.id);
+        const activeAllocation = await getActivePaymentAllocationForDocuments({
+          saleIds,
+          salesDocumentIds: [+sale.sales_document_id],
+        }, client);
+        if (activeAllocation) {
+          throw httpError('Нельзя удалить продажу: по ней есть активные оплаты. Сначала отмените/отредактируйте оплату.');
+        }
         const totalRow = await get('SELECT COALESCE(SUM(total_amount::numeric),0) AS total FROM sales WHERE sales_document_id=$1', [+sale.sales_document_id], client);
         await query('DELETE FROM transactions WHERE sale_id = ANY($1::int[])', [saleIds], client);
         await query("DELETE FROM payments WHERE entity_type='sale' AND entity_id = ANY($1::int[])", [saleIds], client);
@@ -4947,6 +5072,11 @@ app.delete('/api/sales/:id', async (req, res) => {
           meta: { sale_ids: saleIds },
         });
         return;
+      }
+
+      const activeAllocation = await getActivePaymentAllocationForDocuments({ saleIds: [id] }, client);
+      if (activeAllocation) {
+        throw httpError('Нельзя удалить продажу: по ней есть активные оплаты. Сначала отмените/отредактируйте оплату.');
       }
 
       await query('DELETE FROM transactions WHERE sale_id=$1', [id], client);
