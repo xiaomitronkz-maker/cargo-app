@@ -11,6 +11,11 @@ const COST_METHOD_LABELS = {
   unknown: 'Неизвестно',
 }
 
+const fmtDate = (value) => {
+  if (!value) return '—'
+  return new Date(value).toLocaleDateString('ru-RU')
+}
+
 function Status({ difference }) {
   return ok(difference)
     ? <span className="badge badge-success">OK</span>
@@ -64,6 +69,7 @@ export default function Audit() {
   const global = data?.global_check || {}
   const profitReconciliation = data?.profit_reconciliation || {}
   const costMethodSummary = normalizeArray(data?.cost_method_summary)
+  const costMethodDetails = normalizeArray(data?.cost_method_details)
   const supplierReconciliation = data?.supplier_reconciliation || {}
   const accountFactTotal = accounts.reduce((sum, account) => sum + toNumber(account.balance_actual ?? account.balance), 0)
   const accountCalculatedTotal = accounts.reduce((sum, account) => sum + toNumber(account.balance_calculated ?? account.recalculated_balance), 0)
@@ -263,6 +269,58 @@ export default function Audit() {
           </tbody>
         </table>
       </div>
+
+      {costMethodDetails.length > 0 && (
+        <details open style={{ marginTop: 20 }}>
+          <summary style={{ cursor: 'pointer', fontWeight: 700, marginBottom: 10 }}>Строки для проверки</summary>
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Метод</th>
+                  <th>Дата</th>
+                  <th>Клиент</th>
+                  <th>Товар</th>
+                  <th>Маркировка</th>
+                  <th>Кол-во/кг</th>
+                  <th>Выручка</th>
+                  <th>Себестоимость</th>
+                  <th>Прибыль</th>
+                  <th>Причина</th>
+                </tr>
+              </thead>
+              <tbody>
+                {costMethodDetails.map(row => {
+                  const amount = row.sale_unit === 'pcs'
+                    ? `${toNumber(row.quantity).toLocaleString('ru-RU')} шт`
+                    : `${toNumber(row.weight_kg).toLocaleString('ru-RU', { maximumFractionDigits: 3 })} кг`
+                  return (
+                    <tr key={`${row.method}-${row.sale_id}`}>
+                      <td><span className="badge badge-warning">{COST_METHOD_LABELS[row.method] || row.method || 'Неизвестно'}</span></td>
+                      <td className="td-date">{fmtDate(row.sale_date || row.document_date)}</td>
+                      <td>{row.client_name || '—'}</td>
+                      <td>{row.product_name || '—'}</td>
+                      <td>{row.marking_name || '—'}</td>
+                      <td className="td-mono">{amount}</td>
+                      <td className="td-mono">{fmt(row.revenue)}</td>
+                      <td className="td-mono">{fmt(row.cost)}</td>
+                      <td className="td-mono">{fmt(row.profit)}</td>
+                      <td>
+                        <div>{row.reason || '—'}</div>
+                        <div className="td-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                          Продажа #{row.sale_id || '—'}
+                          {row.sales_document_id ? ` · Документ #${row.sales_document_id}` : ''}
+                          {row.source_row ? ` · source row ${row.source_row}` : ''}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
 
       <div className="table-wrapper">
         <table>

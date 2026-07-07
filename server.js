@@ -6204,6 +6204,49 @@ app.get('/api/audit', async (req, res) => {
         ELSE 4
       END
   `);
+  const costMethodDetails = await all(`
+    ${salesCostCte()},
+    ranked AS (
+      SELECT
+        sc.cost_method AS method,
+        sc.id::integer AS sale_id,
+        sc.sales_document_id::integer AS sales_document_id,
+        sc.date::text AS sale_date,
+        c.name::text AS client_name,
+        pr.name::text AS product_name,
+        m.marking::text AS marking_name,
+        sc.sale_unit::text AS sale_unit,
+        CASE WHEN sc.sale_unit='pcs' THEN sc.quantity ELSE NULL END AS quantity,
+        CASE WHEN sc.sale_unit='kg' THEN sc.quantity ELSE NULL END AS weight_kg,
+        sc.revenue::numeric AS revenue,
+        sc.cost::numeric AS cost,
+        (sc.revenue::numeric - sc.cost::numeric) AS profit,
+        sc.source_row::integer AS source_row,
+        sc.notes::text AS source_info,
+        CASE
+          WHEN sc.cost_method='product_average' THEN 'Нет точной связи с приходом/source_row, себестоимость взята как средняя по товару.'
+          WHEN sc.cost_method='legacy_fallback' THEN 'Legacy продажа без точного purchase match.'
+          ELSE 'Не удалось определить точный метод себестоимости.'
+        END AS reason,
+        ROW_NUMBER() OVER (PARTITION BY sc.cost_method ORDER BY sc.date DESC NULLS LAST, sc.id DESC) AS rn
+      FROM sales_costed sc
+      LEFT JOIN clients c ON c.id=sc.client_id
+      LEFT JOIN products pr ON pr.id=sc.product_id
+      LEFT JOIN markings m ON m.id=sc.marking_id
+      WHERE sc.cost_method IN ('product_average','legacy_fallback','unknown')
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn <= 50
+    ORDER BY
+      CASE
+        WHEN method='legacy_fallback' THEN 1
+        WHEN method='product_average' THEN 2
+        ELSE 3
+      END,
+      sale_date DESC NULLS LAST,
+      sale_id DESC
+  `);
   const ownerContributionRow = await get(`
     SELECT COALESCE(SUM(amount::numeric),0) AS total
     FROM transactions
@@ -6328,6 +6371,25 @@ app.get('/api/audit', async (req, res) => {
       cost: +(row.cost || 0),
       profit: +(row.profit || 0),
       status: row.status || 'warning',
+    })),
+    cost_method_details: costMethodDetails.map((row) => ({
+      method: row.method || 'unknown',
+      sale_id: row.sale_id == null ? null : +row.sale_id,
+      sales_document_id: row.sales_document_id == null ? null : +row.sales_document_id,
+      sale_date: row.sale_date || null,
+      document_date: row.sale_date || null,
+      client_name: row.client_name || 'Без клиента',
+      product_name: row.product_name || 'Без товара',
+      marking_name: row.marking_name || '',
+      sale_unit: row.sale_unit || '',
+      quantity: row.quantity == null ? null : +(row.quantity || 0),
+      weight_kg: row.weight_kg == null ? null : +(row.weight_kg || 0),
+      revenue: +(row.revenue || 0),
+      cost: +(row.cost || 0),
+      profit: +(row.profit || 0),
+      source_row: row.source_row == null ? null : +row.source_row,
+      source_info: row.source_info || '',
+      reason: row.reason || '',
     })),
     global_check: {
       accounts_total: accountsTotal,
