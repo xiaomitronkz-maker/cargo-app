@@ -379,7 +379,8 @@ async function initDb() {
       manual_cost_reason TEXT,
       manual_cost_updated_at TIMESTAMP,
       notes TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS sales_documents (
@@ -408,7 +409,8 @@ async function initDb() {
       date DATE NOT NULL DEFAULT CURRENT_DATE,
       comment TEXT,
       transaction_id INTEGER,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS payment_allocations (
@@ -546,12 +548,16 @@ async function initDb() {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS manual_cost NUMERIC;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS manual_cost_reason TEXT;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS manual_cost_updated_at TIMESTAMP;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;
+    ALTER TABLE sales ALTER COLUMN updated_at SET DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS comment TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS debt_payment_group_id TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS cancelled_reason TEXT;
     ALTER TABLE payments ADD COLUMN IF NOT EXISTS cancelled_meta JSONB DEFAULT '{}'::jsonb;
+    ALTER TABLE payments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;
+    ALTER TABLE payments ALTER COLUMN updated_at SET DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_entity_type_check;
     ALTER TABLE payments ADD CONSTRAINT payments_entity_type_check CHECK(entity_type IN ('sale','purchase','client_advance','client','supplier'));
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS receipt_id INTEGER REFERENCES receipts(id) ON DELETE SET NULL;
@@ -5095,7 +5101,7 @@ app.put('/api/sales/:id/manual-cost', async (req, res) => {
       `, [saleId], client);
       await query(`
         UPDATE sales
-        SET manual_cost=$1, manual_cost_reason=$2, manual_cost_updated_at=CURRENT_TIMESTAMP
+        SET manual_cost=$1, manual_cost_reason=$2, manual_cost_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
         WHERE id=$3
       `, [cost, reason || null, saleId], client);
       const newCostRow = await get(`
@@ -5158,7 +5164,7 @@ app.put('/api/sales/:id', async (req, res) => {
         const totalAmount = Math.round(+item.quantity * +item.price_per_unit * 100) / 100;
         await query(`
           UPDATE sales
-          SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
+          SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9,updated_at=CURRENT_TIMESTAMP
           WHERE id=$10
         `, [body.date, cid, mid, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, totalAmount, item.notes || item.note || null, +req.params.id]);
         await logOperation({
@@ -5203,7 +5209,7 @@ app.put('/api/sales/:id', async (req, res) => {
           if (existingSale) {
             await query(`
               UPDATE sales
-              SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
+              SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9,updated_at=CURRENT_TIMESTAMP
               WHERE id=$10
             `, [body.date, cid, mid, +item.product_id, item.sale_unit, +item.quantity, +item.price_per_unit, itemTotal, item.notes || item.note || null, existingSale.id], client);
           } else {
@@ -5250,7 +5256,7 @@ app.put('/api/sales/:id', async (req, res) => {
     const totalAmount = Math.round(+body.quantity * +body.price_per_unit * 100) / 100;
     await query(`
       UPDATE sales
-      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9
+      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,sale_unit=$5,quantity=$6,price_per_unit=$7,total_amount=$8,notes=$9,updated_at=CURRENT_TIMESTAMP
       WHERE id=$10
     `, [body.date, cid, mid, +body.product_id, body.sale_unit, +body.quantity, +body.price_per_unit, totalAmount, body.notes || null, +req.params.id]);
     await logOperation({
@@ -6031,7 +6037,7 @@ app.put('/api/payments/:id', async (req, res) => {
           newAllocations.push({ document_type: 'client_advance', document_id: +payment.entity_id, amount: remainingPayment });
         }
 
-        await query('UPDATE payments SET amount=$1,date=$2,comment=$3 WHERE id=$4', [amount, date, comment, paymentId], client);
+        await query('UPDATE payments SET amount=$1,date=$2,comment=$3,updated_at=CURRENT_TIMESTAMP WHERE id=$4', [amount, date, comment, paymentId], client);
         if (transaction) {
           await query(`
             UPDATE transactions
@@ -6181,7 +6187,7 @@ app.put('/api/payments/:id', async (req, res) => {
         newAmount: amount,
       }, client);
 
-      await query('UPDATE payments SET amount=$1,date=$2,comment=$3 WHERE id=$4', [amount, date, comment, paymentId], client);
+      await query('UPDATE payments SET amount=$1,date=$2,comment=$3,updated_at=CURRENT_TIMESTAMP WHERE id=$4', [amount, date, comment, paymentId], client);
 
       if (transaction) {
         await query(`
