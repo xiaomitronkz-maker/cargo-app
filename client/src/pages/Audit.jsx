@@ -49,6 +49,7 @@ export default function Audit() {
   const [costForm, setCostForm] = useState({ cost: '', reason: '' })
   const [costSaving, setCostSaving] = useState(false)
   const [costError, setCostError] = useState('')
+  const [costNotice, setCostNotice] = useState('')
 
   const load = () => {
     setLoading(true)
@@ -70,6 +71,7 @@ export default function Audit() {
     setCostModal(row)
     setCostForm({ cost: String(toNumber(row.cost)), reason: '' })
     setCostError('')
+    setCostNotice('')
   }
 
   const closeCostModal = () => {
@@ -80,13 +82,20 @@ export default function Audit() {
 
   const saveManualCost = async () => {
     if (!costModal?.sale_id) return
+    const reason = costForm.reason.trim()
+    if (!reason) {
+      setCostError('Укажите причину ручной себестоимости.')
+      return
+    }
     setCostSaving(true)
     setCostError('')
+    setCostNotice('')
     try {
-      await api.put(`/sales/${costModal.sale_id}/manual-cost`, {
+      const result = await api.put(`/sales/${costModal.sale_id}/manual-cost`, {
         cost: costForm.cost,
-        reason: costForm.reason,
+        reason,
       })
+      if (result?.warning) setCostNotice(result.warning)
       closeCostModal()
       await load()
     } catch (e) {
@@ -159,6 +168,12 @@ export default function Audit() {
         </div>
         <button className="btn btn-secondary" onClick={load}>🔄 Перепроверить</button>
       </div>
+
+      {costNotice && (
+        <div className="alert alert-info" style={{ marginTop: 0, marginBottom: 20 }}>
+          {costNotice}
+        </div>
+      )}
 
       <div className="stat-grid">
         <div className="stat-card">
@@ -557,9 +572,10 @@ export default function Audit() {
             />
           </div>
           <div className="form-group">
-            <label className="form-label">Причина / комментарий</label>
+            <label className="form-label">Причина / комментарий *</label>
             <textarea
               className="form-textarea"
+              required
               value={costForm.reason}
               onChange={e => setCostForm(form => ({ ...form, reason: e.target.value }))}
               placeholder="Например: сверено вручную по исходному приходу"

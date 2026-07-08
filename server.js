@@ -5202,11 +5202,20 @@ app.put('/api/sales/:id/manual-cost', async (req, res) => {
   if (costValue == null || costValue === '' || !Number.isFinite(cost) || cost < 0) {
     return validationError(res, 'Себестоимость должна быть числом 0 или больше', { sale_id: saleId, cost: req.body?.cost });
   }
+  if (!reason) {
+    return validationError(res, 'Укажите причину ручной себестоимости.', { sale_id: saleId });
+  }
 
   try {
     const result = await withTx(async (client) => {
       const sale = await get('SELECT id,total_amount FROM sales WHERE id=$1', [saleId], client);
       if (!sale) throw new Error('Продажа не найдена');
+      const revenue = +(sale.total_amount || 0);
+      const warning = cost === 0 && revenue > 0.009
+        ? 'Себестоимость 0 при положительной выручке — проверьте.'
+        : cost > revenue + 0.009
+          ? 'Себестоимость выше выручки — проверьте.'
+          : null;
       const oldCostRow = await get(`
         ${salesCostCte('WHERE s.id=$1')}
         SELECT cost,cost_method
@@ -5238,17 +5247,18 @@ app.put('/api/sales/:id/manual-cost', async (req, res) => {
           old_cost_method: oldCostRow?.cost_method || null,
           new_cost: +(newCostRow?.cost || cost),
           new_cost_method: newCostRow?.cost_method || 'manual_override',
-          reason: reason || null,
+          reason,
         },
       });
       return {
         sale_id: saleId,
-        revenue: +(sale.total_amount || 0),
+        revenue,
         old_cost: +(oldCostRow?.cost || 0),
         old_cost_method: oldCostRow?.cost_method || null,
         new_cost: +(newCostRow?.cost || cost),
         new_cost_method: newCostRow?.cost_method || 'manual_override',
-        manual_cost_reason: reason || null,
+        manual_cost_reason: reason,
+        warning,
       };
     });
     res.json(result);
