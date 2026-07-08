@@ -105,6 +105,17 @@ export default function Audit() {
   const operationLogFailureRows = normalizeArray(operationLogFailures.recent)
   const operationLogFailureCount = toNumber(operationLogFailures.unresolved_count ?? operationLogFailures.count)
   const operationLogFailuresOk = operationLogFailures.status === 'ok' || operationLogFailureCount === 0
+  const manualBalanceTables = data?.legacy_manual_balance_tables || data?.money_assets_liabilities_status || {}
+  const manualAssetsCount = toNumber(manualBalanceTables.money_assets_count)
+  const manualAssetsTotal = toNumber(manualBalanceTables.money_assets_total)
+  const manualLiabilitiesCount = toNumber(manualBalanceTables.liabilities_count)
+  const manualLiabilitiesTotal = toNumber(manualBalanceTables.liabilities_total)
+  const manualBalanceTablesOk = manualBalanceTables.status === 'ok' || (
+    manualAssetsCount === 0 &&
+    manualLiabilitiesCount === 0 &&
+    ok(manualAssetsTotal) &&
+    ok(manualLiabilitiesTotal)
+  )
   const debts = data?.debts_check || {}
   const global = data?.global_check || {}
   const profitReconciliation = data?.profit_reconciliation || {}
@@ -180,6 +191,19 @@ export default function Audit() {
           </div>
           <div className="stat-sub">незакрытые ошибки записи operation_logs</div>
           <StatusText isOk={operationLogFailuresOk} />
+        </div>
+
+        <div className="stat-card">
+          <div className="stat-label">Ручные активы/обязательства</div>
+          <div className={`stat-value ${manualBalanceTablesOk ? 'positive' : 'negative'}`}>
+            {manualAssetsCount + manualLiabilitiesCount}
+          </div>
+          <AuditBreakdown rows={[
+            { label: 'Manual assets', value: `${manualAssetsCount} · ${fmt(manualAssetsTotal)}` },
+            { label: 'Manual liabilities', value: `${manualLiabilitiesCount} · ${fmt(manualLiabilitiesTotal)}` },
+            { label: 'В формуле контроля', value: manualBalanceTables.included_in_control_formula ? 'участвуют' : 'не участвуют' },
+          ]} />
+          <StatusText isOk={manualBalanceTablesOk} />
         </div>
 
         <div className="stat-card">
@@ -285,6 +309,10 @@ export default function Audit() {
           {operationLogFailures.note || 'Есть незакрытые ошибки записи operation_logs. Проверьте журнал аудита.'}
         </div>
       )}
+
+      <div className={`alert ${manualBalanceTablesOk ? 'alert-info' : 'alert-error'}`} style={{ marginTop: 20 }}>
+        {manualBalanceTables.note || 'Manual money_assets/liabilities are legacy/reference tables and are not included in profit/control formula to avoid double counting.'}
+      </div>
 
       <div className="table-wrapper" style={{ marginTop: 20 }}>
         <table>

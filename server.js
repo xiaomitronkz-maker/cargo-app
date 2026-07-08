@@ -6781,6 +6781,24 @@ app.get('/api/audit', async (req, res) => {
     ORDER BY created_at DESC,id DESC
     LIMIT 10
   `);
+  const manualMoneyAssets = await get(`
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(amount::numeric),0) AS total
+    FROM money_assets
+  `);
+  const manualLiabilities = await get(`
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(amount::numeric),0) AS total
+    FROM liabilities
+  `);
+  const manualMoneyAssetsCount = +(manualMoneyAssets?.count || 0);
+  const manualMoneyAssetsTotal = +(manualMoneyAssets?.total || 0);
+  const manualLiabilitiesCount = +(manualLiabilities?.count || 0);
+  const manualLiabilitiesTotal = +(manualLiabilities?.total || 0);
+  const manualBalanceTablesStatus = (
+    manualMoneyAssetsCount === 0 &&
+    manualLiabilitiesCount === 0 &&
+    Math.abs(manualMoneyAssetsTotal) < 0.01 &&
+    Math.abs(manualLiabilitiesTotal) < 0.01
+  ) ? 'ok' : 'warning';
 
   const debtSummary = await debtSummaryData();
   const debtLedger = await debtsLedgerData();
@@ -6937,6 +6955,17 @@ app.get('/api/audit', async (req, res) => {
     accounts_balance_check: accounts,
     accounts,
     orphan_transactions: orphanTransactions,
+    legacy_manual_balance_tables: {
+      status: manualBalanceTablesStatus,
+      money_assets_count: manualMoneyAssetsCount,
+      money_assets_total: manualMoneyAssetsTotal,
+      liabilities_count: manualLiabilitiesCount,
+      liabilities_total: manualLiabilitiesTotal,
+      included_in_control_formula: false,
+      note: manualBalanceTablesStatus === 'ok'
+        ? 'Manual money_assets/liabilities are legacy/reference tables and are not included in profit/control formula to avoid double counting.'
+        : 'Manual money_assets/liabilities contain data but are not included in control formula.',
+    },
     operation_log_failures: {
       status: operationLogFailureCount === 0 ? 'ok' : 'warning',
       unresolved_count: operationLogFailureCount,
