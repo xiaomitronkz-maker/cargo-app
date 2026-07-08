@@ -3,7 +3,8 @@
 async function request(method, path, body) {
   const opts = {
     method,
-    headers: { 'Content-Type': 'application/json' }
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
   }
   if (body !== undefined) opts.body = JSON.stringify(body)
   const res = await fetch(`/api${path}`, opts)
@@ -16,6 +17,7 @@ async function upload(path, formData) {
   const res = await fetch(`/api${path}`, {
     method: 'POST',
     body: formData,
+    credentials: 'same-origin',
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`)
@@ -30,6 +32,11 @@ const api = {
   post: (path, body) => request('POST', path, body),
   put: (path, body) => request('PUT', path, body),
   del: (path) => request('DELETE', path),
+
+  // Auth
+  login: (data) => api.post('/auth/login', data),
+  logout: () => api.post('/auth/logout', {}),
+  getAuthMe: () => api.get('/auth/me'),
 
   // Clients
   getClients: () => api.get('/clients'),

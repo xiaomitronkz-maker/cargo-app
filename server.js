@@ -14,9 +14,10 @@ const cors = require('cors');
 const path = require('path');
 const XLSX = require('xlsx');
 const { google } = require('googleapis');
-const { randomUUID } = require('crypto');
+const { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } = require('crypto');
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 const REQUEST_BODY_LIMIT = '10mb';
 const isProduction = process.env.NODE_ENV === 'production';
@@ -36,7 +37,19 @@ const pool = hasDatabaseUrl
     })
   : null;
 
-app.use(cors());
+const allowedCorsOrigins = String(process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedCorsOrigins.includes(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+}));
 app.use(express.json({ limit: REQUEST_BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: REQUEST_BODY_LIMIT }));
 app.use((req, res, next) => {
@@ -46,10 +59,129 @@ app.use((req, res, next) => {
   next();
 });
 
+const SESSION_COOKIE_NAME = 'cargo_session';
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+function isAuthConfigured() {
+  return Boolean(process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD_HASH && process.env.SESSION_SECRET);
+}
+
+function parseCookies(header = '') {
+  return header.split(';').reduce((cookies, part) => {
+    const index = part.indexOf('=');
+    if (index === -1) return cookies;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (!key) return cookies;
+    try {
+      cookies[key] = decodeURIComponent(value);
+    } catch (_) {
+      cookies[key] = value;
+    }
+    return cookies;
+  }, {});
+}
+
+function signSessionPayload(payload) {
+  return createHmac('sha256', process.env.SESSION_SECRET || '')
+    .update(payload)
+    .digest('base64url');
+}
+
+function safeEqualText(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function createSessionToken(username) {
+  const payload = Buffer.from(JSON.stringify({
+    username,
+    exp: Date.now() + SESSION_TTL_MS,
+    nonce: randomBytes(12).toString('base64url'),
+  })).toString('base64url');
+  return `${payload}.${signSessionPayload(payload)}`;
+}
+
+function getSessionFromRequest(req) {
+  if (!isAuthConfigured()) return null;
+  const token = parseCookies(req.headers.cookie || '')[SESSION_COOKIE_NAME];
+  if (!token || !token.includes('.')) return null;
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature || !safeEqualText(signature, signSessionPayload(payload))) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!session?.username || !session?.exp || Date.now() > +session.exp) return null;
+    if (session.username !== process.env.ADMIN_USERNAME) return null;
+    return { username: session.username };
+  } catch (_) {
+    return null;
+  }
+}
+
+function verifyPassword(password, passwordHash) {
+  const [scheme, salt, expectedHash] = String(passwordHash || '').split('$');
+  if (scheme !== 'scrypt' || !salt || !expectedHash) return false;
+  const actualHash = scryptSync(String(password || ''), salt, 64).toString('hex');
+  return safeEqualText(actualHash, expectedHash);
+}
+
+function shouldUseSecureCookie(req) {
+  return isProduction || req.secure || req.get('x-forwarded-proto') === 'https';
+}
+
+function sessionCookieOptions(req) {
+  return {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: shouldUseSecureCookie(req),
+    path: '/',
+  };
+}
+
+function setSessionCookie(req, res, username) {
+  res.cookie(SESSION_COOKIE_NAME, createSessionToken(username), {
+    ...sessionCookieOptions(req),
+    maxAge: SESSION_TTL_MS,
+  });
+}
+
+function clearSessionCookie(req, res) {
+  res.clearCookie(SESSION_COOKIE_NAME, sessionCookieOptions(req));
+}
+
+app.post('/api/auth/login', (req, res) => {
+  if (!isAuthConfigured()) return res.status(503).json({ error: 'Authentication is not configured' });
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  if (username !== process.env.ADMIN_USERNAME || !verifyPassword(password, process.env.ADMIN_PASSWORD_HASH)) {
+    return res.status(401).json({ error: 'Неверный логин или пароль' });
+  }
+  setSessionCookie(req, res, username);
+  res.json({ authenticated: true, user: { username } });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  clearSessionCookie(req, res);
+  res.json({ success: true });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  const session = getSessionFromRequest(req);
+  res.json({
+    authenticated: Boolean(session),
+    configured: isAuthConfigured(),
+    user: session ? { username: session.username } : null,
+  });
+});
+
 app.use('/api', (req, res, next) => {
   if (!pool || !databaseReady) {
     return res.status(503).json({ error: 'Database is not available' });
   }
+  const session = getSessionFromRequest(req);
+  if (!session) return res.status(401).json({ error: 'Требуется вход', code: 'UNAUTHORIZED' });
+  req.user = session;
   next();
 });
 

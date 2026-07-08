@@ -32,7 +32,14 @@ const NAV = [
   ]},
 ]
 
-export default function Layout() {
+export default function Layout({ user, onLogout }) {
+  const navigate = useNavigate()
+
+  const logout = async () => {
+    await onLogout?.()
+    navigate('/dashboard', { replace: true })
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -58,6 +65,16 @@ export default function Layout() {
             </div>
           ))}
         </nav>
+
+        <div className="sidebar-footer">
+          <div className="sidebar-user">
+            <span>Пользователь</span>
+            <strong>{user?.username || 'admin'}</strong>
+          </div>
+          <button className="btn btn-secondary btn-sm sidebar-logout" type="button" onClick={logout}>
+            Выйти
+          </button>
+        </div>
       </aside>
 
       <main className="main-content">
