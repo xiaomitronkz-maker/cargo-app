@@ -30,6 +30,12 @@ function StatusText({ isOk }) {
     : <span className="badge badge-danger">Ошибка</span>
 }
 
+function ProfitStatus({ status, isOk }) {
+  if (isOk) return <span className="badge badge-success">OK</span>
+  if (status === 'inventory_required') return <span className="badge badge-warning">Требует товарного учета</span>
+  return <span className="badge badge-danger">Ошибка</span>
+}
+
 function AuditBreakdown({ rows }) {
   return (
     <div className="stat-sub audit-breakdown">
@@ -154,7 +160,12 @@ export default function Audit() {
   const ownerControlOk = global.control_with_owner_ok ?? ok(ownerControl)
   const clientAdvancesTotal = toNumber(data?.client_advances_total ?? global.client_advances_total ?? debts.client_advances_total)
   const profitDifference = toNumber(profitReconciliation.profit_difference)
+  const profitBridge = profitReconciliation.diagnostic_bridge || {}
+  const inventoryCostGap = profitBridge.inventory_cost_gap || {}
+  const manualBalanceAdjustments = profitBridge.manual_balance_adjustments || {}
+  const bridgedDifference = toNumber(profitBridge.bridged_difference)
   const profitReconciliationOk = profitReconciliation.status === 'ok' || ok(profitDifference)
+  const profitNeedsInventory = profitReconciliation.status === 'inventory_required' && ok(bridgedDifference)
   const supplierDifference = toNumber(supplierReconciliation.ledger_difference ?? ((debts.supplier_payable_total || 0) - (debts.supplier_payable_ledger_total || 0)))
   const supplierBySuppliersDifference = toNumber(supplierReconciliation.by_suppliers_difference)
   const supplierOk = supplierReconciliation.status === 'ok' || (ok(supplierDifference) && ok(supplierBySuppliersDifference))
@@ -294,8 +305,12 @@ export default function Audit() {
             { label: 'Прибыль по отчету', value: fmt(profitReconciliation.reported_profit) },
             { label: 'Прибыль по балансу', value: fmt(profitReconciliation.implied_profit) },
             { label: 'Формула', value: profitReconciliation.formula || 'cash + receivable - payable - owner_capital' },
+            { label: 'Товарный разрыв', value: fmt(inventoryCostGap.gap) },
+            { label: 'Ручные корректировки', value: fmt(manualBalanceAdjustments.net) },
+            { label: 'Остаток между ними', value: fmt(profitBridge.inventory_manual_residual) },
+            { label: 'Bridge diff', value: fmt(bridgedDifference), tone: ok(bridgedDifference) ? 'positive' : 'negative' },
           ]} />
-          <StatusText isOk={profitReconciliationOk} />
+          <ProfitStatus status={profitReconciliation.status} isOk={profitReconciliationOk} />
         </div>
 
         <div className="stat-card">
@@ -315,7 +330,9 @@ export default function Audit() {
 
       {!profitReconciliationOk && (
         <div className="alert alert-info" style={{ marginTop: 20 }}>
-          {profitReconciliation.note || 'Прибыль по P&L отличается от балансной прибыли. Частая причина — продажи со средней/legacy себестоимостью без точной связи с приходом.'}
+          {profitNeedsInventory
+            ? (profitBridge.note || 'Текущая формула не учитывает товар/остатки как актив. Это отдельная крупная задача.')
+            : (profitReconciliation.note || 'Прибыль по P&L отличается от балансной прибыли. Частая причина — продажи со средней/legacy себестоимостью без точной связи с приходом.')}
         </div>
       )}
 

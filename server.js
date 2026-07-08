@@ -6818,6 +6818,19 @@ app.get('/api/audit', async (req, res) => {
   const payableLedger = +(debtLedger.summary?.payable || 0);
   const debtsDiff = (receivableSystem - receivableLedger) + (payableSystem - payableLedger);
   const profit = await profitSummaryData();
+  const purchasesTotalRow = await get(`
+    SELECT COALESCE(SUM(total_cost::numeric),0) AS total
+    FROM purchases
+  `);
+  const manualBalanceAdjustments = await get(`
+    SELECT
+      COALESCE(SUM(amount::numeric) FILTER (
+        WHERE type='income' AND COALESCE(related_type,'')='manual'
+      ),0) AS manual_income,
+      COALESCE(SUM(amount::numeric) FILTER (WHERE type='cash_adjustment_in'),0) AS cash_adjustment_in,
+      COALESCE(SUM(amount::numeric) FILTER (WHERE type='cash_adjustment_out'),0) AS cash_adjustment_out
+    FROM transactions
+  `);
   const costMethodSummary = await all(`
     ${salesCostCte()}
     SELECT
@@ -6950,6 +6963,21 @@ app.get('/api/audit', async (req, res) => {
     - ownerCapitalTotal;
   const reportedProfit = +(profit.profit || 0);
   const profitDifference = reportedProfit - impliedProfit;
+  const purchasesTotal = +(purchasesTotalRow?.total || 0);
+  const salesCostTotal = +(profit.cost || 0);
+  const inventoryCostGap = purchasesTotal - salesCostTotal;
+  const manualIncomeTotal = +(manualBalanceAdjustments?.manual_income || 0);
+  const cashAdjustmentInTotal = +(manualBalanceAdjustments?.cash_adjustment_in || 0);
+  const cashAdjustmentOutTotal = +(manualBalanceAdjustments?.cash_adjustment_out || 0);
+  const manualBalanceAdjustmentsNet = manualIncomeTotal + cashAdjustmentInTotal - cashAdjustmentOutTotal;
+  const inventoryManualResidual = inventoryCostGap - manualBalanceAdjustmentsNet;
+  const bridgedImpliedProfit = impliedProfit + inventoryManualResidual;
+  const bridgedDifference = reportedProfit - bridgedImpliedProfit;
+  const profitReconciliationStatus = Math.abs(profitDifference) <= 0.05
+    ? 'ok'
+    : Math.abs(bridgedDifference) <= 0.05
+      ? 'inventory_required'
+      : 'error';
   const supplierSummaryTotal = +(debtSummary.supplier_payable?.total || 0);
   const supplierLedgerTotal = +(debtLedger.summary?.supplier_payable || 0);
   const supplierBySuppliersTotal = +(supplierBySuppliers?.total || 0);
@@ -7024,10 +7052,29 @@ app.get('/api/audit', async (req, res) => {
       implied_profit: impliedProfit,
       profit_difference: profitDifference,
       formula: 'cash + receivable - payable - owner_capital',
-      status: Math.abs(profitDifference) <= 0.05 ? 'ok' : 'warning',
+      status: profitReconciliationStatus,
+      diagnostic_bridge: {
+        inventory_cost_gap: {
+          purchases_total: purchasesTotal,
+          sales_cost_total: salesCostTotal,
+          gap: inventoryCostGap,
+        },
+        manual_balance_adjustments: {
+          manual_income: manualIncomeTotal,
+          cash_adjustment_in: cashAdjustmentInTotal,
+          cash_adjustment_out: cashAdjustmentOutTotal,
+          net: manualBalanceAdjustmentsNet,
+        },
+        inventory_manual_residual: inventoryManualResidual,
+        bridged_implied_profit: bridgedImpliedProfit,
+        bridged_difference: bridgedDifference,
+        note: 'Текущая формула не учитывает товар/остатки как актив. Это отдельная крупная задача.',
+      },
       note: Math.abs(profitDifference) <= 0.05
         ? 'Прибыль по P&L сходится с балансной прибылью.'
-        : 'Прибыль по P&L отличается от балансной прибыли. Возможная причина — legacy/fallback себестоимость или продажи без точной связи с приходом.',
+        : Math.abs(bridgedDifference) <= 0.05
+          ? 'Расхождение объясняется товарным разрывом и ручными корректировками баланса. Текущая формула не учитывает товар/остатки как актив.'
+          : 'Прибыль по P&L отличается от балансной прибыли даже после диагностической расшифровки.',
     },
     cost_method_summary: costMethodSummary.map((row) => ({
       method: row.method || 'unknown',
