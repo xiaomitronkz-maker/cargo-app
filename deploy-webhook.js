@@ -81,6 +81,7 @@ async function deploy() {
   log('deploy started', { appDir: APP_DIR });
   await runStep('git pull', 'git', ['pull', '--ff-only']);
   await runStep('npm install', 'npm', ['install']);
+  await runStep('server syntax check', 'node', ['--check', 'server.js']);
   await runStep('client build', 'npm', ['run', 'build', '--prefix', 'client']);
   await runStep('pm2 restart', 'pm2', ['restart', 'cargo', '--update-env']);
   log('deploy finished');
@@ -141,6 +142,10 @@ app.post('/github-webhook', express.raw({ type: 'application/json', limit: '1mb'
 
   if (!payload || !payload.repository) {
     return res.status(202).json({ ok: true, message: 'ignored empty payload' });
+  }
+
+  if (payload.ref !== 'refs/heads/main') {
+    return res.status(200).json({ ok: true, message: 'ignored non-main ref' });
   }
 
   if (deployRunning) {
