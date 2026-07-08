@@ -61,6 +61,9 @@ app.use((req, res, next) => {
 
 const SESSION_COOKIE_NAME = 'cargo_session';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_LIMIT_MAX_FAILURES = 5;
+const loginFailuresByIp = new Map();
 
 function isAuthConfigured() {
   return Boolean(process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD_HASH && process.env.SESSION_SECRET);
@@ -126,6 +129,37 @@ function verifyPassword(password, passwordHash) {
   return safeEqualText(actualHash, expectedHash);
 }
 
+function getLoginRateLimitKey(req) {
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function getLoginFailureState(req) {
+  const key = getLoginRateLimitKey(req);
+  const now = Date.now();
+  const existing = loginFailuresByIp.get(key);
+  if (existing && existing.resetAt > now) return { key, state: existing, now };
+  const state = { count: 0, resetAt: now + LOGIN_RATE_LIMIT_WINDOW_MS };
+  loginFailuresByIp.set(key, state);
+  return { key, state, now };
+}
+
+function isLoginRateLimited(req) {
+  const { state, now } = getLoginFailureState(req);
+  if (state.count < LOGIN_RATE_LIMIT_MAX_FAILURES) return false;
+  return Math.max(1, Math.ceil((state.resetAt - now) / 1000));
+}
+
+function recordFailedLogin(req) {
+  const { key, state, now } = getLoginFailureState(req);
+  state.count += 1;
+  state.resetAt = state.resetAt > now ? state.resetAt : now + LOGIN_RATE_LIMIT_WINDOW_MS;
+  loginFailuresByIp.set(key, state);
+}
+
+function resetLoginRateLimit(req) {
+  loginFailuresByIp.delete(getLoginRateLimitKey(req));
+}
+
 function shouldUseSecureCookie() {
   const value = String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase();
   if (value === 'true') return true;
@@ -155,11 +189,18 @@ function clearSessionCookie(req, res) {
 
 app.post('/api/auth/login', (req, res) => {
   if (!isAuthConfigured()) return res.status(503).json({ error: 'Authentication is not configured' });
+  const retryAfter = isLoginRateLimited(req);
+  if (retryAfter) {
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'Слишком много попыток входа. Попробуйте позже.' });
+  }
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
   if (username !== process.env.ADMIN_USERNAME || !verifyPassword(password, process.env.ADMIN_PASSWORD_HASH)) {
+    recordFailedLogin(req);
     return res.status(401).json({ error: 'Неверный логин или пароль' });
   }
+  resetLoginRateLimit(req);
   setSessionCookie(req, res, username);
   res.json({ authenticated: true, user: { username } });
 });
