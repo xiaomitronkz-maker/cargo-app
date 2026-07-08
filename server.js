@@ -634,6 +634,29 @@ function validatePurchaseNums({ weight_kg = 0, quantity_pcs = 0, cost_almaty = 0
   if (+cost_dubai < 0) throw new Error('Тариф Дубай не может быть отрицательным');
 }
 
+function purchaseLogValues(purchase = {}) {
+  return {
+    purchase_id: purchase.id ? +purchase.id : null,
+    date: purchase.date || null,
+    receipt_id: purchase.receipt_id ? +purchase.receipt_id : null,
+    supplier_id: purchase.supplier_id ? +purchase.supplier_id : null,
+    client_id: purchase.client_id ? +purchase.client_id : null,
+    marking_id: purchase.marking_id ? +purchase.marking_id : null,
+    product_id: purchase.product_id ? +purchase.product_id : null,
+    quantity_pcs: +(purchase.quantity_pcs || 0),
+    weight_kg: +(purchase.weight_kg || 0),
+    boxes_count: +(purchase.boxes_count || 0),
+    cost_almaty: +(purchase.cost_almaty || 0),
+    cost_dubai: +(purchase.cost_dubai || 0),
+    cost_per_kg: +(purchase.cost_per_kg || 0),
+    ala_unit: purchase.ala_unit || null,
+    class_code: purchase.class_code || null,
+    total_cost: +(purchase.total_cost || 0),
+    paid_amount: +(purchase.paid_amount || 0),
+    notes: purchase.notes || null,
+  };
+}
+
 function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -4645,29 +4668,50 @@ app.post('/api/purchases', async (req, res) => {
 
   try {
     validatePurchaseNums(body);
-    const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
-    const weight = +body.weight_kg || 0;
-    const quantity = +body.quantity_pcs || 0;
-    const costAlmaty = +body.cost_almaty || 0;
-    const costDubai = +body.cost_dubai || 0;
-    const product = await get('SELECT name FROM products WHERE id=$1', [+body.product_id]);
-    const classCode = body.class_code || body.class || null;
-    const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
-      weight_kg: weight,
-      quantity_pcs: quantity,
-      cost_almaty: costAlmaty,
-      cost_dubai: costDubai,
-      product_name: product?.name,
-      class_code: classCode,
-      ala_unit: body.ala_unit,
+    const result = await withTx(async (client) => {
+      const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id, client);
+      const weight = +body.weight_kg || 0;
+      const quantity = +body.quantity_pcs || 0;
+      const costAlmaty = +body.cost_almaty || 0;
+      const costDubai = +body.cost_dubai || 0;
+      const product = await get('SELECT name FROM products WHERE id=$1', [+body.product_id], client);
+      const classCode = body.class_code || body.class || null;
+      const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
+        weight_kg: weight,
+        quantity_pcs: quantity,
+        cost_almaty: costAlmaty,
+        cost_dubai: costDubai,
+        product_name: product?.name,
+        class_code: classCode,
+        ala_unit: body.ala_unit,
+      });
+      const paidAmount = +body.paid_amount || 0;
+      const row = await get(`
+        INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,ala_unit,class_code,total_cost,paid_amount,notes)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        RETURNING *
+      `, [body.date, cid, mid, +body.supplier_id, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, paidAmount, body.notes || null], client);
+      const values = purchaseLogValues(row);
+      await logOperation(client, {
+        action: 'purchase_created',
+        entity_type: 'purchase',
+        entity_id: row.id,
+        entity_label: `Приход №${row.id}`,
+        amount: totalCost,
+        currency: 'USD',
+        description: 'Создана строка прихода',
+        meta: values,
+      });
+      return {
+        id: row.id,
+        cost_per_kg: costPerKg,
+        ala_unit: alaUnit,
+        total_cost: totalCost,
+        paid_amount: paidAmount,
+        payable: totalCost - paidAmount,
+      };
     });
-    const paidAmount = +body.paid_amount || 0;
-    const row = await get(`
-      INSERT INTO purchases(date,client_id,marking_id,supplier_id,product_id,quantity_pcs,weight_kg,boxes_count,cost_almaty,cost_dubai,cost_per_kg,ala_unit,class_code,total_cost,paid_amount,notes)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-      RETURNING id
-    `, [body.date, cid, mid, +body.supplier_id, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, paidAmount, body.notes || null]);
-    res.json({ id: row.id, cost_per_kg: costPerKg, ala_unit: alaUnit, total_cost: totalCost, paid_amount: paidAmount, payable: totalCost - paidAmount });
+    res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -4678,30 +4722,56 @@ app.put('/api/purchases/:id', async (req, res) => {
   if (!body.date || !body.product_id) return res.status(400).json({ error: 'Дата и товар обязательны' });
   try {
     validatePurchaseNums(body);
-    const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id);
-    const weight = +body.weight_kg || 0;
-    const quantity = +body.quantity_pcs || 0;
-    const costAlmaty = +body.cost_almaty || 0;
-    const costDubai = +body.cost_dubai || 0;
-    const product = await get('SELECT name FROM products WHERE id=$1', [+body.product_id]);
-    const classCode = body.class_code || body.class || null;
-    const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
-      weight_kg: weight,
-      quantity_pcs: quantity,
-      cost_almaty: costAlmaty,
-      cost_dubai: costDubai,
-      product_name: product?.name,
-      class_code: classCode,
-      ala_unit: body.ala_unit,
+    const result = await withTx(async (client) => {
+      const id = +req.params.id;
+      const previous = await get('SELECT * FROM purchases WHERE id=$1 FOR UPDATE', [id], client);
+      if (!previous) throw httpError('Приход не найден', 404);
+      const { cid, mid } = await resolveClientMarking(body.client_id, body.marking_id, client);
+      const weight = +body.weight_kg || 0;
+      const quantity = +body.quantity_pcs || 0;
+      const costAlmaty = +body.cost_almaty || 0;
+      const costDubai = +body.cost_dubai || 0;
+      const product = await get('SELECT name FROM products WHERE id=$1', [+body.product_id], client);
+      const classCode = body.class_code || body.class || null;
+      const { costPerKg, totalCost, alaUnit } = calculatePurchaseCost({
+        weight_kg: weight,
+        quantity_pcs: quantity,
+        cost_almaty: costAlmaty,
+        cost_dubai: costDubai,
+        product_name: product?.name,
+        class_code: classCode,
+        ala_unit: body.ala_unit,
+      });
+      const updated = await get(`
+        UPDATE purchases
+        SET date=$1,client_id=$2,marking_id=$3,product_id=$4,quantity_pcs=$5,weight_kg=$6,boxes_count=$7,cost_almaty=$8,cost_dubai=$9,cost_per_kg=$10,ala_unit=$11,class_code=$12,total_cost=$13,notes=$14
+        WHERE id=$15
+        RETURNING *
+      `, [body.date, cid, mid, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, body.notes || null, id], client);
+      await logOperation(client, {
+        action: 'purchase_updated',
+        entity_type: 'purchase',
+        entity_id: id,
+        entity_label: `Приход №${id}`,
+        amount: totalCost,
+        currency: 'USD',
+        description: 'Изменена строка прихода',
+        meta: {
+          purchase_id: id,
+          receipt_id: updated.receipt_id || null,
+          supplier_id: updated.supplier_id || null,
+          client_id: updated.client_id || null,
+          marking_id: updated.marking_id || null,
+          product_id: updated.product_id || null,
+          old_values: purchaseLogValues(previous),
+          new_values: purchaseLogValues(updated),
+        },
+      });
+      return { success: true, cost_per_kg: costPerKg, ala_unit: alaUnit, total_cost: totalCost };
     });
-    await query(`
-      UPDATE purchases
-      SET date=$1,client_id=$2,marking_id=$3,product_id=$4,quantity_pcs=$5,weight_kg=$6,boxes_count=$7,cost_almaty=$8,cost_dubai=$9,cost_per_kg=$10,ala_unit=$11,class_code=$12,total_cost=$13,notes=$14
-      WHERE id=$15
-    `, [body.date, cid, mid, +body.product_id, quantity, weight, +body.boxes_count || 0, costAlmaty, costDubai, costPerKg, alaUnit, classCode, totalCost, body.notes || null, +req.params.id]);
-    res.json({ success: true, cost_per_kg: costPerKg, ala_unit: alaUnit, total_cost: totalCost });
+    res.json(result);
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.statusCode || 400).json({ error: e.message });
   }
 });
 
