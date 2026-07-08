@@ -129,6 +129,67 @@ function verifyPassword(password, passwordHash) {
   return safeEqualText(actualHash, expectedHash);
 }
 
+function sanitizeLogFailureValue(value, seen = new WeakSet()) {
+  if (value == null || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'string') {
+    return value;
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitizeLogFailureValue(item, seen));
+  if (typeof value !== 'object') return String(value);
+  if (seen.has(value)) return '[circular]';
+  seen.add(value);
+
+  return Object.entries(value).slice(0, 100).reduce((acc, [key, item]) => {
+    const normalizedKey = String(key).toLowerCase();
+    if (/(password|secret|token|cookie|authorization|session)/.test(normalizedKey)) {
+      acc[key] = '[redacted]';
+    } else {
+      acc[key] = sanitizeLogFailureValue(item, seen);
+    }
+    return acc;
+  }, {});
+}
+
+function operationLogFailureMeta(options) {
+  return {
+    actor: options.actor || 'system',
+    entity_label: options.entity_label || null,
+    amount: options.amount != null && options.amount !== '' ? +options.amount : null,
+    currency: options.currency || 'USD',
+    description: options.description || null,
+    meta: sanitizeLogFailureValue(options.meta || {}),
+  };
+}
+
+async function recordOperationLogFailure(client, options, error) {
+  const useSavepoint = client && client !== pool && typeof client.query === 'function';
+  const entityId = options.entity_id != null && Number.isFinite(+options.entity_id) ? +options.entity_id : null;
+  try {
+    if (useSavepoint) await client.query('SAVEPOINT operation_log_failure_sp');
+    await query(`
+      INSERT INTO operation_log_failures(operation_type,entity_type,entity_id,error_message,meta)
+      VALUES($1,$2,$3,$4,$5::jsonb)
+    `, [
+      options.action || null,
+      options.entity_type || null,
+      entityId,
+      String(error?.message || error || 'Unknown operation log error').slice(0, 1000),
+      JSON.stringify(operationLogFailureMeta(options)),
+    ], client || pool);
+    if (useSavepoint) await client.query('RELEASE SAVEPOINT operation_log_failure_sp');
+  } catch (failureError) {
+    if (useSavepoint) {
+      try {
+        await client.query('ROLLBACK TO SAVEPOINT operation_log_failure_sp');
+        await client.query('RELEASE SAVEPOINT operation_log_failure_sp');
+      } catch (rollbackError) {
+        console.error('Operation log failure rollback failed:', rollbackError.message);
+      }
+    }
+    console.error('Operation log failure tracking failed:', failureError.message);
+  }
+}
+
 function getLoginRateLimitKey(req) {
   return req.ip || req.socket?.remoteAddress || 'unknown';
 }
@@ -314,6 +375,7 @@ async function logOperation(clientOrOptions, maybeOptions) {
       }
     }
     console.error('Operation log failed:', error.message);
+    await recordOperationLogFailure(client, options, error);
   }
 }
 
@@ -562,6 +624,17 @@ async function initDb() {
       currency TEXT DEFAULT 'USD',
       description TEXT,
       meta JSONB DEFAULT '{}'::jsonb
+    );
+
+    CREATE TABLE IF NOT EXISTS operation_log_failures (
+      id SERIAL PRIMARY KEY,
+      operation_type TEXT,
+      entity_type TEXT,
+      entity_id INTEGER,
+      error_message TEXT NOT NULL,
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      resolved_at TIMESTAMP
     );
   `);
 
@@ -6696,6 +6769,18 @@ app.get('/api/audit', async (req, res) => {
     )
     ORDER BY id DESC
   `);
+  const operationLogFailureCount = +(await get(`
+    SELECT COUNT(*)::int AS count
+    FROM operation_log_failures
+    WHERE resolved_at IS NULL
+  `))?.count || 0;
+  const operationLogFailureRecent = await all(`
+    SELECT id,operation_type,entity_type,entity_id,error_message,meta,created_at
+    FROM operation_log_failures
+    WHERE resolved_at IS NULL
+    ORDER BY created_at DESC,id DESC
+    LIMIT 10
+  `);
 
   const debtSummary = await debtSummaryData();
   const debtLedger = await debtsLedgerData();
@@ -6852,6 +6937,22 @@ app.get('/api/audit', async (req, res) => {
     accounts_balance_check: accounts,
     accounts,
     orphan_transactions: orphanTransactions,
+    operation_log_failures: {
+      status: operationLogFailureCount === 0 ? 'ok' : 'warning',
+      unresolved_count: operationLogFailureCount,
+      recent: operationLogFailureRecent.map((row) => ({
+        id: +row.id,
+        operation_type: row.operation_type || null,
+        entity_type: row.entity_type || null,
+        entity_id: row.entity_id == null ? null : +row.entity_id,
+        error_message: row.error_message || '',
+        meta: row.meta || {},
+        created_at: row.created_at || null,
+      })),
+      note: operationLogFailureCount === 0
+        ? 'Ошибок записи operation_logs нет.'
+        : 'Есть незакрытые ошибки записи operation_logs. Финансовые операции не откатывались, но журнал мог быть неполным.',
+    },
     debts_check: {
       receivable_total: receivableSystem,
       ledger_total: receivableLedger,

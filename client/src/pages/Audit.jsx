@@ -101,6 +101,10 @@ export default function Audit() {
   const payments = data?.payments_vs_transactions || {}
   const accounts = normalizeArray(data?.accounts || data?.accounts_balance_check)
   const orphanTransactions = normalizeArray(data?.orphan_transactions)
+  const operationLogFailures = data?.operation_log_failures || {}
+  const operationLogFailureRows = normalizeArray(operationLogFailures.recent)
+  const operationLogFailureCount = toNumber(operationLogFailures.unresolved_count ?? operationLogFailures.count)
+  const operationLogFailuresOk = operationLogFailures.status === 'ok' || operationLogFailureCount === 0
   const debts = data?.debts_check || {}
   const global = data?.global_check || {}
   const profitReconciliation = data?.profit_reconciliation || {}
@@ -167,6 +171,15 @@ export default function Audit() {
           </div>
           <div className="stat-sub">подозрительные операции без допустимой связи</div>
           <StatusText isOk={orphanTransactions.length === 0} />
+        </div>
+
+        <div className="stat-card">
+          <div className="stat-label">Журнал операций</div>
+          <div className={`stat-value ${operationLogFailuresOk ? 'positive' : 'negative'}`}>
+            {operationLogFailureCount}
+          </div>
+          <div className="stat-sub">незакрытые ошибки записи operation_logs</div>
+          <StatusText isOk={operationLogFailuresOk} />
         </div>
 
         <div className="stat-card">
@@ -267,6 +280,12 @@ export default function Audit() {
         </div>
       )}
 
+      {!operationLogFailuresOk && (
+        <div className="alert alert-error" style={{ marginTop: 20 }}>
+          {operationLogFailures.note || 'Есть незакрытые ошибки записи operation_logs. Проверьте журнал аудита.'}
+        </div>
+      )}
+
       <div className="table-wrapper" style={{ marginTop: 20 }}>
         <table>
           <thead>
@@ -359,6 +378,36 @@ export default function Audit() {
                     </tr>
                   )
                 })}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+
+      {operationLogFailureRows.length > 0 && (
+        <details open style={{ marginTop: 20 }}>
+          <summary style={{ cursor: 'pointer', fontWeight: 700, marginBottom: 10 }}>Ошибки журнала операций</summary>
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Дата</th>
+                  <th>Операция</th>
+                  <th>Сущность</th>
+                  <th>Ошибка</th>
+                </tr>
+              </thead>
+              <tbody>
+                {operationLogFailureRows.map(row => (
+                  <tr key={row.id}>
+                    <td className="td-date">{fmtDate(row.created_at)}</td>
+                    <td><span className="badge badge-warning">{row.operation_type || 'Неизвестно'}</span></td>
+                    <td className="td-mono">
+                      {row.entity_type || '—'}{row.entity_id ? ` #${row.entity_id}` : ''}
+                    </td>
+                    <td>{row.error_message || '—'}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
