@@ -126,28 +126,31 @@ function verifyPassword(password, passwordHash) {
   return safeEqualText(actualHash, expectedHash);
 }
 
-function shouldUseSecureCookie(req) {
-  return isProduction || req.secure || req.get('x-forwarded-proto') === 'https';
+function shouldUseSecureCookie() {
+  const value = String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase();
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return isProduction;
 }
 
-function sessionCookieOptions(req) {
+function sessionCookieOptions() {
   return {
     httpOnly: true,
     sameSite: 'lax',
-    secure: shouldUseSecureCookie(req),
+    secure: shouldUseSecureCookie(),
     path: '/',
   };
 }
 
 function setSessionCookie(req, res, username) {
   res.cookie(SESSION_COOKIE_NAME, createSessionToken(username), {
-    ...sessionCookieOptions(req),
+    ...sessionCookieOptions(),
     maxAge: SESSION_TTL_MS,
   });
 }
 
 function clearSessionCookie(req, res) {
-  res.clearCookie(SESSION_COOKIE_NAME, sessionCookieOptions(req));
+  res.clearCookie(SESSION_COOKIE_NAME, sessionCookieOptions());
 }
 
 app.post('/api/auth/login', (req, res) => {
