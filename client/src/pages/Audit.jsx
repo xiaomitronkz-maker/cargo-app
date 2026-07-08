@@ -343,7 +343,7 @@ export default function Audit() {
       )}
 
       <div className={`alert ${manualBalanceTablesOk ? 'alert-info' : 'alert-error'}`} style={{ marginTop: 20 }}>
-        {manualBalanceTables.note || 'Manual money_assets/liabilities are legacy/reference tables and are not included in profit/control formula to avoid double counting.'}
+        {manualBalanceTables.note || 'Таблицы money_assets/liabilities используются только как справочные/диагностические и не включаются в формулу прибыли/контроля, чтобы избежать двойного учета.'}
       </div>
 
       <div className="table-wrapper" style={{ marginTop: 20 }}>
