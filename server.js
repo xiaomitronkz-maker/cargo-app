@@ -14,7 +14,7 @@ const cors = require('cors');
 const path = require('path');
 const XLSX = require('xlsx');
 const { google } = require('googleapis');
-const { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } = require('crypto');
+const { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } = require('crypto');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -419,6 +419,14 @@ async function initDb() {
       amount NUMERIC NOT NULL DEFAULT 0,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       cancelled_at TIMESTAMP NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS debt_payment_idempotency (
+      id SERIAL PRIMARY KEY,
+      idempotency_key TEXT UNIQUE NOT NULL,
+      request_hash TEXT NOT NULL,
+      response_json JSONB,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS accounts (
@@ -2521,6 +2529,47 @@ async function debtSummaryData(client = pool) {
 
 function ledgerNumber(value) {
   return Math.round((+value || 0) * 100) / 100;
+}
+
+function normalizeIdempotencyKey(value) {
+  const key = String(value || '').trim();
+  return key || null;
+}
+
+function debtPaymentRequestHash(payload) {
+  return createHash('sha256')
+    .update(JSON.stringify(payload))
+    .digest('hex');
+}
+
+async function reserveDebtPaymentIdempotency(client, idempotencyKey, requestHash) {
+  if (!idempotencyKey) return { isReplay: false, id: null, response: null };
+
+  const inserted = await get(`
+    INSERT INTO debt_payment_idempotency(idempotency_key,request_hash)
+    VALUES($1,$2)
+    ON CONFLICT (idempotency_key) DO NOTHING
+    RETURNING id,response_json
+  `, [idempotencyKey, requestHash], client);
+
+  if (inserted) return { isReplay: false, id: inserted.id, response: null };
+
+  const existing = await get(`
+    SELECT id,request_hash,response_json
+    FROM debt_payment_idempotency
+    WHERE idempotency_key=$1
+    FOR UPDATE
+  `, [idempotencyKey], client);
+
+  if (!existing) throw new Error('Не удалось проверить повтор платежа. Попробуйте еще раз.');
+  if (existing.request_hash !== requestHash) {
+    throw new Error('Этот idempotency key уже использован для другого платежа. Откройте форму оплаты заново.');
+  }
+  if (!existing.response_json) {
+    throw new Error('Платеж с таким idempotency key уже обрабатывается. Повторите запрос позже.');
+  }
+
+  return { isReplay: true, id: existing.id, response: existing.response_json };
 }
 
 async function manualExpensesTotal(filters = {}, client = pool) {
@@ -5260,38 +5309,46 @@ app.post('/api/debts/pay', async (req, res) => {
   const amount = ledgerNumber(req.body.amount);
   const date = String(req.body.date || new Date().toISOString().slice(0, 10)).trim();
   const comment = req.body.comment || null;
+  const idempotencyKey = normalizeIdempotencyKey(req.body.idempotency_key || req.get('Idempotency-Key'));
 
   if (!['supplier', 'client'].includes(entityType)) return validationError(res, 'Тип контрагента должен быть supplier или client', { entity_type: rawEntityType });
   if (!Number.isInteger(entityId) || entityId <= 0) return validationError(res, 'Контрагент обязателен', { entity_type: entityType, entity_id: req.body.entity_id });
   if (!Number.isInteger(cashboxId) || cashboxId <= 0) return validationError(res, 'Касса обязательна', { entity_type: entityType, entity_id: entityId, cashbox_id: req.body.cashbox_id });
   if (!(amount > 0)) return validationError(res, 'Сумма должна быть больше 0', { entity_type: entityType, entity_id: entityId, amount });
   if (!isStrictIsoDate(date)) return validationError(res, 'Дата должна быть существующей датой в формате YYYY-MM-DD', { entity_type: entityType, entity_id: entityId, date });
+  if (idempotencyKey && idempotencyKey.length > 200) return validationError(res, 'Idempotency key слишком длинный', { idempotency_key_length: idempotencyKey.length });
 
   try {
-    const cashbox = await get('SELECT id FROM accounts WHERE id=$1', [cashboxId]);
-    if (!cashbox) return validationError(res, 'Касса не найдена', { entity_type: entityType, entity_id: entityId, cashbox_id: cashboxId });
+    const requestHash = debtPaymentRequestHash({
+      entity_type: entityType,
+      entity_id: entityId,
+      cashbox_id: cashboxId,
+      amount,
+      date,
+      comment,
+    });
 
-    if (entityType === 'supplier') {
-      const supplier = await get('SELECT id FROM suppliers WHERE id=$1', [entityId]);
-      if (!supplier) return res.status(404).json({ error: 'Поставщик не найден' });
-    }
+    const response = await withTx(async (client) => {
+      const idempotency = await reserveDebtPaymentIdempotency(client, idempotencyKey, requestHash);
+      if (idempotency.isReplay) return { ...idempotency.response, idempotent: true };
 
-    const documents = entityType === 'supplier'
-      ? await getSupplierOpenDebtDocuments(entityId)
-      : await getClientOpenDebtDocuments(entityId);
-    const totalDebt = ledgerNumber(documents.reduce((sum, document) => sum + +(document.remaining || 0), 0));
+      const cashbox = await get('SELECT id FROM accounts WHERE id=$1', [cashboxId], client);
+      if (!cashbox) throw new Error('Касса не найдена');
 
-    if (entityType === 'supplier' && (!documents.length || totalDebt <= 0.009)) return res.status(400).json({ error: 'Открытых документов для оплаты нет' });
-    if (entityType === 'supplier' && amount > totalDebt + 0.009) {
-      return validationError(res, 'Сумма оплаты превышает общий долг поставщика', {
-        entity_type: entityType,
-        entity_id: entityId,
-        amount,
-        total_debt: totalDebt,
-      });
-    }
+      if (entityType === 'supplier') {
+        const supplier = await get('SELECT id FROM suppliers WHERE id=$1', [entityId], client);
+        if (!supplier) throw httpError('Поставщик не найден', 404);
+      }
 
-    const result = await withTx(async (client) => {
+      const documents = entityType === 'supplier'
+        ? await getSupplierOpenDebtDocuments(entityId, client)
+        : await getClientOpenDebtDocuments(entityId, client);
+      const totalDebt = ledgerNumber(documents.reduce((sum, document) => sum + +(document.remaining || 0), 0));
+
+      if (entityType === 'supplier' && (!documents.length || totalDebt <= 0.009)) throw new Error('Открытых документов для оплаты нет');
+      if (entityType === 'supplier' && amount > totalDebt + 0.009) {
+        throw new Error('Сумма оплаты превышает общий долг поставщика');
+      }
       if (entityType === 'supplier' && await getAccountBalance(cashboxId, client) < amount) {
         throw new Error('Недостаточно средств в кассе');
       }
@@ -5411,27 +5468,35 @@ app.post('/api/debts/pay', async (req, res) => {
         },
       });
 
-      return { allocations, debt_payment_group_id: debtPaymentGroupId, payment_id: payment.id, transaction_id: transaction.id };
-    });
-    const finalBalance = entityType === 'client'
-      ? await getClientLedgerBalance(entityId)
-      : ledgerNumber(totalDebt - amount);
+      const finalBalance = entityType === 'client'
+        ? await getClientLedgerBalance(entityId, client)
+        : ledgerNumber(totalDebt - amount);
 
-    res.json({
-      success: true,
-      entity_type: entityType,
-      entity_id: entityId,
-      paid_amount: amount,
-      previous_debt: totalDebt,
-      remaining_debt: finalBalance,
-      advance_amount: entityType === 'client' && finalBalance < -0.009 ? ledgerNumber(Math.abs(finalBalance)) : 0,
-      payment_id: result.payment_id,
-      transaction_id: result.transaction_id,
-      debt_payment_group_id: result.debt_payment_group_id,
-      allocations: result.allocations,
+      const body = {
+        success: true,
+        idempotent: false,
+        entity_type: entityType,
+        entity_id: entityId,
+        paid_amount: amount,
+        previous_debt: totalDebt,
+        remaining_debt: finalBalance,
+        advance_amount: entityType === 'client' && finalBalance < -0.009 ? ledgerNumber(Math.abs(finalBalance)) : 0,
+        payment_id: payment.id,
+        transaction_id: transaction.id,
+        debt_payment_group_id: debtPaymentGroupId,
+        allocations,
+      };
+
+      if (idempotency.id) {
+        await query('UPDATE debt_payment_idempotency SET response_json=$1::jsonb WHERE id=$2', [JSON.stringify(body), idempotency.id], client);
+      }
+
+      return body;
     });
+
+    res.json(response);
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.statusCode || 400).json({ error: e.message });
   }
 });
 

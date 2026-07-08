@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Modal from '../components/Modal'
 import api from '../api'
 import { formatDate } from '../utils/data'
@@ -30,7 +30,11 @@ const todayIso = () => {
   date.setMinutes(date.getMinutes() - date.getTimezoneOffset())
   return date.toISOString().slice(0, 10)
 }
-const emptyPaymentForm = () => ({ account_id: '', amount: '', date: todayIso(), comment: '' })
+const createIdempotencyKey = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+const emptyPaymentForm = () => ({ account_id: '', amount: '', date: todayIso(), comment: '', idempotency_key: '' })
 
 const tabLabels = {
   customers: 'Клиенты',
@@ -149,6 +153,7 @@ export default function Debts() {
   const [paymentForm, setPaymentForm] = useState(emptyPaymentForm())
   const [paymentError, setPaymentError] = useState('')
   const [paymentSaving, setPaymentSaving] = useState(false)
+  const paymentSavingRef = useRef(false)
   const [editPaymentTarget, setEditPaymentTarget] = useState(null)
   const [editPaymentForm, setEditPaymentForm] = useState(emptyPaymentForm())
   const [editPaymentError, setEditPaymentError] = useState('')
@@ -227,6 +232,7 @@ export default function Debts() {
       amount: hasOpenDebt(row) ? String(roundMoney(row.balance)) : '',
       date: todayIso(),
       comment: '',
+      idempotency_key: createIdempotencyKey(),
     })
     setPaymentError('')
   }
@@ -236,7 +242,7 @@ export default function Debts() {
   }
 
   const closePayment = () => {
-    if (paymentSaving) return
+    if (paymentSaving || paymentSavingRef.current) return
     setPaymentTarget(null)
     setPaymentForm(emptyPaymentForm())
     setPaymentError('')
@@ -253,7 +259,7 @@ export default function Debts() {
   }
 
   const submitPayment = async () => {
-    if (!paymentTarget) return
+    if (paymentSavingRef.current || !paymentTarget) return
     const amount = roundMoney(paymentForm.amount)
     const debt = roundMoney(paymentTarget.balance)
     if (!paymentForm.account_id) {
@@ -273,6 +279,7 @@ export default function Debts() {
       return
     }
 
+    paymentSavingRef.current = true
     setPaymentSaving(true)
     setPaymentError('')
     try {
@@ -283,6 +290,7 @@ export default function Debts() {
         amount,
         date: paymentForm.date || todayIso(),
         comment: paymentForm.comment || null,
+        idempotency_key: paymentForm.idempotency_key || createIdempotencyKey(),
       })
       setPaymentTarget(null)
       setPaymentForm(emptyPaymentForm())
@@ -292,6 +300,7 @@ export default function Debts() {
     } catch (e) {
       setPaymentError(e.message || 'Не удалось сохранить оплату')
     } finally {
+      paymentSavingRef.current = false
       setPaymentSaving(false)
     }
   }
