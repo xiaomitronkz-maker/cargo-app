@@ -6374,16 +6374,16 @@ app.get('/api/ledger', async (req, res) => {
   }));
 });
 
-// Withdrawals
+// Legacy withdrawals history only. New owner withdrawals must go through
+// /api/transactions/manual with type='owner_withdrawal' so cash and audit stay consistent.
 app.get('/api/withdrawals', async (req, res) => {
   res.json(await all('SELECT * FROM withdrawals ORDER BY date DESC, created_at DESC'));
 });
 
 app.post('/api/withdrawals', async (req, res) => {
-  const { amount, date, comment } = req.body;
-  if (!(+amount > 0) || !date) return res.status(400).json({ error: 'Сумма и дата обязательны' });
-  const row = await get('INSERT INTO withdrawals(amount,date,comment) VALUES($1,$2,$3) RETURNING id', [+amount, date, comment || null]);
-  res.json({ id: row.id });
+  res.status(410).json({
+    error: 'Withdrawals endpoint is deprecated. Use /api/transactions/manual with owner_withdrawal.',
+  });
 });
 
 // Accounts & Transactions
