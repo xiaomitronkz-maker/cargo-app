@@ -20,6 +20,7 @@ export default function Finance() {
   const [summary, setSummary] = useState(null)
   const [profitSummary, setProfitSummary] = useState(null)
   const [periodProfit, setPeriodProfit] = useState(null)
+  const [audit, setAudit] = useState(null)
   const [periodFilters, setPeriodFilters] = useState({ date_from: '', date_to: '' })
   const [periodLoading, setPeriodLoading] = useState(false)
   const [debts, setDebts] = useState([])
@@ -34,9 +35,9 @@ export default function Finance() {
 
   const load = () => {
     setLoading(true)
-    Promise.all([api.getDebtsSummary(), api.getDebtsBySuppliers(), api.getAccounts(), api.getProfitSummary(), api.getDebts(), api.getTransactions()])
-      .then(([summaryData, suppliersData, accountsData, profitData, debtsData, transactionsData]) => {
-        console.log('Analytics data:', { summaryData, suppliersData, accountsData, profitData, debtsData, transactionsData })
+    Promise.all([api.getDebtsSummary(), api.getDebtsBySuppliers(), api.getAccounts(), api.getProfitSummary(), api.getDebts(), api.getTransactions(), api.getAudit()])
+      .then(([summaryData, suppliersData, accountsData, profitData, debtsData, transactionsData, auditData]) => {
+        console.log('Analytics data:', { summaryData, suppliersData, accountsData, profitData, debtsData, transactionsData, auditData })
         setSummary(summaryData && typeof summaryData === 'object' ? summaryData : {})
         setSuppliers(normalizeArray(suppliersData))
         setAccounts(normalizeArray(accountsData))
@@ -44,6 +45,7 @@ export default function Finance() {
         setPeriodProfit(profitData && typeof profitData === 'object' ? profitData : {})
         setDebts(normalizeArray(debtsData))
         setTransactions(normalizeArray(transactionsData))
+        setAudit(auditData && typeof auditData === 'object' ? auditData : {})
       })
       .catch(() => {
         console.log('Analytics data:', null)
@@ -54,6 +56,7 @@ export default function Finance() {
         setPeriodProfit({})
         setDebts([])
         setTransactions([])
+        setAudit({})
       })
       .finally(() => setLoading(false))
   }
@@ -114,9 +117,15 @@ export default function Finance() {
     .filter(transaction => transaction.type === 'owner_withdrawal')
     .reduce((sum, transaction) => sum + toNumber(transaction.amount), 0)
   const ownerCapital = ownerContribution - ownerWithdrawal
-  const assets = cash + receivable
+  const auditControl = audit?.proposed_control_formula || {}
+  const auditBridge = audit?.profit_reconciliation?.diagnostic_bridge || {}
+  const inventoryAsset = toNumber(auditControl.inventory_asset ?? auditBridge.inventory_cost_gap?.gap)
+  const manualBalanceAdjustments = toNumber(auditControl.manual_balance_adjustments ?? auditBridge.manual_balance_adjustments?.net)
+  const baseAssets = cash + receivable
+  const assets = baseAssets + inventoryAsset
   const liabilities = payable
-  const control = assets - (liabilities + profit) - ownerCapital
+  const control = assets - manualBalanceAdjustments - liabilities - profit - ownerCapital
+  const legacyControl = baseAssets - liabilities - profit - ownerCapital
   const isOk = Math.abs(control) < 0.01
 
   return (
@@ -139,16 +148,19 @@ export default function Finance() {
         <FinanceCard label="Авансы клиентов" value={clientAdvances} tone={clientAdvances > 0 ? 'negative' : ''} />
         <FinanceCard label="📊 Прибыль" value={profit} tone={profit >= 0 ? 'positive' : 'negative'} />
         <FinanceCard label="Капитал владельца" value={ownerCapital} tone={ownerCapital >= 0 ? 'positive' : 'negative'} />
+        <FinanceCard label="Товарный актив" value={inventoryAsset} tone={inventoryAsset >= 0 ? 'positive' : 'negative'} />
+        <FinanceCard label="Ручные корректировки" value={manualBalanceAdjustments} tone={manualBalanceAdjustments >= 0 ? 'negative' : 'positive'} />
         <FinanceCard label="🧮 Контроль" value={control} tone={isOk ? 'positive' : 'negative'} />
       </div>
 
       <div className={`alert ${isOk ? 'alert-success' : 'alert-error'}`} style={{ marginBottom: 20 }}>
         {isOk ? 'Баланс сошелся' : `Ошибка баланса: ${fmt(control)}`}
-        {!isOk && (
-          <div style={{ marginTop: 8 }}>
-            активы: {fmt(assets)} · обязательства: {fmt(liabilities)} · поставщики: {fmt(supplierPayable)} · авансы клиентов: {fmt(clientAdvances)} · прибыль: {fmt(profit)} · капитал владельца: {fmt(ownerCapital)}
-          </div>
-        )}
+        <div style={{ marginTop: 8 }}>
+          деньги + дебиторка: {fmt(baseAssets)} · товарный актив: {fmt(inventoryAsset)} · ручные балансировочные корректировки: {fmt(manualBalanceAdjustments)} · обязательства: {fmt(liabilities)} · поставщики: {fmt(supplierPayable)} · авансы клиентов: {fmt(clientAdvances)} · прибыль: {fmt(profit)} · капитал владельца: {fmt(ownerCapital)}
+        </div>
+        <div style={{ marginTop: 6 }}>
+          Старая формула без товарного актива: {fmt(legacyControl)}
+        </div>
       </div>
 
       <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 8, padding: 14, marginBottom: 20 }}>
