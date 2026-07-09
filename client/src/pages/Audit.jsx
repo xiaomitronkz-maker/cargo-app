@@ -134,6 +134,7 @@ export default function Audit() {
   const debts = data?.debts_check || {}
   const global = data?.global_check || {}
   const profitReconciliation = data?.profit_reconciliation || {}
+  const legacyProfitReconciliation = data?.legacy_profit_reconciliation || {}
   const costMethodSummary = normalizeArray(data?.cost_method_summary)
   const costMethodDetails = normalizeArray(data?.cost_method_details)
   const supplierReconciliation = data?.supplier_reconciliation || {}
@@ -168,7 +169,9 @@ export default function Audit() {
   const proposedControlDifference = toNumber(proposedControl.proposed_difference)
   const proposedControlOk = proposedControl.status === 'ok' || ok(proposedControlDifference)
   const profitReconciliationOk = profitReconciliation.status === 'ok' || ok(profitDifference)
-  const profitNeedsInventory = profitReconciliation.status === 'inventory_required' && ok(bridgedDifference)
+  const legacyProfitDifference = toNumber(legacyProfitReconciliation.profit_difference)
+  const inventoryAsset = toNumber(proposedControl.inventory_asset ?? inventoryCostGap.gap)
+  const manualBalanceAdjustmentNet = toNumber(proposedControl.manual_balance_adjustments ?? manualBalanceAdjustments.net)
   const supplierDifference = toNumber(supplierReconciliation.ledger_difference ?? ((debts.supplier_payable_total || 0) - (debts.supplier_payable_ledger_total || 0)))
   const supplierBySuppliersDifference = toNumber(supplierReconciliation.by_suppliers_difference)
   const supplierOk = supplierReconciliation.status === 'ok' || (ok(supplierDifference) && ok(supplierBySuppliersDifference))
@@ -307,13 +310,25 @@ export default function Audit() {
           <AuditBreakdown rows={[
             { label: 'Прибыль по отчету', value: fmt(profitReconciliation.reported_profit) },
             { label: 'Прибыль по балансу', value: fmt(profitReconciliation.implied_profit) },
-            { label: 'Формула', value: profitReconciliation.formula || 'cash + receivable - payable - owner_capital' },
-            { label: 'Товарный разрыв', value: fmt(inventoryCostGap.gap) },
-            { label: 'Ручные корректировки', value: fmt(manualBalanceAdjustments.net) },
-            { label: 'Остаток между ними', value: fmt(profitBridge.inventory_manual_residual) },
+            { label: 'Формула', value: profitReconciliation.formula || 'cash + receivable + inventory_asset - payable - ownerCapital - manual_balance_adjustments' },
+            { label: 'Товарный актив', value: fmt(inventoryAsset) },
+            { label: 'Ручные балансировочные корректировки', value: fmt(manualBalanceAdjustmentNet) },
             { label: 'Bridge diff', value: fmt(bridgedDifference), tone: ok(bridgedDifference) ? 'positive' : 'negative' },
           ]} />
           <ProfitStatus status={profitReconciliation.status} isOk={profitReconciliationOk} />
+        </div>
+
+        <div className="stat-card">
+          <div className="stat-label">Старая формула без товарного актива</div>
+          <div className={`stat-value ${ok(legacyProfitDifference) ? 'positive' : 'negative'}`}>
+            Разница: {fmt(legacyProfitDifference)}
+          </div>
+          <AuditBreakdown rows={[
+            { label: 'Прибыль по отчету', value: fmt(legacyProfitReconciliation.profit_report) },
+            { label: 'Прибыль по старой формуле', value: fmt(legacyProfitReconciliation.implied_profit) },
+            { label: 'Формула', value: legacyProfitReconciliation.formula || 'cash + receivable - payable - ownerCapital' },
+          ]} />
+          <StatusText isOk={ok(legacyProfitDifference)} />
         </div>
 
         <div className="stat-card">
@@ -338,8 +353,8 @@ export default function Audit() {
             Разница: {fmt(proposedControlDifference)}
           </div>
           <AuditBreakdown rows={[
-            { label: 'Товарный актив', value: fmt(proposedControl.inventory_asset) },
-            { label: 'Ручные балансировочные корректировки', value: fmt(proposedControl.manual_balance_adjustments) },
+            { label: 'Товарный актив', value: fmt(inventoryAsset) },
+            { label: 'Ручные балансировочные корректировки', value: fmt(manualBalanceAdjustmentNet) },
             { label: 'Прибыль по диагностической формуле', value: fmt(proposedControl.proposed_implied_profit) },
             { label: 'Разница по диагностической формуле', value: fmt(proposedControlDifference), tone: proposedControlOk ? 'positive' : 'negative' },
           ]} />
@@ -348,14 +363,12 @@ export default function Audit() {
       </div>
 
       <div className="alert alert-info" style={{ marginTop: 20 }}>
-        Это диагностическая формула. Основная формула пока не изменена. Товарный актив и ручные корректировки требуют отдельного бизнес-подтверждения.
+        Старая формула не учитывала товар/остатки как актив, поэтому давала расхождение {fmt(legacyProfitDifference)}.
       </div>
 
       {!profitReconciliationOk && (
         <div className="alert alert-info" style={{ marginTop: 20 }}>
-          {profitNeedsInventory
-            ? (profitBridge.note || 'Текущая формула не учитывает товар/остатки как актив. Это отдельная крупная задача.')
-            : (profitReconciliation.note || 'Прибыль по P&L отличается от балансной прибыли. Частая причина — продажи со средней/legacy себестоимостью без точной связи с приходом.')}
+          {profitReconciliation.note || 'Прибыль по P&L отличается от балансной прибыли даже с учетом товарного актива и ручных балансировочных корректировок.'}
         </div>
       )}
 

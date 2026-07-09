@@ -6957,12 +6957,12 @@ app.get('/api/audit', async (req, res) => {
     - (+(debtSummary.payable?.total || 0))
     - (+(profit.profit || 0))
     - ownerCapitalTotal;
-  const impliedProfit = accountsTotal
+  const legacyImpliedProfit = accountsTotal
     + (+(debtSummary.receivable?.total || 0))
     - (+(debtSummary.payable?.total || 0))
     - ownerCapitalTotal;
   const reportedProfit = +(profit.profit || 0);
-  const profitDifference = reportedProfit - impliedProfit;
+  const legacyProfitDifference = reportedProfit - legacyImpliedProfit;
   const purchasesTotal = +(purchasesTotalRow?.total || 0);
   const salesCostTotal = +(profit.cost || 0);
   const inventoryCostGap = purchasesTotal - salesCostTotal;
@@ -6971,15 +6971,15 @@ app.get('/api/audit', async (req, res) => {
   const cashAdjustmentOutTotal = +(manualBalanceAdjustments?.cash_adjustment_out || 0);
   const manualBalanceAdjustmentsNet = manualIncomeTotal + cashAdjustmentInTotal - cashAdjustmentOutTotal;
   const inventoryManualResidual = inventoryCostGap - manualBalanceAdjustmentsNet;
-  const bridgedImpliedProfit = impliedProfit + inventoryManualResidual;
-  const bridgedDifference = reportedProfit - bridgedImpliedProfit;
-  const proposedImpliedProfit = impliedProfit + inventoryCostGap - manualBalanceAdjustmentsNet;
-  const proposedDifference = reportedProfit - proposedImpliedProfit;
+  const impliedProfit = legacyImpliedProfit + inventoryManualResidual;
+  const profitDifference = reportedProfit - impliedProfit;
+  const bridgedImpliedProfit = impliedProfit;
+  const bridgedDifference = profitDifference;
+  const proposedImpliedProfit = impliedProfit;
+  const proposedDifference = profitDifference;
   const profitReconciliationStatus = Math.abs(profitDifference) <= 0.05
     ? 'ok'
-    : Math.abs(bridgedDifference) <= 0.05
-      ? 'inventory_required'
-      : 'error';
+    : 'warning';
   const supplierSummaryTotal = +(debtSummary.supplier_payable?.total || 0);
   const supplierLedgerTotal = +(debtLedger.summary?.supplier_payable || 0);
   const supplierBySuppliersTotal = +(supplierBySuppliers?.total || 0);
@@ -7062,11 +7062,19 @@ app.get('/api/audit', async (req, res) => {
       proposed_difference: proposedDifference,
       status: Math.abs(proposedDifference) <= 0.05 ? 'ok' : 'warning',
     },
+    legacy_profit_reconciliation: {
+      formula: 'cash + receivable - payable - ownerCapital',
+      implied_profit: legacyImpliedProfit,
+      profit_report: reportedProfit,
+      profit_difference: legacyProfitDifference,
+      status: Math.abs(legacyProfitDifference) <= 0.05 ? 'ok' : 'warning',
+      note: 'Старая формула не учитывала товар/остатки как актив.',
+    },
     profit_reconciliation: {
       reported_profit: reportedProfit,
       implied_profit: impliedProfit,
       profit_difference: profitDifference,
-      formula: 'cash + receivable - payable - owner_capital',
+      formula: 'cash + receivable + inventory_asset - payable - ownerCapital - manual_balance_adjustments',
       status: profitReconciliationStatus,
       diagnostic_bridge: {
         inventory_cost_gap: {
@@ -7086,10 +7094,8 @@ app.get('/api/audit', async (req, res) => {
         note: 'Текущая формула не учитывает товар/остатки как актив. Это отдельная крупная задача.',
       },
       note: Math.abs(profitDifference) <= 0.05
-        ? 'Прибыль по P&L сходится с балансной прибылью.'
-        : Math.abs(bridgedDifference) <= 0.05
-          ? 'Расхождение объясняется товарным разрывом и ручными корректировками баланса. Текущая формула не учитывает товар/остатки как актив.'
-          : 'Прибыль по P&L отличается от балансной прибыли даже после диагностической расшифровки.',
+        ? 'Прибыль по P&L сходится с балансной прибылью с учетом товарного актива и ручных балансировочных корректировок.'
+        : 'Прибыль по P&L отличается от балансной прибыли даже с учетом товарного актива и ручных балансировочных корректировок.',
     },
     cost_method_summary: costMethodSummary.map((row) => ({
       method: row.method || 'unknown',
