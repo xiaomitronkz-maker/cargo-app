@@ -6973,6 +6973,8 @@ app.get('/api/audit', async (req, res) => {
   const inventoryManualResidual = inventoryCostGap - manualBalanceAdjustmentsNet;
   const bridgedImpliedProfit = impliedProfit + inventoryManualResidual;
   const bridgedDifference = reportedProfit - bridgedImpliedProfit;
+  const proposedImpliedProfit = impliedProfit + inventoryCostGap - manualBalanceAdjustmentsNet;
+  const proposedDifference = reportedProfit - proposedImpliedProfit;
   const profitReconciliationStatus = Math.abs(profitDifference) <= 0.05
     ? 'ok'
     : Math.abs(bridgedDifference) <= 0.05
@@ -7046,6 +7048,19 @@ app.get('/api/audit', async (req, res) => {
       note: Math.abs(supplierLedgerDifference) < 0.01 && Math.abs(supplierBySuppliersDifference) < 0.01
         ? 'Поставщики сходятся между audit, ledger и /api/debts/by-suppliers.'
         : 'Проверьте legacy payments, cancelled payments или allocation-aware расчёт поставщиков.',
+    },
+    proposed_control_formula: {
+      formula: 'cash + receivable + inventory_asset - payable - ownerCapital - manual_balance_adjustments',
+      cash: accountsTotal,
+      receivable: +(debtSummary.receivable?.total || 0),
+      payable: +(debtSummary.payable?.total || 0),
+      ownerCapital: ownerCapitalTotal,
+      inventory_asset: inventoryCostGap,
+      manual_balance_adjustments: manualBalanceAdjustmentsNet,
+      proposed_implied_profit: proposedImpliedProfit,
+      profit_report: reportedProfit,
+      proposed_difference: proposedDifference,
+      status: Math.abs(proposedDifference) <= 0.05 ? 'ok' : 'warning',
     },
     profit_reconciliation: {
       reported_profit: reportedProfit,

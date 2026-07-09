@@ -164,6 +164,9 @@ export default function Audit() {
   const inventoryCostGap = profitBridge.inventory_cost_gap || {}
   const manualBalanceAdjustments = profitBridge.manual_balance_adjustments || {}
   const bridgedDifference = toNumber(profitBridge.bridged_difference)
+  const proposedControl = data?.proposed_control_formula || {}
+  const proposedControlDifference = toNumber(proposedControl.proposed_difference)
+  const proposedControlOk = proposedControl.status === 'ok' || ok(proposedControlDifference)
   const profitReconciliationOk = profitReconciliation.status === 'ok' || ok(profitDifference)
   const profitNeedsInventory = profitReconciliation.status === 'inventory_required' && ok(bridgedDifference)
   const supplierDifference = toNumber(supplierReconciliation.ledger_difference ?? ((debts.supplier_payable_total || 0) - (debts.supplier_payable_ledger_total || 0)))
@@ -326,6 +329,26 @@ export default function Audit() {
           ]} />
           <StatusText isOk={supplierOk} />
         </div>
+      </div>
+
+      <div className="stat-grid" style={{ marginTop: 20 }}>
+        <div className="stat-card">
+          <div className="stat-label">Диагностика с учетом товарного актива</div>
+          <div className={`stat-value ${proposedControlOk ? 'positive' : 'negative'}`}>
+            Разница: {fmt(proposedControlDifference)}
+          </div>
+          <AuditBreakdown rows={[
+            { label: 'Товарный актив', value: fmt(proposedControl.inventory_asset) },
+            { label: 'Ручные балансировочные корректировки', value: fmt(proposedControl.manual_balance_adjustments) },
+            { label: 'Прибыль по диагностической формуле', value: fmt(proposedControl.proposed_implied_profit) },
+            { label: 'Разница по диагностической формуле', value: fmt(proposedControlDifference), tone: proposedControlOk ? 'positive' : 'negative' },
+          ]} />
+          <StatusText isOk={proposedControlOk} />
+        </div>
+      </div>
+
+      <div className="alert alert-info" style={{ marginTop: 20 }}>
+        Это диагностическая формула. Основная формула пока не изменена. Товарный актив и ручные корректировки требуют отдельного бизнес-подтверждения.
       </div>
 
       {!profitReconciliationOk && (
