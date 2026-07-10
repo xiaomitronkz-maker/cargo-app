@@ -3,7 +3,11 @@ import Modal from '../components/Modal'
 import api from '../api'
 import { formatType, normalizeArray, toNumber } from '../utils/data'
 
-const fmt = (n) => '$' + toNumber(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmt = (n) => {
+  const value = toNumber(n)
+  const normalized = Math.abs(value) < 0.005 ? 0 : value
+  return '$' + normalized.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
 const ok = (n) => Math.abs(toNumber(n)) < 0.01
 const COST_METHOD_LABELS = {
   manual_override: 'Ручная себестоимость',
@@ -158,7 +162,6 @@ export default function Audit() {
   const ownerWithdrawalTotal = toNumber(data?.owner_withdrawal_total ?? global.owner_withdrawal_total)
   const ownerCapitalTotal = toNumber(data?.owner_capital_total ?? global.owner_capital_total ?? (ownerContributionTotal - ownerWithdrawalTotal))
   const ownerControl = toNumber(data?.control_with_owner_ops ?? global.control_with_owner_ops)
-  const ownerControlOk = global.control_with_owner_ok ?? ok(ownerControl)
   const clientAdvancesTotal = toNumber(data?.client_advances_total ?? global.client_advances_total ?? debts.client_advances_total)
   const profitDifference = toNumber(profitReconciliation.profit_difference)
   const profitBridge = profitReconciliation.diagnostic_bridge || {}
@@ -172,6 +175,8 @@ export default function Audit() {
   const legacyProfitDifference = toNumber(legacyProfitReconciliation.profit_difference)
   const inventoryAsset = toNumber(proposedControl.inventory_asset ?? inventoryCostGap.gap)
   const manualBalanceAdjustmentNet = toNumber(proposedControl.manual_balance_adjustments ?? manualBalanceAdjustments.net)
+  const ownerControlInventoryAware = ownerControl + inventoryAsset - manualBalanceAdjustmentNet
+  const ownerControlInventoryAwareOk = ok(ownerControlInventoryAware)
   const supplierDifference = toNumber(supplierReconciliation.ledger_difference ?? ((debts.supplier_payable_total || 0) - (debts.supplier_payable_ledger_total || 0)))
   const supplierBySuppliersDifference = toNumber(supplierReconciliation.by_suppliers_difference)
   const supplierOk = supplierReconciliation.status === 'ok' || (ok(supplierDifference) && ok(supplierBySuppliersDifference))
@@ -231,8 +236,8 @@ export default function Audit() {
             {manualAssetsCount + manualLiabilitiesCount}
           </div>
           <AuditBreakdown rows={[
-            { label: 'Manual assets', value: `${manualAssetsCount} · ${fmt(manualAssetsTotal)}` },
-            { label: 'Manual liabilities', value: `${manualLiabilitiesCount} · ${fmt(manualLiabilitiesTotal)}` },
+            { label: 'Ручные активы', value: `${manualAssetsCount} · ${fmt(manualAssetsTotal)}` },
+            { label: 'Ручные обязательства', value: `${manualLiabilitiesCount} · ${fmt(manualLiabilitiesTotal)}` },
             { label: 'В формуле контроля', value: manualBalanceTables.included_in_control_formula ? 'участвуют' : 'не участвуют' },
           ]} />
           <StatusText isOk={manualBalanceTablesOk} />
@@ -280,12 +285,13 @@ export default function Audit() {
             {fmt(ownerCapitalTotal)}
           </div>
           <AuditBreakdown rows={[
-            { label: 'Контроль', value: fmt(ownerControl), tone: ownerControlOk ? 'positive' : 'negative' },
+            { label: 'Контроль', value: fmt(ownerControlInventoryAware), tone: ownerControlInventoryAwareOk ? 'positive' : 'negative' },
+            { label: 'Старая формула', value: fmt(ownerControl) },
             { label: 'Авансы клиентов', value: fmt(clientAdvancesTotal) },
             { label: 'Вложения', value: fmt(ownerContributionTotal) },
             { label: 'Снятия', value: fmt(ownerWithdrawalTotal) },
           ]} />
-          <StatusText isOk={ownerControlOk} />
+          <StatusText isOk={ownerControlInventoryAwareOk} />
         </div>
 
         <div className="stat-card">

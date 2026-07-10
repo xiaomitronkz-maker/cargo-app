@@ -7003,8 +7003,8 @@ app.get('/api/audit', async (req, res) => {
       liabilities_total: manualLiabilitiesTotal,
       included_in_control_formula: false,
       note: manualBalanceTablesStatus === 'ok'
-        ? 'Manual money_assets/liabilities are legacy/reference tables and are not included in profit/control formula to avoid double counting.'
-        : 'Manual money_assets/liabilities contain data but are not included in control formula.',
+        ? 'Таблицы money_assets/liabilities используются только как справочные/диагностические и не включаются в формулу прибыли/контроля, чтобы избежать двойного учета.'
+        : 'В таблицах money_assets/liabilities есть данные, но они не включаются в формулу контроля, чтобы избежать двойного учета.',
     },
     operation_log_failures: {
       status: operationLogFailureCount === 0 ? 'ok' : 'warning',
