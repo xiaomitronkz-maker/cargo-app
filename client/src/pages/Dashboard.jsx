@@ -30,13 +30,14 @@ export default function Dashboard() {
   const [receipts, setReceipts] = useState([])
   const [transactions, setTransactions] = useState([])
   const [profitSummary, setProfitSummary] = useState({})
+  const [audit, setAudit] = useState({})
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const load = async () => {
       setLoading(true)
       try {
-        const [accountsData, summaryData, debtsData, salesData, receiptsData, profitData, transactionsData] = await Promise.all([
+        const [accountsData, summaryData, debtsData, salesData, receiptsData, profitData, transactionsData, auditData] = await Promise.all([
           api.getAccounts(),
           api.getDebtsSummary(),
           api.getDebts(),
@@ -44,8 +45,9 @@ export default function Dashboard() {
           api.getReceipts(),
           api.getProfitSummary(),
           api.getTransactions(),
+          api.getAudit(),
         ])
-        console.log('Analytics data:', { accountsData, summaryData, debtsData, salesData, receiptsData, profitData, transactionsData })
+        console.log('Analytics data:', { accountsData, summaryData, debtsData, salesData, receiptsData, profitData, transactionsData, auditData })
         setAccounts(normalizeArray(accountsData))
         setSummary(summaryData && typeof summaryData === 'object' ? summaryData : {})
         setDebts(normalizeArray(debtsData))
@@ -53,6 +55,7 @@ export default function Dashboard() {
         setReceipts(normalizeArray(receiptsData))
         setTransactions(normalizeArray(transactionsData))
         setProfitSummary(profitData && typeof profitData === 'object' ? profitData : {})
+        setAudit(auditData && typeof auditData === 'object' ? auditData : {})
       } catch (e) {
         console.log('Analytics data:', null)
         setAccounts([])
@@ -62,6 +65,7 @@ export default function Dashboard() {
         setReceipts([])
         setTransactions([])
         setProfitSummary({})
+        setAudit({})
       } finally {
         setLoading(false)
       }
@@ -83,7 +87,12 @@ export default function Dashboard() {
   const ownerContribution = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_contribution').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
   const ownerWithdrawal = useMemo(() => safeTransactions.filter((tx) => tx.type === 'owner_withdrawal').reduce((sum, tx) => sum + toNumber(tx.amount), 0), [safeTransactions])
   const ownerCapital = ownerContribution - ownerWithdrawal
-  const control = cash + receivable - payable - profit - ownerCapital
+  const auditControl = audit?.proposed_control_formula || {}
+  const auditBridge = audit?.profit_reconciliation?.diagnostic_bridge || {}
+  const inventoryAsset = toNumber(auditControl.inventory_asset ?? auditBridge.inventory_cost_gap?.gap)
+  const manualBalanceAdjustments = toNumber(auditControl.manual_balance_adjustments ?? auditBridge.manual_balance_adjustments?.net)
+  const control = cash + receivable + inventoryAsset - manualBalanceAdjustments - payable - profit - ownerCapital
+  const legacyControl = cash + receivable - payable - profit - ownerCapital
 
   const latestSales = useMemo(() => [...safeSales].slice(0, 5), [safeSales])
   const latestReceipts = useMemo(() => [...safeReceipts].slice(0, 5), [safeReceipts])
@@ -118,6 +127,9 @@ export default function Dashboard() {
 
       <div className={`alert ${Math.abs(control) < 0.01 ? 'alert-success' : 'alert-error'}`} style={{ marginTop: 20 }}>
         {Math.abs(control) < 0.01 ? 'Баланс сошелся' : `Контроль: ${fmt(control)}`}
+        <div style={{ marginTop: 6 }}>
+          Старая формула без товарного актива: {fmt(legacyControl)}
+        </div>
       </div>
 
       <div className="record-grid dashboard-section-grid" style={{ marginTop: 20 }}>
